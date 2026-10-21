@@ -35,6 +35,9 @@
 #[path = "../../src-tauri/src/zip.rs"] mod zip;
 #[path = "../../src-tauri/src/backup.rs"] mod backup;
 #[path = "../../src-tauri/src/startup.rs"] mod startup;
+// 运行日志：只依赖 std 与 flate2（桩里已有 gzip），因此能离线编译并跑它的
+// 等级门控、转义、滚动与编号等用例。
+#[path = "../../src-tauri/src/run_log.rs"] mod run_log;
 // 目录栏的文件操作（删除/复制/打开文件夹）。
 // Windows 实现用 `#[link]` 直接声明系统函数，不依赖外部 crate，
 // 因此这里也能离线编译并跑它的单元测试。

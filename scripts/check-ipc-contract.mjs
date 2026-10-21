@@ -89,7 +89,10 @@ function parseHandlers(src) {
  */
 function parseFrontendCalls(src) {
   const out = new Map();
-  const callRe = /invoke\s*<[^>]*>\s*\(\s*"([a-z0-9_]+)"\s*(,\s*)?/g;
+  // api.ts 的命令调用统一走它自己的 logged 出口（失败时记一条日志再上抛），
+  // 只有 log_ui_event 为了不递归而直接 invoke。两种写法都要认，否则这里
+  // 一条命令都匹配不到，检查会退化成「全部命令未被调用」的空转。
+  const callRe = /(?:invoke|logged)\s*<[^>]*>\s*\(\s*"([a-z0-9_]+)"\s*(,\s*)?/g;
   let m;
   while ((m = callRe.exec(src)) !== null) {
     const cmd = m[1];

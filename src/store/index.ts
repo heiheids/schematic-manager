@@ -15,6 +15,7 @@
 import { inject, provide } from "vue";
 import type { InjectionKey } from "vue";
 import { useSidebarResize } from "../composables/useSidebarResize";
+import { usePreviewResize } from "../composables/usePreviewResize";
 import { createFileListSlice } from "./fileList";
 import { createScenePreviewSlice } from "./scenePreview";
 import { createBlockReplaceSlice } from "./blockReplace";
@@ -26,6 +27,7 @@ import { createUiStateSlice } from "./uiState";
 
 export interface AppStore
   extends ReturnType<typeof useSidebarResize>,
+    ReturnType<typeof usePreviewResize>,
     ReturnType<typeof createFileListSlice>,
     ReturnType<typeof createScenePreviewSlice>,
     ReturnType<typeof createBlockReplaceSlice>,
@@ -46,6 +48,7 @@ export function createAppStore(): AppStore {
   // Object.assign 合并所有域，参数求值期间 s 还是空对象，
   // 读跨域成员（如 scenePreview 读 analysis）会拿到 undefined。
   Object.assign(s, useSidebarResize());
+  Object.assign(s, usePreviewResize());
   Object.assign(s, createFileListSlice(s));
   Object.assign(s, createScenePreviewSlice(s));
   Object.assign(s, createBlockReplaceSlice(s));

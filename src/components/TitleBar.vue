@@ -7,13 +7,15 @@
  * 语言切换放在这里而不是工具条：工具条有十来个按钮，实测约需 1650px，
  * 窗口最小宽度却是 1400，放最右侧会被挤出可视范围；标题栏右侧始终有空位。
  *
- * 左上角的标识与程序图标同源：深色圆角方块 + 青色等轴测立方体 + 四角选中括号。
- * 用内联 SVG 而不是图片，是为了任意缩放都清晰、也不额外引入资源文件；坐标按
- * 18px 直接算好，线宽与图标生成脚本在 18px 档的取值一致（细线在小尺寸下会糊）。
+ * 左上角的标识直接取图标文件本身（`src/assets/app-icon.png`，由
+ * `tools/gen_app_icons.py` 从 `docs/48x.png` 生成），不再手写一份 SVG：
+ * 手写的那份曾经因为图标换版而没跟着改，界面上就一直显示旧标识。
+ * 从母版出图，标识与程序图标就不可能再脱节。
  */
 <script setup lang="ts">
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useI18n } from "vue-i18n";
+import appIcon from "../assets/app-icon.png";
 import { LOCALES, currentLocale, setLocale } from "../i18n";
 
 const { t } = useI18n();
@@ -32,21 +34,7 @@ function currentLabelKey(): string {
 <template>
   <div class="titlebar" data-tauri-drag-region>
     <div class="titlebar__logo" aria-hidden="true">
-      <svg viewBox="0 0 18 18" width="18" height="18">
-        <!-- 立方体：顶面菱形、左右两侧面，共用一个虚接的中心点 -->
-        <g fill="none" stroke="#7ec8ff" stroke-width="1.35" stroke-linejoin="round">
-          <polygon points="3.87,6.75 9,4.185 14.13,6.75 9,9.315" />
-          <polygon points="3.87,6.75 9,9.315 9,14.445 3.87,11.88" />
-          <polygon points="9,9.315 14.13,6.75 14.13,11.88 9,14.445" />
-        </g>
-        <!-- 四角选中括号 -->
-        <g fill="none" stroke="#ffffff" stroke-width="1.6">
-          <path d="M1.89 4.68 V1.89 H4.68" />
-          <path d="M13.32 1.89 H16.11 V4.68" />
-          <path d="M1.89 13.32 V16.11 H4.68" />
-          <path d="M13.32 16.11 H16.11 V13.32" />
-        </g>
-      </svg>
+      <img :src="appIcon" alt="" width="18" height="18" />
     </div>
     <div class="titlebar__title">{{ t("titleBar.appName") }}</div>
     <div class="titlebar__spacer" data-tauri-drag-region />

@@ -19,6 +19,7 @@ const { t } = useI18n();
 const {
   analysis,
   analyzing,
+  openReplace,
   blockTableKey,
   blockTableColumns,
   BLOCK_PAGE_SIZE,
@@ -55,6 +56,11 @@ const {
           </i18n-t>
         </a-space>
         <span class="preview__spacer" />
+        <!-- 方块替换放在方块列表里：它改的正是这张表里的方块，
+             入口与被作用的对象在同一区域。 -->
+        <a-button size="mini" type="primary" @click="openReplace">
+          {{ t("stats.replace") }}
+        </a-button>
         <a-button size="mini" @click="copyBlockTable">{{ t("stats.copyTable") }}</a-button>
         <a-button size="mini" @click="exportBlockTable">{{ t("stats.exportTable") }}</a-button>
         <a-button

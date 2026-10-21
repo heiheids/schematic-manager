@@ -44,13 +44,17 @@ body,
   &__logo {
     width: 18px;
     height: 18px;
-    border-radius: 4px;
-    // 与程序图标同源的深底。标识不跟随主题主色（品牌标识换了色就不成标识），
-    // 但纯深底在深色主题下会与标题栏背景糊在一起，所以在块外另给一档亮底色。
-    background: #1e293b;
+    // 标识位图自带深底与圆角（母版就是圆角方块），这里只负责定位，
+    // 不再画底色或圆角——否则会与图里的圆角错开、露出两层边。
     display: flex;
     align-items: center;
     justify-content: center;
+
+    img {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
   }
 
   &__title {
@@ -295,13 +299,23 @@ body[arco-theme='dark'] .titlebar__logo {
     background: var(--color-bg-2);
   }
 
-  // 顶部操作条靠左，并在下方留一条分隔线，与表格区分开
+  // 顶部操作条靠左，并在下方留一条分隔线，与表格区分开。
+  // 允许换行：目录栏可以被拖窄，搜索框加上按钮放不进一行时宁可换行，
+  // 也不要压扁搜索框（压扁后连输入的内容都看不清）。
   &__ops {
+    flex-wrap: wrap;
     border-bottom: 1px solid var(--color-border-1);
   }
 
-  // 底部多选条：上方留分隔线，计数靠左、按钮靠右
+  // 搜索框占满一行剩余宽度，但给按钮留出位置
+  &__search {
+    flex: 1 1 160px;
+    min-width: 120px;
+  }
+
+  // 底部多选条：上方留分隔线
   &__checks {
+    flex-wrap: wrap;
     border-top: 1px solid var(--color-border-1);
   }
 }
@@ -385,6 +399,18 @@ body[arco-theme='dark'] .titlebar__logo {
     // 键盘聚焦时给一条可见的提示，颜色交给主题变量
     box-shadow: 0 0 0 2px rgb(var(--primary-3));
   }
+
+  // 横放的分隔条：用于预览区与页签区之间，拖动改高度而不是宽度
+  &--horizontal {
+    width: auto;
+    height: 5px;
+    cursor: row-resize;
+
+    // 命中区域向上下各扩 2px
+    &::after {
+      inset: -2px 0;
+    }
+  }
 }
 
 .detail {
@@ -394,6 +420,19 @@ body[arco-theme='dark'] .titlebar__logo {
   min-width: 0;
   min-height: 0;
   background: var(--color-bg-2);
+
+  // 拖动分隔条期间：屏蔽文本选择并统一光标，
+  // 否则指针移到舞台或信息列上时光标会跳回默认样式。
+  // 水平与垂直各一个类：同一时刻只会拖其中一条。
+  &.is-resizing-h {
+    user-select: none;
+    cursor: row-resize;
+  }
+
+  &.is-resizing-v {
+    user-select: none;
+    cursor: col-resize;
+  }
 }
 
 .statusbar {
@@ -494,35 +533,26 @@ $info-min-w: 300px;
 $preview-stage-w: 398px;
 $preview-stage-h: 344px;
 
-// 预览行的固定高度 = 舞台高度 + 上下内边距（各 8px）。
+// 预览面板与舞台的尺寸关系（这几项推导出窗口的最小尺寸要求，改动前先读一遍）：
 //
-// 用户要求「界面不许自行变化尺寸」：此前信息列用 max-height: calc(100vh - …)
-// 单独约束，被夹短之后内容**溢出可见**，而下面的控制条紧接着被夹短的盒子
-// 排版，于是盖在信息内容上（实测「投影名称」被控制条压住）。
-//
-// 现在整行高度由舞台尺寸推出、不再依赖视口：信息列由 align-items: stretch
-// 跟着行高走，装不下的部分在自己的滚动区里滚，绝不溢出到控制条上；
-// 切换页签、选中文件也不会让分割线移动。
-//
-// 高度写死带来的**必要条件**是窗口足够大，这不是实现细节而是这条需求的
-// 直接后果，因此要在 tauri.conf.json 里如实声明：
-//
-//   预览面板 = 预览行 360 + 控制条 40 + 分隔线 1 = 401
+//   预览面板高度 = 舞台高 + 上下内边距 16 + 控制条 40 + 分隔线 1
+//   默认 401，与用户截图里标注的红框一致（舞台 398×344）
 //   页签区下限 = 160（再小就放不下统计条与一行表格）
 //   详情区高度实测 = 窗口高 − 199
 //
 // 要让「方块表至少露出一行」还需要页签区约 184px（表头 31 + 一行 41 +
 // 统计条与提示），即详情区 ≥ 622，对应窗口高 ≥ 821。
-// 因此 minHeight 提到 820、minWidth 提到 1400（舞台 398 加信息列
-// 至少 300 需要约 1397）。
+// 因此 tauri.conf.json 里 minHeight 为 820、minWidth 为 1400（舞台 398 加
+// 信息列至少 300 需要约 1397）。
 //
-// 注意：这是固定尺寸的代价。若将来要支持 768 高的屏幕，只能让舞台
-// 在窗口过矮时收缩，而那就与「固定尺寸」这条要求相冲突了。
-$preview-row-h: $preview-stage-h + 16px;
+// 面板高度本身由用户拖分隔条调整（见 composables/usePreviewResize），
+// 舞台按 398:344 等比缩放；窗口缩放时两者都不自动变化，只有拖动才改变，
+// 因此「界面不自行变化尺寸」与「允许用户调整」可以同时成立。
 
 .preview {
-  // 固定高度、不参与伸缩：下面页签区拿到的是「详情区高度 − 本面板高度」，
-  // 与预览内容多少无关，因此页签高度不会随页签切换而跳动。
+  // 高度由 DetailPanel 内联给出（用户可拖分隔条调整），不参与伸缩：
+  // 下面页签区拿到的是「详情区高度 − 本面板高度」，与预览内容多少无关，
+  // 因此页签高度不会随页签切换而跳动。
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
@@ -530,44 +560,52 @@ $preview-row-h: $preview-stage-h + 16px;
   background: var(--color-bg-2);
   overflow: hidden;
 
-  // 预览舞台：固定尺寸，见上面的 $preview-stage-*。
+  // 预览舞台：宽高由 DetailPanel 内联给出，随面板高度等比缩放。
+  // 这里的 $preview-stage-* 只是没有内联值时的兜底。
+  //
+  // 不能再写 max-width / max-height：内联尺寸变大时会被它们截回默认值，
+  // 舞台就永远停在 398×344 而拖动无效。
+  //
+  // align-self 用 stretch 而不是 flex-start：舞台高度由内联样式给出，
+  // 但让它在行内纵向拉伸可以保证行高变化时不留缝隙。
   &__stage {
     flex: 0 0 auto;
     width: $preview-stage-w;
     height: $preview-stage-h;
     min-width: 0;
-    max-width: $preview-stage-w;
-    max-height: $preview-stage-h;
-    align-self: flex-start;
+    align-self: stretch;
     overflow: hidden;
     background: var(--color-fill-1);
   }
 
-  // 预览与信息并排。行高写死，与窗口高度无关。
+  // 预览与信息并排：占满面板剩余高度（面板高度减去控制条）。
+  // 这里必须是 flex 撑满而不是写死行高，否则面板被拖矮后内容会溢出到控制条上。
+  //
+  // 不设 gap：舞台与信息列之间就是那条可拖动的垂直分隔条，它自己占位。
+  // 加 gap 会在分隔条两侧各留一段空白，看起来像断开的线。
   &__main {
     display: flex;
     align-items: stretch;
-    gap: 12px;
     padding: 8px;
-    height: $preview-row-h;
+    flex: 1 1 auto;
+    min-height: 0;
     min-width: 0;
     box-sizing: border-box;
   }
 
-  // 信息列：占满预览右侧的剩余宽度，并在很宽的窗口下拉住上限，
-  // 否则单行文字会长到难以阅读。
+  // 信息列：吃掉舞台之外的剩余宽度，与舞台一起占满预览行。
   //
-  // 用 flex:0 1 auto 而不是 flex:1 1 auto：两列都按 flex-grow 分空间时，
-  // 信息列会白白吃掉一半宽度。让它按内容宽度取（上限 620px），其余留白。
+  // 这里不再给最大宽度：早期为了「单行文字别太长」封顶 620px，但那样舞台
+  // 加信息列在宽窗口下填不满预览行，右侧留出一片空白。宽度现在由用户拖
+  // 垂直分隔条决定——想让信息列窄一点，把舞台拖宽即可。
   //
-  // 高度由行高决定（align-items: stretch），并且**必须 overflow: hidden**：
-  // 内容超出时若任其溢出，它会画到下面的控制条上（用户实测到的重叠）。
+  // **必须 overflow: hidden**：内容超出时若任其溢出，它会画到下面的控制条上
+  // （用户实测到的重叠）。内容过高由内部滚动条消化（见 &__info-body）。
   &__info {
     display: flex;
     flex-direction: column;
     flex: 1 1 auto;
     min-width: 0;
-    max-width: 620px;
     min-height: 0;
     overflow: hidden;
   }
@@ -755,11 +793,11 @@ $preview-row-h: $preview-stage-h + 16px;
   cursor: pointer;
 }
 
-// 操作日志列表：逐条分开，每条三段——时间、动作、细节。
+// 运行日志列表：逐条分开，每条四段——时间、等级、动作、细节。
 // 原先整行用等宽字体 + pre-wrap + break-all 直接铺出来：时间戳是 20 位数字，
 // 说明里可能塞几十个文件名，于是一整块糊在一起，逐条阅读很吃力。
-// 现在时间单独占一列（等宽、固定宽度），动作成标签，细节另起一段正常换行；
-// 条目之间用边框与留白分开。
+// 现在时间单独占一列（等宽、固定宽度），等级与动作各成一个标签，细节另起一段
+// 正常换行；条目之间用边框与留白分开。
 //
 // 这里不设 max-height、也不自己滚：两处宿主（备份抽屉的日志页签、日志管理
 // 窗口）都已经把内容包在 Arco 无轨道滚动条里，自带原生滚动条会多出一条。
@@ -791,6 +829,11 @@ $preview-row-h: $preview-stage-h + 16px;
   &__body {
     flex: 1 1 auto;
     min-width: 0;
+  }
+
+  // 等级：颜色由 Arco 标签色板给（见 RunLogList.vue），这里只管与动作分开
+  &__level {
+    margin-right: 6px;
   }
 
   // 动作：单独一个标签，扫一眼就知道这条是什么操作
@@ -1482,30 +1525,35 @@ body[arco-theme='dark'] .repl-block--empty .arco-input-wrapper {
   font-size: 13px;
 }
 
-// 弹出层的高度：上下都要与页面边缘留出距离，不要铺满整屏。
+// 弹出层的高度与位置：上下都与页面边缘留出距离，且垂直居中。
 //
-// Arco 的弹窗默认靠 `text-align: center` + `inline-block` + `vertical-align: middle`
-// 做水平与垂直居中，本身不限高：内容一多就把遮罩层撑成可滚动的，标题与按钮
-// 随之滚出视野。这里给弹窗封顶并改成纵向 flex，body 于是在弹窗内部伸缩。
+// Arco 原本靠 `text-align: center` + `inline-block` + `vertical-align: middle`
+// 居中，本身不限高：内容一多就把遮罩层撑成可滚动的，标题与按钮随之滚出视野。
+// 为了封顶并让 body 在弹窗内部伸缩，这里把弹窗改成了纵向 flex——而 display
+// 一改，上面那套 vertical-align 居中就失效了（实测弹窗贴到屏幕顶部）。
 //
-// 改了 display 之后 Arco 那套 vertical-align 居中就失效了（实测弹窗贴到屏幕
-// 顶部，上方没有留白），因此**必须自己给上下外边距**，不能只靠 max-height。
-// `calc(100vh - 160px)` 的上限加上 24px 上下边距，最多占满视口也不溢出，
-// 遮罩层因此不会变成可滚动的——否则滚轮一动，整个弹窗会跟着上移。
-// 宽度仍由各弹窗的 width 属性以内联样式给出，配合 margin 的 auto 保持水平居中。
+// 因此居中改由遮罩层承担：它变成 flex 容器后，`align-items: center` 做垂直
+// 居中、`justify-content: center` 做水平居中，弹窗自己的 display 就不必再迁就
+// Arco 的老写法。`align-items` 必须显式写：flex 默认是 stretch，会把弹窗拉成
+// 整屏高。
+//
+// `max-height` 上限加上 24px 外边距，最多占满视口也不溢出，遮罩层因此不会
+// 变成可滚动的——否则滚轮一动，整个弹窗会跟着上移。
+.arco-modal-wrapper {
+  // 遮罩层是 Arco 的滚动容器（overflow: auto）。弹窗封顶后它永远不需要滚动，
+  // 但只要它还能滚，滚轮落在弹窗的非滚动区域（标题、按钮行）时就会带着整个
+  // 弹窗上移（实测 scrollTop=300 时弹窗位移 -300）。直接关掉它的滚动。
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .arco-modal {
   display: flex;
   flex-direction: column;
   max-height: calc(100vh - 160px);
-  margin: 24px auto;
-}
-
-// 遮罩层是 Arco 的滚动容器（overflow: auto）。弹窗封顶后它永远不需要滚动，
-// 但只要它还能滚，滚轮落在弹窗的非滚动区域（标题、按钮行）时就会**带着整个
-// 弹窗上移**（实测 scrollTop=300 时弹窗位移 -300）。直接关掉它的滚动：
-// 内容超出的部分由弹窗内部的滚动条负责，这里不该再出现第二条滚动路径。
-.arco-modal-wrapper {
-  overflow: hidden;
+  margin: 24px;
 }
 
 // Arco 表格的滚动链。
@@ -1523,8 +1571,8 @@ body[arco-theme='dark'] .repl-block--empty .arco-input-wrapper {
 // `.arco-scrollbar-container` 还要显式给 min-height: 0，否则它的默认
 // min-height: auto 会挡住收缩，同样撑到内容高度。
 //
-// 同理，不要在外面再套一层 a-scrollbar：那会让高度先经过一个不参与 flex 的
-// 容器，滚动条滑块拖动时会滚不动。
+// 同理，不要在外面再套一层 a-scrollbar：Table 自己已经有滚动条，
+// 外层那一条的容器既不参与 Table 的滚动、又会多出一条不动的滑块。
 .scroll-table,
 .scroll-table > .arco-spin,
 .scroll-table > .arco-spin > .arco-table-container,
@@ -1547,19 +1595,27 @@ body[arco-theme='dark'] .repl-block--empty .arco-input-wrapper {
   min-height: 0;
 }
 
-// 可滚动区域：让 Arco 的无轨道滚动条真的在给定高度内滚动。
+// 可滚动区域：让 Arco 的无轨道滚动条真的滚起来。
 //
-// Arco 的结构是 `.arco-scrollbar`（根，Arco 自己给了 height: 100%）套
-// `.arco-scrollbar-container`（真正滚动的那个，height: 100% + overflow: auto）。
-// 当根的高度由**父级 flex 布局**决定时，容器的 `height: 100%` 解析不成确定值，
-// 于是它退回按内容撑开、`overflow: auto` 形同虚设：内容溢出到弹窗遮罩层
-// （`.arco-modal-wrapper` 是 overflow: auto）上，表现为**一滚动整个弹窗往上移，
-// 列表自己不滚**。实测：根 464px、容器却 1565px。
+// Arco 只给 `.arco-scrollbar`（根）和 `.arco-scrollbar-container`（内容容器）
+// 各一句 `position: relative` 与隐藏原生滚动条的样式，**既没给 height，
+// 也没给 overflow**——滚动能力要使用方自己给。少了 `overflow: auto`，
+// 容器即使被限住高度也只是把内容裁掉：滚动条照样画、滑块照样显示，
+// 但 `container.scrollTop = 200` 仍是 0，拖动滑块也一动不动
+// （实测日志窗口：容器 c397/s14025，设 scrollTop 无反应、拖滑块 0 → 0）。
 //
-// 修法是把高度沿 flex 传下去，不再依赖百分比：根当纵向 flex 容器，
-// 容器由 flex 拿到确定高度。
+// 两件事缺一不可：
+//   1. 高度要确定。根的高度由父级 flex 决定时，容器的 `height: 100%` 解析不成
+//      确定值，会退回按内容撑开（实测根 464px、容器 1565px），因此高度沿 flex
+//      传下去：根当纵向 flex 容器，容器用 flex 拿到确定高度。
+//   2. 容器自己要 `overflow: auto`，否则它根本不能滚。
+//
 // 用法：`<a-scrollbar type="embed" class="scroll-fill__inner" outer-class="scroll-fill">`
-// （普通 class 会落到内部容器上，根要用 outer-class）。
+// （普通 class 落到内部容器上，根要用 outer-class）。
+//
+// 注意 Arco Table 不适用这条：它自己给 `.arco-table-body` 设了 overflow 与
+// max-height，额外套一层 a-scrollbar 反而会多出一条不参与滚动的容器
+// （见 .scroll-table 的说明）。
 .scroll-fill {
   display: flex;
   flex-direction: column;
@@ -1568,7 +1624,17 @@ body[arco-theme='dark'] .repl-block--empty .arco-input-wrapper {
 }
 
 .scroll-fill__inner {
+  overflow: auto;
   flex: 1 1 auto;
+  min-height: 0;
+}
+
+// 抽屉里日志页签的宿主：抽屉内容区没有确定高度，这里给它一个，
+// 滚动区（.scroll-fill）再在里面 flex 伸缩，容器这才拿得到确定高度。
+.log-scroll-host {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 220px);
   min-height: 0;
 }
 

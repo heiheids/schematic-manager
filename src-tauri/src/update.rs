@@ -249,9 +249,16 @@ pub fn check() -> AppResult<CheckOutcome> {
         .set("Accept", "application/vnd.github+json")
         .call()
         .map_err(|e| AppError::Parse(format!("检查更新失败 {RELEASES_URL}：{e}")))?;
+    let status = resp.status();
     let body = resp
         .into_string()
         .map_err(|e| AppError::Parse(format!("读取发布列表失败：{e}")))?;
+    if crate::run_log::enabled(crate::run_log::Level::Debug) {
+        crate::run_log::debug(&format!(
+            "GET {RELEASES_URL} -> {status}\n{}",
+            crate::run_log::clip_body(&body)
+        ));
+    }
 
     let current = Version::parse(current_version())
         .ok_or_else(|| AppError::Parse(format!("当前版本号无法解析：{}", current_version())))?;

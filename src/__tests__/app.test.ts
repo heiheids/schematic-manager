@@ -127,6 +127,10 @@ function mountApp() {
   });
 }
 
+/** 运行日志目录：界面显示的路径必须来自后端 run_log_dir，而不是前端自己拼的
+ *  （identifier 改过一次，拼出来的位置会指向不存在的地方）。 */
+const LOG_DIR = "C:\\Users\\tester\\AppData\\Roaming\\io.github.heiheids.schematic-manager\\logs";
+
 /** 一个可用的场景数据，字段与后端 SceneData 对齐 */
 const scene: SceneData = {
   batches: [],
@@ -199,8 +203,11 @@ function stubInvoke(overrides: Record<string, unknown> = {}) {
       case "setup_add_versions":
         return { outcomes: [] };
       case "list_backups":
-      case "read_operation_log":
+      case "read_run_log":
         return [];
+      case "run_log_dir":
+        // 契约是 string | null。默认给一个目录，说明文案里才会显示日志位置
+        return LOG_DIR;
       case "rename_schematic":
         // 契约是 RenameOutcome。默认「名字没变」，因此路径与文件名都取空，
         // 需要断言改名的用例自己给出具体返回值。
@@ -219,6 +226,11 @@ function stubInvoke(overrides: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   mockInvoke.mockReset();
+  // invoke 的契约是**总返回 Promise**：替身若在未设实现时返回 undefined，
+  // 调用链上的 `.catch`（api.ts 的命令失败上报、界面诊断上报）会直接崩成
+  // TypeError，测出来的就不是被测代码的问题了。这里补上默认值，让替身与
+  // 真实 invoke 的形状一致。
+  mockInvoke.mockResolvedValue(undefined as never);
   mockOpen.mockReset();
   mockOpen.mockResolvedValue(null);
   // 主题用例会替换 getCurrentWindow 的返回值；不复位的话，
@@ -240,29 +252,38 @@ describe("界面外壳", () => {
     expect(() => mountApp()).not.toThrow();
   });
 
-  it("工具栏列出全部功能入口", () => {
+  it("功能入口各自出现在被作用的面板里", () => {
     const w = mountApp();
-    const text = w.text();
-    for (const label of [
-      "添加目录",
-      "方块替换",
-      "版本转换",
+    // 入口与它作用的对象在同一区域：搜索与重复筛查在投影列表、
+    // 方块替换在方块列表、版本转换在投影信息区。
+    // 这里核对「不在工具栏、而在对应面板」，防止以后搬家时漏掉或搬错。
+    const toolbar = w.find(".toolbar");
+    expect(toolbar.find("input").exists(), "工具栏不应再有搜索框").toBe(false);
+
+    const labels = (sel: string) =>
+      w.findAll(`${sel} button`).map((b) => b.text().trim());
+    expect(labels(".sidebar__ops").join(" "), "投影列表区应有重复文件筛查").toContain(
       "重复文件筛查",
-      "备份与日志",
-      "版本库",
-    ]) {
-      expect(text, `工具栏应含「${label}」`).toContain(label);
+    );
+
+    // 与选中项无关的入口仍在工具栏
+    const toolbarText = toolbar.text();
+    for (const label of ["添加目录", "备份与日志", "版本库"]) {
+      expect(toolbarText, `工具栏应含「${label}」`).toContain(label);
     }
     w.unmount();
   });
 
-  it("未选中文件时，依赖选中项的按钮被禁用", () => {
+  it("未选中文件时不出现依赖选中项的入口", async () => {
     const w = mountApp();
+    await flushPromises();
     const buttons = w.findAll("button");
     const find = (label: string) => buttons.find((b) => b.text().includes(label));
-    // 这两个功能以「有选中的投影文件」为前提，无选中时应禁用而不是可点后报错
-    expect(find("方块替换")?.attributes("disabled"), "方块替换应禁用").toBeDefined();
-    expect(find("版本转换")?.attributes("disabled"), "版本转换应禁用").toBeDefined();
+    // 方块替换与版本转换都以「选中的投影文件」为前提。它们现在分别放在
+    // 方块列表与投影信息区，而那两块在无选中时整块不渲染，入口自然不可达
+    // ——比「可见但禁用」更彻底，用户不会去点一个点了报错的按钮。
+    expect(find("方块替换"), "无选中时不应出现方块替换").toBeUndefined();
+    expect(find("版本转换"), "无选中时不应出现版本转换").toBeUndefined();
     // 与选中项无关的入口应始终可用
     expect(find("添加目录")?.attributes("disabled")).toBeUndefined();
     expect(find("备份与日志")?.attributes("disabled")).toBeUndefined();
@@ -1041,10 +1062,11 @@ describe("重新扫描后的选中项", () => {
       "选中项已不在列表中，应回到空状态而不是继续显示旧文件的详情",
     ).toContain("选择一个投影文件以查看详情");
 
-    // 依赖选中项的按钮必须同步禁用，否则点下去会作用到旧路径
+    // 依赖选中项的入口必须同步消失，否则点下去会作用到旧路径。
+    // 它们分别放在方块列表与投影信息区，选中项没了这两块就不渲染。
     const btn = (label: string) => w.findAll("button").find((b) => b.text().includes(label));
-    expect(btn("方块替换")?.attributes("disabled"), "移除后应禁用").toBeDefined();
-    expect(btn("版本转换")?.attributes("disabled"), "移除后应禁用").toBeDefined();
+    expect(btn("方块替换"), "移除后不应再有方块替换入口").toBeUndefined();
+    expect(btn("版本转换"), "移除后不应再有版本转换入口").toBeUndefined();
     w.unmount();
   });
 
@@ -2464,7 +2486,8 @@ describe("多目录与列宽复位", () => {
 
     expect(w.text(), "文件已不显示，应回到空状态").toContain("选择一个投影文件以查看详情");
     const btn = (label: string) => w.findAll("button").find((x) => x.text().includes(label));
-    expect(btn("方块替换")?.attributes("disabled"), "依赖选中项的按钮应禁用").toBeDefined();
+    // 入口随信息区 / 方块列表一起消失，用户不会点到作用在旧路径上的按钮
+    expect(btn("方块替换"), "依赖选中项的入口应消失").toBeUndefined();
     w.unmount();
   });
 });
@@ -2698,6 +2721,36 @@ describe("界面状态记忆", () => {
       "不认识的版本不应被套用".replace("不应被套用", "不应被采用"),
     ).not.toContain("111");
     w.unmount();
+  });
+
+  it("界面状态写入失败时只写一条带命令名的 error 运行日志", async () => {
+    // 写盘失败原来会记两条（命令一条、界面语境一条），现在收口成一条：
+    // 由 api.ts 的 logged 出口按命令名记，排查时能直接定位是哪条命令。
+    mockInvoke.mockImplementation((async (cmd: string) => {
+      if (cmd === "load_ui_state") return null;
+      if (cmd === "save_ui_state") throw new Error("磁盘只读");
+      return undefined;
+    }) as never);
+
+    const w = mountApp();
+    await flushPromises();
+
+    // 改一下界面状态，卸载时防抖中的写盘会立刻执行，必然撞上失败的替身
+    const splitter = w.find(".splitter").element as HTMLElement;
+    splitter.dispatchEvent(
+      new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: 0 }),
+    );
+    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 800 }));
+    window.dispatchEvent(new PointerEvent("pointerup", { clientX: 800 }));
+    await flushPromises();
+    w.unmount();
+    await flushPromises();
+
+    const events = mockInvoke.mock.calls.filter((c) => c[0] === "log_ui_event");
+    expect(events.length, "同一次失败只应留一条日志").toBe(1);
+    const args = events[0][1] as { level: string; message: string };
+    expect(args.level, "命令失败属于错误").toBe("error");
+    expect(args.message, "说明里要带上失败的命令名").toContain("save_ui_state");
   });
 });
 
@@ -3202,7 +3255,7 @@ describe("方块栏渲染图", () => {
   });
 });
 
-/** 日志管理窗口：从备份与日志的「操作日志」页签进入 */
+/** 日志管理窗口：从备份与日志的「运行日志」页签进入 */
 describe("日志管理窗口", () => {
   /** 在弹窗里按文字找按钮 */
   function bodyButton(label: string): HTMLElement | undefined {
@@ -3240,18 +3293,20 @@ describe("日志管理窗口", () => {
     return [...root.querySelectorAll(".log-list__row")].map((r) => r.textContent ?? "");
   }
 
-  /** 从「备份与日志」的「操作日志」页签打开日志管理窗口。
+  /** 从「备份与日志」的「运行日志」页签打开日志管理窗口。
    *
-   * read_operation_log 用**有状态**替身：清空之后必须真的读到空，
+   * read_run_log 用**有状态**替身：清空之后必须真的读到空，
    * 否则「清空 → 界面变空」这条链路验不出来（固定数组会让漏掉刷新也照样通过）。
+   *
+   * `lines` 可换成别的日志内容，用来覆盖等级标签一类的展示分支。
    */
-  async function openLogWindow(extra: Record<string, unknown> = {}) {
-    // 与后端实际写出的格式一致：纳秒时间戳 + 制表符 + 说明。
+  async function openLogWindow(extra: Record<string, unknown> = {}, lines?: string[]) {
+    // 与后端实际写出的格式一致：纳秒时间戳 + 制表符 + 大写等级 + 制表符 + 说明。
     // 这里曾经写成「2026-10-15 12:00:00\t…」——那是格式化后的时间，
     // 后端从不这么写，界面也就照不出真实的显示效果。
     const state = {
-      lines: [
-        "1792138651762518000\t替换 demo.litematic：石头（minecraft:stone） -> 泥土（minecraft:dirt），共 12 个",
+      lines: lines ?? [
+        "1792138651762518000\tINFO\t替换 demo.litematic：石头（minecraft:stone） -> 泥土（minecraft:dirt），共 12 个",
       ],
     };
     stubInvoke({
@@ -3260,23 +3315,23 @@ describe("日志管理窗口", () => {
     const w = mountApp();
     await flushPromises();
 
-    // 备份与日志抽屉 → 操作日志页签 → 日志管理
+    // 备份与日志抽屉 → 运行日志页签 → 日志管理
     const entry = w.findAll("button").find((b) => b.text().includes("备份与日志"));
     expect(entry, "工具栏应有「备份与日志」").toBeTruthy();
     await entry!.trigger("click");
     await flushPromises();
     const tab = [...document.querySelectorAll<HTMLElement>(".arco-tabs-tab")].find((t) =>
-      (t.textContent ?? "").includes("操作日志"),
+      (t.textContent ?? "").includes("运行日志"),
     );
-    expect(tab, "备份与日志里应有「操作日志」页签").toBeTruthy();
+    expect(tab, "备份与日志里应有「运行日志」页签").toBeTruthy();
     tab!.click();
     await flushPromises();
 
     // 叠一层带状态的日志命令替身
     const base = mockInvoke.getMockImplementation()!;
     mockInvoke.mockImplementation((async (cmd: string, args: never) => {
-      if (cmd === "read_operation_log") return [...state.lines];
-      if (cmd === "clear_operation_log") {
+      if (cmd === "read_run_log") return [...state.lines];
+      if (cmd === "clear_run_log") {
         state.lines = [];
         return undefined;
       }
@@ -3284,12 +3339,14 @@ describe("日志管理窗口", () => {
     }) as never);
 
     const btn = bodyButton("日志管理");
-    expect(btn, "「操作日志」页签里应有「日志管理」按钮").toBeTruthy();
+    expect(btn, "「运行日志」页签里应有「日志管理」按钮").toBeTruthy();
     // 进页签时抽屉已读过一次，记下来供「打开窗口又读一次」的断言比对
-    const readsBeforeOpen = calls("read_operation_log");
+    const readsBeforeOpen = calls("read_run_log");
+    // 打开窗口会顺带刷新一次归档日期，同样记下来供断言比对
+    const configuresBeforeOpen = calls("configure_run_log");
     btn!.click();
     await flushPromises();
-    return { w, state, readsBeforeOpen };
+    return { w, state, readsBeforeOpen, configuresBeforeOpen };
   }
 
   /** 二次确认弹层里的「清空」按钮。
@@ -3305,18 +3362,24 @@ describe("日志管理窗口", () => {
     return mockInvoke.mock.calls.filter((c) => c[0] === cmd).length;
   }
 
-  it("「日志」按钮打开日志管理窗口并逐条分开显示日志", async () => {
+  it("「日志管理」按钮打开日志管理窗口并逐条分开显示日志", async () => {
     const { w } = await openLogWindow();
     const modal = logModal();
     expect(modal, "应打开日志管理窗口").toBeTruthy();
 
-    // 每条的三个部分各自成元素：时间单独一列、动作成标签、细节另起一段。
+    // 用户要看得见日志在哪：窗口说明里显示的必须是后端给的目录
+    expect(modal!.textContent, "说明里应写明日志位置").toContain(LOG_DIR);
+
+    // 每条的四个部分各自成元素：时间单独一列、等级与动作各成标签、细节另起一段。
     // 断言不再比对整行原文——正因为「整行糊成一段」才要改版。
     const row = modal!.querySelector(".log-list__row")!;
     // 形状写死到时分秒：区域设置一变，toLocaleString 会给出
     // 10/16/2026, 8:17:31 AM 这类 12 小时制，年在前面的断言挡不住
     expect(row.querySelector(".log-list__time")!.textContent, "时间要格式化成日期").toMatch(
       /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}$/,
+    );
+    expect(row.querySelector(".log-list__level")!.textContent?.trim(), "应显示等级标签").toBe(
+      "提示",
     );
     expect(row.querySelector(".log-list__action")!.textContent?.trim()).toBe("替换");
     expect(row.querySelector(".log-list__detail")!.textContent).toContain(
@@ -3331,21 +3394,106 @@ describe("日志管理窗口", () => {
     w.unmount();
   });
 
+  it("每条日志的等级标签按等级渲染", async () => {
+    const { w } = await openLogWindow({}, [
+      "1792138651762518000\tERROR\t替换失败：目标文件只读",
+      "1792138651762518001\tWARN\t转换跳过了 1 种方块",
+      "1792138651762518002\tINFO\t替换 demo.litematic",
+      "1792138651762518003\tDEBUG\t读取方块库版本 3465",
+    ]);
+    const rows = [...logModal()!.querySelectorAll(".log-list__row")];
+    const tags = rows.map((r) => r.querySelector(".log-list__level"));
+    expect(tags.map((t) => t?.textContent?.trim())).toEqual(["错误", "警告", "提示", "调试"]);
+    // 颜色走 Arco 标签的内置色板（深浅主题各自有一套）：错误红、调试灰
+    expect(tags[0]!.className, "错误应是红色标签").toContain("arco-tag-red");
+    expect(tags[3]!.className, "调试应是灰色标签").toContain("arco-tag-gray");
+    // 等级列是独立一列，不该混进动作里
+    expect(rows[0].querySelector(".log-list__action")!.textContent).toBe("替换失败：目标文件只读");
+    w.unmount();
+  });
+
+  it("切换日志等级会调用 configure_run_log，并带上等级与本地日期", async () => {
+    const { w } = await openLogWindow();
+    const before = calls("configure_run_log");
+    const select = logModal()!.querySelector(
+      ".arco-select-view, .arco-select",
+    ) as HTMLElement | null;
+    expect(select, "日志窗口应有等级选择器").toBeTruthy();
+    select!.click();
+    await flushPromises();
+    const opt = [...document.querySelectorAll<HTMLElement>(".arco-select-option")].find(
+      (o) => (o.textContent ?? "").trim() === "调试",
+    );
+    expect(opt, "等级选择器应有「调试」一档").toBeTruthy();
+    opt!.click();
+    await flushPromises();
+
+    expect(calls("configure_run_log"), "改等级后应再推一次给后端").toBe(before + 1);
+    const last = mockInvoke.mock.calls.filter((c) => c[0] === "configure_run_log").at(-1)!;
+    expect((last[1] as { level: string }).level, "应把选中的等级交给后端").toBe("debug");
+    expect((last[1] as { localDate: string }).localDate, "应带上本地日期").toMatch(
+      /^\d{4}-\d{2}-\d{2}$/,
+    );
+
+    // 等级还要被记住。界面状态的写盘是防抖的，卸载会把它立刻写出，
+    // 因此不必等 400ms 也能确定地读到这次改动。
+    w.unmount();
+    await flushPromises();
+    const saves = mockInvoke.mock.calls.filter((c) => c[0] === "save_ui_state");
+    const saved = JSON.parse((saves.at(-1)![1] as { json: string }).json) as {
+      logLevel?: string;
+    };
+    expect(saved.logLevel, "改过的等级应写进界面状态").toBe("debug");
+  });
+
+  it("恢复记忆里的日志等级，并在启动后把等级与本地日期推给后端", async () => {
+    const { w } = await openLogWindow({
+      load_ui_state: JSON.stringify({ version: 1, logLevel: "debug", dirs: [] }),
+    });
+    const shown = logModal()!.querySelector(".arco-select-view-value")?.textContent?.trim();
+    expect(shown, "选择器应显示记忆里的等级").toBe("调试");
+
+    // 恢复之后必须推一次：后端得知道该收哪些行、写进哪一天的文件
+    const pushed = mockInvoke.mock.calls.filter((c) => c[0] === "configure_run_log");
+    expect(pushed.length, "启动时应推一次日志设置").toBeGreaterThan(0);
+    const args = pushed.at(-1)![1] as { level: string; localDate: string };
+    expect(args.level, "推的应是恢复出来的等级").toBe("debug");
+    expect(args.localDate, "应带上当前的本地日期").toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    w.unmount();
+  });
+
+  it("后端给不出日志目录时不显示位置，不猜一个路径", async () => {
+    const { w } = await openLogWindow({ run_log_dir: null });
+    // 路径由后端算；拿不到就整条不显示——显示一个猜的位置比不显示更糟
+    expect(logModal()!.textContent, "不应显示日志位置").not.toContain("日志位置");
+    w.unmount();
+  });
+
   it("打开日志窗口时随即读取一次日志", async () => {
-    // 进入「操作日志」页签时抽屉已经读过一次，因此这里比对的是
+    // 进入「运行日志」页签时抽屉已经读过一次，因此这里比对的是
     // 「打开窗口又读了一次」，而不是总次数恰好为一
     const { w, readsBeforeOpen } = await openLogWindow();
     expect(logModal(), "此时日志窗口应已打开").toBeTruthy();
-    expect(calls("read_operation_log"), "打开窗口应再读一次").toBe(readsBeforeOpen + 1);
+    expect(calls("read_run_log"), "打开窗口应再读一次").toBe(readsBeforeOpen + 1);
+    w.unmount();
+  });
+
+  it("打开日志管理窗口会把等级与当前日期再推一次", async () => {
+    // 跨天挂机时，按大小滚动出来的归档要用「今天」的日期命名，
+    // 因此每次打开窗口都要顺手刷新一次日期（见 store/backups.ts 的 openLogs）
+    const { w, configuresBeforeOpen } = await openLogWindow();
+    expect(calls("configure_run_log"), "打开窗口应再推一次日志设置").toBe(
+      configuresBeforeOpen + 1,
+    );
     w.unmount();
   });
 
   it("「刷新」再读一次日志", async () => {
     const { w } = await openLogWindow();
-    const before = calls("read_operation_log");
+    const before = calls("read_run_log");
     logButton("刷新")!.click();
     await flushPromises();
-    expect(calls("read_operation_log"), "刷新应再读一次").toBe(before + 1);
+    expect(calls("read_run_log"), "刷新应再读一次").toBe(before + 1);
     w.unmount();
   });
 
@@ -3366,7 +3514,7 @@ describe("日志管理窗口", () => {
     const { w } = await openLogWindow();
     logButton("打开日志所在目录")!.click();
     await flushPromises();
-    expect(calls("open_operation_log_dir"), "应调用 open_operation_log_dir").toBe(1);
+    expect(calls("open_run_log_dir"), "应调用 open_run_log_dir").toBe(1);
     w.unmount();
   });
 
@@ -3376,7 +3524,7 @@ describe("日志管理窗口", () => {
     // 只点触发器还不该清空：清空不可撤销，必须先确认
     logButton("清空日志")!.click();
     await flushPromises();
-    expect(calls("clear_operation_log"), "确认之前不应清空").toBe(0);
+    expect(calls("clear_run_log"), "确认之前不应清空").toBe(0);
     expect(state.lines.length, "确认之前日志内容不应变").toBe(1);
 
     const ok = confirmClearButton();
@@ -3384,7 +3532,7 @@ describe("日志管理窗口", () => {
     ok!.click();
     await flushPromises();
 
-    expect(calls("clear_operation_log"), "确认后应调用 clear_operation_log").toBe(1);
+    expect(calls("clear_run_log"), "确认后应调用 clear_run_log").toBe(1);
     // 后端清了还不够：界面必须重新读取，否则会继续显示已经删掉的那几行
     expect(state.lines.length, "确认后后端内容应被清空").toBe(0);
     expect(logRows(), "清空后界面不应再显示旧日志").toEqual([]);
@@ -3395,7 +3543,7 @@ describe("日志管理窗口", () => {
     const { w } = await openLogWindow();
     const base = mockInvoke.getMockImplementation()!;
     mockInvoke.mockImplementation((async (cmd: string, args: never) => {
-      if (cmd === "clear_operation_log") throw new Error("日志文件被占用");
+      if (cmd === "clear_run_log") throw new Error("日志文件被占用");
       return base(cmd, args);
     }) as never);
 
@@ -3415,7 +3563,7 @@ describe("日志管理窗口", () => {
     const { w } = await openLogWindow();
     const base = mockInvoke.getMockImplementation()!;
     mockInvoke.mockImplementation((async (cmd: string, args: never) => {
-      if (cmd === "open_operation_log_dir") throw new Error("资源管理器不可用");
+      if (cmd === "open_run_log_dir") throw new Error("资源管理器不可用");
       return base(cmd, args);
     }) as never);
 
@@ -3638,6 +3786,18 @@ describe("版本库", () => {
     expect(bar, "下载阶段应画出进度条").toBeTruthy();
     expect(parseFloat(bar!.style.width), "条宽应等于真实比例").toBeCloseTo(9, 3);
     expect(row.textContent, "不应出现被放大一百倍的百分比").not.toContain("900%");
+
+    // 除不尽的进度只保留两位小数：Arco 默认文本会把比例原样乘 100 输出浮点，
+    // 实测出现过「6.886031082519097%」。6886/100000 = 6.886%
+    listener!.handler({
+      payload: { id: "1.21", stage: "download", received: 6886, total: 100000, error: "" },
+    });
+    await flushPromises();
+    const frac = [...document.querySelectorAll(".setup-table tbody tr")]
+      .find((r) => (r.textContent ?? "").includes("1.21"))!
+      .querySelector<HTMLElement>(".arco-progress-line-text");
+    expect(frac?.textContent?.trim(), "除不尽时应四舍五入到两位小数").toBe("6.89%");
+    expect(frac?.textContent, "不该把整串浮点都铺出来").not.toContain("6.886031");
 
     // 服务器没给长度时画不出进度条，这时才由文案补一句状态
     listener!.handler({
@@ -4160,5 +4320,446 @@ describe("方块显示名称", () => {
     expect(cell.text(), "缺中文名时退回英文名").toContain("Mystery Block");
     expect(cell.find(".hint-dim").exists(), "退回的名字要标灰说明").toBe(true);
     w.unmount();
+  });
+});
+describe("投影列表排序", () => {
+  /** 三个文件：文件名、修改时间、作者的顺序各不相同，
+   *  这样每个字段排出来的结果都能和别的字段区分开。 */
+  const make = (
+    fileName: string,
+    name: string,
+    author: string,
+    timeModified: number,
+  ): SchematicSummary => ({
+    ...summary,
+    path: `/p/${fileName}`,
+    fileName,
+    name,
+    author,
+    timeModified,
+  });
+
+  const c = make("c.litematic", "阿尔法", "甲", 300);
+  const a = make("a.litematic", "查理", "丙", 200);
+  const b = make("b.litematic", "布拉沃", "", 100);
+
+  /** 挂载并加载这三个文件 */
+  async function setup() {
+    stubInvoke({ scan_litematics: { items: [c, a, b], skippedDirs: 0, skippedPaths: [] } });
+    const w = mountApp();
+    await flushPromises();
+    mockOpen.mockResolvedValue(["/p"]);
+    const btn = w.findAll("button").find((x) => x.text().includes("添加目录"));
+    await btn!.trigger("click");
+    await flushPromises();
+    return w;
+  }
+
+  /** 表格里当前的名称列顺序（只取数据行） */
+  function order(w: ReturnType<typeof mountApp>): string[] {
+    // 第一列是行选择复选框列（文本为空），文件名不在第一列；
+    // 直接按整行里的 .litematic 片段取，稳定且与列顺序无关
+    return w
+      .findAll("tr")
+      .map((r) => /[\w.-]+\.litematic/.exec(r.text() ?? "")?.[0] ?? "")
+      .filter(Boolean);
+  }
+
+  /** 点开排序下拉并选一项。下拉内容被 teleport 到 body，只能从 document 找。 */
+  async function pick(w: ReturnType<typeof mountApp>, label: string) {
+    const trigger = w.find(".sidebar__checks .arco-select");
+    expect(trigger.exists(), "底部应有排序下拉").toBe(true);
+    await trigger.trigger("click");
+    await flushPromises();
+    const opt = Array.from(document.querySelectorAll(".arco-select-option")).find((el) =>
+      (el.textContent ?? "").includes(label),
+    ) as HTMLElement | undefined;
+    expect(opt, `下拉里应有「${label}」`).toBeTruthy();
+    opt!.click();
+    await flushPromises();
+  }
+
+it("默认按路径排序，未选字段时就是文件系统的扫描顺序", async () => {
+    const w = await setup();
+    expect(order(w), "未排序时按路径").toEqual([
+      "a.litematic",
+      "b.litematic",
+      "c.litematic",
+    ]);
+    w.unmount();
+  });
+
+  it("按文件名升序与降序", async () => {
+    const w = await setup();
+    await pick(w, "按文件名");
+    expect(order(w), "按文件名升序").toEqual([
+      "a.litematic",
+      "b.litematic",
+      "c.litematic",
+    ]);
+
+    // 方向按钮：再点一次变降序
+    const dirBtn = w.findAll(".sidebar__checks button").find((x) => x.text().includes("↑"));
+    expect(dirBtn, "选了字段后应出现方向按钮").toBeTruthy();
+    await dirBtn!.trigger("click");
+    await flushPromises();
+    expect(order(w), "按文件名降序").toEqual([
+      "c.litematic",
+      "b.litematic",
+      "a.litematic",
+    ]);
+    w.unmount();
+  });
+
+  it("按修改时间排，数字比大小而不是比字符串", async () => {
+    const w = await setup();
+    await pick(w, "按修改时间");
+    // 时间：a=200 b=100 c=300，升序应为 b,a,c；
+    // 若按字符串比较会得到 "100"<"200"<"300" 同样成立，故再用降序交叉验证
+    expect(order(w), "按修改时间升序").toEqual([
+      "b.litematic",
+      "a.litematic",
+      "c.litematic",
+    ]);
+    w.unmount();
+  });
+
+  it("按作者排，空作者固定排在末尾（升降序都不翻到最前）", async () => {
+    const w = await setup();
+    await pick(w, "按作者");
+    // 作者：c=甲 a=丙 b=空。中文按拼音排，丙(bǐng) 在 甲(jiǎ) 之前，
+    // 因此升序是 a,c；空作者的 b 固定排末尾
+    expect(order(w), "按作者升序，空作者在末尾").toEqual([
+      "a.litematic",
+      "c.litematic",
+      "b.litematic",
+    ]);
+
+    const dirBtn = w.findAll(".sidebar__checks button").find((x) => x.text().includes("↑"));
+    await dirBtn!.trigger("click");
+    await flushPromises();
+    // 降序时空的仍在末尾——这条是空值处理的关键：若跟着翻转，
+    // 降序会把空作者顶到最前，盖住真正有作者的那两行
+    // 降序把甲(c) 提到丙(a) 之前，空作者的 b 仍在末尾
+    expect(order(w), "降序时空作者仍在末尾").toEqual([
+      "c.litematic",
+      "a.litematic",
+      "b.litematic",
+    ]);
+    w.unmount();
+  });
+
+  it("选「按路径」可以取消排序，回到默认顺序", async () => {
+    const w = await setup();
+    await pick(w, "按文件名");
+    const dirBtn = w.findAll(".sidebar__checks button").find((x) => x.text().includes("↑"));
+    await dirBtn!.trigger("click");
+    await flushPromises();
+    expect(order(w)[0], "先确认已变成降序").toBe("c.litematic");
+
+    await pick(w, "按路径");
+    expect(order(w), "取消排序后回到路径序").toEqual([
+      "a.litematic",
+      "b.litematic",
+      "c.litematic",
+    ]);
+    w.unmount();
+  });
+
+  it("排序设置会被记住，重开应用后仍是同一顺序", async () => {
+    // 同时覆盖「收集」与「恢复」两条路径：只测其一的话，写盘字段名与读盘
+    // 字段名对不上也不会被发现（两边各自看都「通过」）
+    const w = await setup();
+    await pick(w, "按文件名");
+    const dirBtn = w.findAll(".sidebar__checks button").find((x) => x.text().includes("↑"));
+    await dirBtn!.trigger("click");
+    await flushPromises();
+    expect(order(w)[0], "先确认已按文件名降序").toBe("c.litematic");
+
+    // 卸载会把防抖中的改动立刻写出
+    w.unmount();
+    await flushPromises();
+
+    const saved = mockInvoke.mock.calls
+      .filter((c) => c[0] === "save_ui_state")
+      .map((c) => JSON.parse(String((c[1] as { json: string }).json)) as Record<string, unknown>);
+    const last = saved[saved.length - 1];
+    expect(last, "应写出过界面状态").toBeTruthy();
+    expect(last.sortKey, "写出的状态里应带排序字段").toBe("fileName");
+    expect(last.sortOrder, "写出的状态里应带排序方向").toBe("descend");
+
+    // 用同一份状态重新挂载，顺序应与刚才一致
+    stubInvoke({
+      load_ui_state: JSON.stringify(last),
+      scan_litematics: { items: [c, a, b], skippedDirs: 0, skippedPaths: [] },
+    });
+    const w2 = mountApp();
+    await flushPromises();
+    mockOpen.mockResolvedValue(["/p"]);
+    const btn = w2.findAll("button").find((x) => x.text().includes("添加目录"));
+    await btn!.trigger("click");
+    await flushPromises();
+    expect(order(w2), "重开后应恢复降序").toEqual([
+      "c.litematic",
+      "b.litematic",
+      "a.litematic",
+    ]);
+    w2.unmount();
+  });
+});
+describe("预览区尺寸调整", () => {
+  /** 面板当前高度（由组件内联样式给出） */
+  function panelHeight(w: ReturnType<typeof mountApp>): number {
+    const el = w.find(".preview").element as HTMLElement;
+    return parseFloat(el.style.height || "0");
+  }
+
+  /** 舞台当前宽高（由组件内联样式给出） */
+  function stageSize(w: ReturnType<typeof mountApp>): { w: number; h: number } {
+    const el = w.find(".preview__stage").element as HTMLElement;
+    return { w: parseFloat(el.style.width || "0"), h: parseFloat(el.style.height || "0") };
+  }
+
+  function horizSplitter(w: ReturnType<typeof mountApp>): HTMLElement {
+    const el = w.find(".splitter--horizontal");
+    expect(el.exists(), "应有预览区高度分隔条").toBe(true);
+    return el.element as HTMLElement;
+  }
+
+  /** 垂直分隔条只在有选中文件时存在（信息列本身是条件渲染的） */
+  function vertSplitter(w: ReturnType<typeof mountApp>): HTMLElement {
+    const el = w.find(".preview__main .splitter");
+    expect(el.exists(), "应有预览区宽度分隔条").toBe(true);
+    return el.element as HTMLElement;
+  }
+
+  /** 挂载 → 添加目录 → 选中第一个文件，得到带信息列的完整预览行 */
+  async function mountWithSelection() {
+    stubInvoke();
+    const w = mountApp();
+    await flushPromises();
+    mockOpen.mockResolvedValue(["/p"]);
+    const btn = w.findAll("button").find((b) => b.text().includes("添加目录"));
+    await btn!.trigger("click");
+    await flushPromises();
+    const row = w.findAll("tr").find((r) => r.text().includes("测试.litematic"));
+    expect(row, "应能找到文件所在的行").toBeTruthy();
+    await row!.trigger("click");
+    await flushPromises();
+    return w;
+  }
+
+  it("默认尺寸与两条分隔条的无障碍属性", async () => {
+    const w = await mountWithSelection();
+    const s = stageSize(w);
+    expect(s.w, "舞台默认宽度应与用户标注一致").toBe(398);
+    expect(panelHeight(w), "面板高度应容得下舞台与控制条").toBeGreaterThan(200);
+
+    const hSp = w.find(".splitter--horizontal");
+    expect(hSp.attributes("role")).toBe("separator");
+    expect(hSp.attributes("aria-orientation")).toBe("horizontal");
+    expect(hSp.attributes("tabindex"), "键盘可用的前提").toBe("0");
+
+    const vSp = w.find(".preview__main .splitter");
+    expect(vSp.attributes("role")).toBe("separator");
+    expect(vSp.attributes("aria-orientation")).toBe("vertical");
+    expect(vSp.attributes("tabindex"), "键盘可用的前提").toBe("0");
+    w.unmount();
+  });
+
+  it("拖高度分隔条：只改高度，不动宽度，且分隔条跟着鼠标走", async () => {
+    const w = await mountWithSelection();
+    const beforePanel = panelHeight(w);
+    const beforeStage = stageSize(w);
+
+    const el = horizSplitter(w);
+    // 预览行在分隔条上方：指针下移（clientY 变大）让预览行变高，
+    // 分隔条本身因此向下移动，与鼠标同向
+    el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientY: 400 }));
+    window.dispatchEvent(new PointerEvent("pointermove", { clientY: 520 }));
+    await flushPromises();
+
+    expect(panelHeight(w), "往下拖应让面板变高").toBeGreaterThan(beforePanel);
+    const after = stageSize(w);
+    expect(after.h, "舞台高度应跟着变").toBeGreaterThan(beforeStage.h);
+    // 这条是「拖高度却改了宽度」的回归防护
+    expect(after.w, "拖高度不应改变舞台宽度").toBe(beforeStage.w);
+
+    window.dispatchEvent(new PointerEvent("pointerup", { clientY: 520 }));
+    await flushPromises();
+    w.unmount();
+  });
+
+  it("拖高度分隔条的方向与鼠标一致：上移变矮、下移变高", async () => {
+    const w = await mountWithSelection();
+
+    const drag = async (from: number, to: number) => {
+      const el = horizSplitter(w);
+      el.dispatchEvent(
+        new PointerEvent("pointerdown", { bubbles: true, button: 0, clientY: from }),
+      );
+      window.dispatchEvent(new PointerEvent("pointermove", { clientY: to }));
+      window.dispatchEvent(new PointerEvent("pointerup", { clientY: to }));
+      await flushPromises();
+      return panelHeight(w);
+    };
+
+    const base = panelHeight(w);
+    const down = await drag(400, 460);
+    expect(down, "指针下移应让预览行变高").toBeGreaterThan(base);
+
+    const up = await drag(460, 380);
+    expect(up, "指针上移应让预览行变矮").toBeLessThan(down);
+    w.unmount();
+  });
+
+  it("拖宽度分隔条：只改宽度，不动高度", async () => {
+    const w = await mountWithSelection();
+    const before = stageSize(w);
+
+    const el = vertSplitter(w);
+    el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: 500 }));
+    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 620 }));
+    await flushPromises();
+
+    const after = stageSize(w);
+    expect(after.w, "向右拖应让舞台变宽").toBeGreaterThan(before.w);
+    expect(after.h, "拖宽度不应改变舞台高度").toBe(before.h);
+
+    window.dispatchEvent(new PointerEvent("pointerup", { clientX: 620 }));
+    await flushPromises();
+    w.unmount();
+  });
+
+  it("信息列不写死宽度，靠伸缩吃掉剩余空间", async () => {
+    const w = await mountWithSelection();
+    // jsdom 不加载样式表，量不到真实像素，因此这里核对结构约束：
+    // 预览行里只有舞台有内联宽度，信息列不能有内联宽度或上限
+    // ——一旦给它写死宽度，剩余宽度就没人吃，右侧会空出一条。
+    // 真实的「占满」在真机上用截图核对。
+    const stage = w.find(".preview__stage").element as HTMLElement;
+    expect(stage.style.width, "舞台宽度由状态给出").toBe("398px");
+
+    const info = w.find(".preview__info").element as HTMLElement;
+    expect(info.style.width, "信息列不应写死宽度").toBe("");
+    expect(info.style.maxWidth, "信息列不应写死最大宽度").toBe("");
+    w.unmount();
+  });
+
+  it("高度被夹在上下限内", async () => {
+    const w = await mountWithSelection();
+    const el = horizSplitter(w);
+
+    const dragTo = async (clientY: number) => {
+      el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientY: 0 }));
+      window.dispatchEvent(new PointerEvent("pointermove", { clientY }));
+      window.dispatchEvent(new PointerEvent("pointerup", { clientY }));
+      await flushPromises();
+    };
+
+    // 预览行在分隔条上方：指针一路下移让它变高，停在上限
+    await dragTo(99999);
+    const max = panelHeight(w);
+    expect(max, "往下拖到底应停在最大高度").toBeLessThanOrEqual(window.innerHeight);
+    expect(max, "最大高度要容得下舞台与控制条").toBeGreaterThan(200);
+
+    // 指针一路上移让它变矮，停在下限
+    await dragTo(-99999);
+    expect(panelHeight(w), "往上拖到底应停在下限").toBe(200);
+    w.unmount();
+  });
+
+  it("宽度被夹在上下限内", async () => {
+    const w = await mountWithSelection();
+    const el = vertSplitter(w);
+
+    const dragTo = async (clientX: number) => {
+      el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: 0 }));
+      window.dispatchEvent(new PointerEvent("pointermove", { clientX }));
+      window.dispatchEvent(new PointerEvent("pointerup", { clientX }));
+      await flushPromises();
+    };
+
+    await dragTo(-99999);
+    expect(stageSize(w).w, "向左拖到底应停在最小宽度").toBeGreaterThanOrEqual(160);
+
+    await dragTo(99999);
+    expect(stageSize(w).w, "向右拖到底不应吃掉信息列").toBeLessThanOrEqual(window.innerWidth);
+    w.unmount();
+  });
+
+  it("双击高度分隔条在默认高度与最小高度之间切换", async () => {
+    const w = await mountWithSelection();
+    const def = panelHeight(w);
+    const el = horizSplitter(w);
+
+    el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await flushPromises();
+    expect(panelHeight(w), "双击应收起到最小高度").toBeLessThan(def);
+
+    el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await flushPromises();
+    expect(panelHeight(w), "再双击应回到默认高度").toBe(def);
+    w.unmount();
+  });
+
+  it("双击宽度分隔条在默认宽度与最小宽度之间切换", async () => {
+    const w = await mountWithSelection();
+    const def = stageSize(w).w;
+    const el = vertSplitter(w);
+
+    el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await flushPromises();
+    expect(stageSize(w).w, "双击应收起到最小宽度").toBeLessThan(def);
+
+    el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await flushPromises();
+    expect(stageSize(w).w, "再双击应回到默认宽度").toBe(def);
+    w.unmount();
+  });
+
+  it("宽高分别写入界面状态，重开应用后都恢复", async () => {
+    const w = await mountWithSelection();
+    // 改高度
+    const hSp = horizSplitter(w);
+    hSp.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientY: 400 }));
+    window.dispatchEvent(new PointerEvent("pointermove", { clientY: 300 }));
+    window.dispatchEvent(new PointerEvent("pointerup", { clientY: 300 }));
+    await flushPromises();
+    // 改宽度
+    const vSp = vertSplitter(w);
+    vSp.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: 500 }));
+    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 560 }));
+    window.dispatchEvent(new PointerEvent("pointerup", { clientX: 560 }));
+    await flushPromises();
+
+    const want = { h: panelHeight(w), w: stageSize(w).w };
+
+    // 卸载会立刻把防抖中的改动写出
+    w.unmount();
+    await flushPromises();
+
+    const saved = mockInvoke.mock.calls
+      .filter((c) => c[0] === "save_ui_state")
+      .map((c) => JSON.parse(String((c[1] as { json: string }).json)) as Record<string, unknown>);
+    const last = saved[saved.length - 1];
+    expect(last.previewHeight, "写出的状态应含高度").toBe(want.h);
+    expect(last.previewWidth, "写出的状态应含宽度").toBe(want.w);
+
+    // 用同一份状态重新挂载
+    stubInvoke({ load_ui_state: JSON.stringify(last) });
+    const w2 = mountApp();
+    await flushPromises();
+    mockOpen.mockResolvedValue(["/p"]);
+    const btn = w2.findAll("button").find((b) => b.text().includes("添加目录"));
+    await btn!.trigger("click");
+    await flushPromises();
+    const row = w2.findAll("tr").find((r) => r.text().includes("测试.litematic"));
+    await row!.trigger("click");
+    await flushPromises();
+
+    expect(panelHeight(w2), "重开后高度应恢复").toBe(want.h);
+    expect(stageSize(w2).w, "重开后宽度应恢复").toBe(want.w);
+    w2.unmount();
   });
 });

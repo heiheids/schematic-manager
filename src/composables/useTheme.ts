@@ -12,6 +12,7 @@
  * 只在应用根组件使用：主题是全局的，各页面/组件不应各自再跟随一遍。
  */
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { reportUiWarning } from "../utils/run_log_report";
 
 export function useTheme() {
   async function followSystemTheme() {
@@ -25,7 +26,7 @@ export function useTheme() {
       await appWindow.onThemeChanged(({ payload }) => apply(payload));
     } catch (e) {
       // 不静默吞掉：这类失败会让界面主题与系统不一致，需要留下线索
-      console.warn("读取系统主题失败，按浅色显示：", e);
+      reportUiWarning("读取系统主题失败，按浅色显示：", e);
     }
   }
 

@@ -30,6 +30,7 @@ import type {
   SetupSource,
   SetupVersionOutcome,
 } from "../types";
+import { reportUiWarning } from "../utils/run_log_report";
 
 /** 「版本库」域用到的外部成员。
  *
@@ -179,6 +180,8 @@ export function createSetupSlice(s: SetupDeps) {
     try {
       await saveSetupState(JSON.stringify(st));
     } catch (e) {
+      // save_setup_state 的失败已经由 api.ts 的 logged 出口记进运行日志（带命令名），
+      // 这里只留控制台一份，免得同一次失败出现两条
       console.warn("保存版本库状态失败：", e);
     }
   }
@@ -189,6 +192,7 @@ export function createSetupSlice(s: SetupDeps) {
     try {
       raw = await loadSetupState();
     } catch (e) {
+      // load_setup_state 的失败已由 logged 记录，这里只留控制台一份
       console.warn("读取版本库状态失败：", e);
     }
     if (raw) {
@@ -199,7 +203,7 @@ export function createSetupSlice(s: SetupDeps) {
           if (st.source === "official" || st.source === "bmcl") source.value = st.source;
         }
       } catch (e) {
-        console.warn("版本库状态内容无法解析，已忽略：", e);
+        reportUiWarning("版本库状态内容无法解析，已忽略：", e);
       }
     }
     if (mcDir.value) return;
@@ -207,6 +211,7 @@ export function createSetupSlice(s: SetupDeps) {
       const def = await defaultMinecraftDir();
       if (def) mcDir.value = def;
     } catch (e) {
+      // default_minecraft_dir 的失败已由 logged 记录，这里只留控制台一份
       console.warn("定位默认 .minecraft 路径失败：", e);
     }
   }
@@ -301,7 +306,7 @@ export function createSetupSlice(s: SetupDeps) {
         progress.value = next;
       });
     } catch (e) {
-      console.warn("订阅版本库进度事件失败：", e);
+      reportUiWarning("订阅版本库进度事件失败：", e);
     }
     let allOk = false;
     try {
@@ -389,6 +394,7 @@ export function createSetupSlice(s: SetupDeps) {
         entityAvailable.value = st.entityAvailable;
         if (st.versions.length === 0) await openSetup();
       } catch (e) {
+        // base_db_status 的失败已由 logged 记录，这里只留控制台一份
         console.warn("启动检查版本库状态失败：", e);
       }
     })();

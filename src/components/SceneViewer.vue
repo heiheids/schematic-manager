@@ -35,13 +35,52 @@ let controls: OrbitControls | null = null;
 // 会让笔记本常态占用 GPU，而这是静态预览，不操作时画面不会变。
 let raf = 0;
 let needsRender = true;
+
+/** 上一次结算时的已渲染帧数。每秒结算一次，差值就是这一秒的帧率。 */
+let fpsFrames = 0;
+let fpsMark = 0;
+
+/** 实际渲染帧率。按需渲染下静止时是 0——这正是要看的信息：
+ *  0 表示「当前没有在画」，而不是「卡死了」。
+ *
+ * 不计入 exportPng 里那一次离屏渲染：它不是主循环画的帧，
+ * 算进去会让导出瞬间的读数虚高。 */
+const fps = ref(0);
+
+/** 累计一帧并每秒结算一次 */
+function countFrame(now: number) {
+  fpsFrames++;
+  if (fpsMark === 0) {
+    fpsMark = now;
+    return;
+  }
+  const elapsed = now - fpsMark;
+  if (elapsed < 1000) return;
+  fps.value = Math.round((fpsFrames * 1000) / elapsed);
+  fpsFrames = 0;
+  fpsMark = now;
+}
+
+/** 每秒把读数拉回 0：停止拖动后不再渲染，但没人去改这个数，
+ *  读数会一直停在最后一秒的值，看起来像还在跑。 */
+let fpsIdle = 0;
+function startFpsClock() {
+  fpsIdle = window.setInterval(() => {
+    // 这一秒内没有渲染过任何帧，说明画面是静止的
+    if (fpsMark !== 0 && performance.now() - fpsMark >= 1000) {
+      fps.value = 0;
+      fpsFrames = 0;
+      fpsMark = 0;
+    }
+  }, 1000);
+}
 // 容器尺寸变化用 ResizeObserver 而不是只监听 window：预览舞台会因
 // 侧栏拖动、分隔条拖动、页签切换而改变大小，这些都不触发 window resize。
 //
-// 只重设画布尺寸、不重新取景：相机 FOV 是垂直方向的，舞台恒为正方形
-// （见 global.scss 的 aspect-ratio），因此画布变大后同一个相机看到的是
-// 同一个角范围——模型占画面的**比例**不变而**像素**变多，正好是
-// 「窗口变大就画得更大」。重新取景反而会把用户转好的视角掰回去。
+// 只重设画布尺寸、不重新取景：相机 FOV 是垂直方向的，而舞台的宽高比固定
+// （398:344，由 composables/usePreviewResize 保证），因此画布变大后同一个
+// 相机看到的是同一个角范围——模型占画面的**比例**不变而**像素**变多，
+// 正好是「舞台变大就画得更大」。重新取景反而会把用户转好的视角掰回去。
 let resizeObserver: ResizeObserver | null = null;
 
 /** 请求在下一帧重绘 */
@@ -198,10 +237,12 @@ onMounted(() => {
         needsRender = false;
         if (renderer.value && camera) {
           renderer.value.render(scene, camera);
+          countFrame(performance.now());
         }
       }
     };
     loop();
+    startFpsClock();
 
     window.addEventListener("resize", onResize);
     // 窗口 resize 事件只在窗口尺寸变化时触发，而预览舞台现在会随
@@ -224,6 +265,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   cancelAnimationFrame(raf);
+  window.clearInterval(fpsIdle);
   window.removeEventListener("resize", onResize);
   resizeObserver?.disconnect();
   resizeObserver = null;
@@ -318,6 +360,16 @@ defineExpose({
 <template>
   <div class="scene-viewer">
     <div ref="host" class="scene-viewer__canvas" />
+    <!-- 帧率：按需渲染下静止时是 0，这一读数用来判断画面是否还在重绘
+         （拖动视角时会跳动，停手后归零）。只在有场景且 WebGL 正常时显示。 -->
+    <div
+      v-if="scene && !error"
+      class="scene-viewer__fps"
+      :class="{ 'is-idle': fps === 0 }"
+      :title="fps === 0 ? t('scene.fpsIdle') : t('scene.fps', { value: fps })"
+    >
+      {{ fps === 0 ? t("scene.fpsIdle") : t("scene.fps", { value: fps }) }}
+    </div>
     <div v-if="error" class="scene-viewer__error">{{ error }}</div>
     <div v-else-if="!scene" class="scene-viewer__empty">{{ t("scene.empty") }}</div>
   </div>
@@ -333,7 +385,7 @@ defineExpose({
   overflow: hidden;
 
   &__canvas {
-    // 画布容器：尺寸由外部样式决定（默认 200×200，见 .preview__stage）
+    // 画布容器：占满父容器（预览舞台），实际宽高由 .preview__stage 决定
     width: 100%;
     height: 100%;
     overflow: hidden;
@@ -359,6 +411,27 @@ defineExpose({
     color: var(--color-text-3);
     font-size: 13px;
     pointer-events: none;
+  }
+
+  // 帧率读数：画面右上角，半透明底避免压住模型细节。
+  // 静止时（0 帧）压暗，一眼能区分「在重绘」与「停着」。
+  &__fps {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    padding: 1px 6px;
+    border-radius: var(--border-radius-small);
+    background: var(--color-bg-popup);
+    color: var(--color-text-2);
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 11px;
+    line-height: 16px;
+    opacity: 0.8;
+    pointer-events: none;
+
+    &.is-idle {
+      opacity: 0.45;
+    }
   }
 
   &__error {

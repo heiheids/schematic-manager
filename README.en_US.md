@@ -25,8 +25,8 @@ English | [简体中文](README.md)
 | Block replacement | Replaces one block with another by rule; the window has two columns — the left holds the rules (source block, property constraints, target block, property overrides), the right is a searchable block list you can click to fill the current field; source and target both show Chinese names, and required fields that are still empty are outlined in red; every replacement is backed up first, and the result can be restored from the backup |
 | Version conversion | Converts a schematic to another game version: it analyses the differences first, then you assign substitutes for the missing blocks; the window has two columns — the left lists the gaps (red border = still to assign, green border = automatically recognised suggestion, no highlight = you picked it yourself), the right is a searchable block list you can click to fill in (blocks absent from the target version are marked and cannot be picked); the result is saved as a new file |
 | Duplicate detection | Screens the loaded directory in place (subdirectories included): files that are byte-for-byte identical are listed as **duplicates**, moved to the top of the list, colour-coded per group, and the extra copies are checked by default; files with the same name, size and block count but different content are listed as **suspected duplicates** and only flagged, never checked |
-| Backups and logs | Lists the backup taken before each modification, each of which can be restored or deleted; also carries an operation log tab (with an entry to the 「日志管理」 (Log Management) window) |
-| Log management | Shows the global operation log (block replacement, version conversion, rename, copy, delete and backup restore records); you can refresh it, clear it, or open the log directory in the file manager; it is reached from the operation log tab of Backups and Logs |
+| Backups and logs | Lists the backup taken before each modification, each of which can be restored or deleted; also carries a run log tab (with an entry to the 「日志管理」 (Log Management) window) |
+| Log management | Shows the run log (block replacement, version conversion, rename, copy, delete and backup restore records); you can switch the level (error/warning/info/debug), refresh it, clear it, or open the log directory in the file manager; the log file rolls over once it exceeds 5 MB or every time the manager is reopened, archiving older content as `YYYY-MM-dd-<roll>.log.gz` (the number is a global rolling sequence: the highest existing archive plus one); logs live in `logs/` inside the application data directory (on Windows that is `%APPDATA%\io.github.heiheids.schematic-manager\logs`); reached from the run log tab of Backups and Logs |
 | Metadata editing | Change a schematic's name, author and description |
 | Updates | Shows the current version, the author and the author's homepage (clickable); 「检测更新」 (Check for updates) reads the release list on GitHub and decides whether a newer version exists (pre-releases included), and reports the result truthfully as one of "update available / already up to date / no releases found / check failed"; the download URL can be copied with a click, or handed to the browser via 「打开下载地址」 (Open download URL) |
 | RMC schematic site | A placeholder entry at the top for an add-on program to plug into; clicking it does nothing until that is wired up |
@@ -229,6 +229,12 @@ master and cannot do that. After writing, the script reads the containers back a
 every entry, confirming that each one really came from the master it should have; that step
 is not optional, because the band boundary (the 64-pixel entry belongs to the large master)
 is exactly where mistakes happen.
+
+The mark in the top-left of the title bar comes from the same script
+(`src/assets/app-icon.png`, the small master rendered at 54 pixels) and is used as an image
+in the component rather than a hand-written SVG. That keeps the mark and the app icon on one
+source: an earlier hand-written SVG was not updated when the icon was redesigned, so the UI
+kept showing the old mark.
 
 The 1024 entry is a 2× upscale of the 512 master (there is no larger master), so its edges
 are slightly softer than native; with a larger master later, just change `MASTER_LARGE` in

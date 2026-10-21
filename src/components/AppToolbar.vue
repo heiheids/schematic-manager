@@ -1,8 +1,12 @@
 /**
- * 顶部工具条：目录管理（添加/已加载下拉/移除）、搜索、
- * 以及各功能弹窗的入口按钮。
+ * 顶部工具条：目录管理（添加/已加载下拉/移除）与各功能弹窗的入口按钮。
  *
  * 只负责把操作转发给 store 各域；按钮的禁用/加载态也从 store 读。
+ *
+ * 这里只放「不属于任何单个面板」的操作：目录管理、备份与日志、版本库、
+ * 更新、RMC 投影站。作用于某个面板的功能入口放在那个面板自己身上——
+ * 搜索与重复筛查在投影列表、方块替换在方块列表、版本转换在投影信息区，
+ * 这样入口与被作用的对象在同一区域，不必来回找。
  *
  * 语言切换不在这里：这一行有十来个按钮，实测按内容排下来约需 1650px，
  * 而窗口最小宽度是 1400（默认 1640），放在最右侧会被挤出可视范围。
@@ -21,14 +25,7 @@ const {
   isDirEnabled,
   toggleDir,
   removeDir,
-  searchText,
-  selected,
   files,
-  filteredFiles,
-  dupBusy,
-  scanDuplicatesInline,
-  openReplace,
-  openConvert,
   openBackups,
   setupOnOpen,
   openSetup,
@@ -80,22 +77,6 @@ const {
         </a-doption>
       </template>
     </a-dropdown>
-    <a-input-search
-      v-model="searchText"
-      size="small"
-      :placeholder="t('toolbar.searchPlaceholder')"
-      class="toolbar__search"
-      allow-clear
-    />
-    <a-button size="small" :disabled="!selected" @click="openReplace">
-      {{ t("toolbar.replace") }}
-    </a-button>
-    <a-button size="small" :disabled="!selected" @click="openConvert">
-      {{ t("toolbar.convert") }}
-    </a-button>
-    <a-button size="small" :loading="dupBusy" @click="scanDuplicatesInline">
-      {{ t("toolbar.duplicates") }}
-    </a-button>
     <a-button size="small" @click="openBackups">{{ t("toolbar.backups") }}</a-button>
     <a-button size="small" :loading="setupOnOpen" @click="openSetup">
       {{ t("toolbar.setup") }}
@@ -110,9 +91,7 @@ const {
     <a-button size="small" :title="t('toolbar.rmcTitle')">{{ t("toolbar.rmc") }}</a-button>
     <span class="preview__spacer" />
     <span class="hint-dim toolbar__count">
-      {{ t("toolbar.totalFiles", { total: files.length }) }}<span v-if="searchText">{{
-        t("toolbar.matchedFiles", { matched: filteredFiles.length })
-      }}</span>
+      {{ t("toolbar.totalFiles", { total: files.length }) }}
     </span>
   </div>
 </template>

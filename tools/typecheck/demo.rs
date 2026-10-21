@@ -39,6 +39,7 @@
 #[path = "../../src-tauri/src/png.rs"] mod png;
 #[path = "../../src-tauri/src/pool.rs"] mod pool;
 #[path = "../../src-tauri/src/replace.rs"] mod replace;
+#[path = "../../src-tauri/src/run_log.rs"] mod run_log;
 #[path = "../../src-tauri/src/scene.rs"] mod scene;
 // 方块染色：visibility 用它给四边形算着色系数
 #[path = "../../src-tauri/src/tint.rs"] mod tint;
@@ -471,7 +472,9 @@ fn main() {
     out!("  备份成功：{}", outcome.backup_path.display());
     let root = crate::backup::backup_root(&bdir);
     out!("  备份根目录：{}", root.display());
-    let _ = crate::backup::append_log(&root, "演示：备份了一次");
+    // 运行日志：改动投影的操作都要留一条记录（演示写在自己的临时目录里）
+    run_log::open(&bdir).expect("运行日志应能打开");
+    run_log::info("演示：备份了一次");
     let entries = crate::backup::list(&root);
     out!("  备份列表：{} 条", entries.len());
     for e in entries.iter().take(3) {
@@ -486,8 +489,8 @@ fn main() {
     crate::backup::restore(&entries[0].path, &src_file).expect("还原失败");
     let restored = std::fs::read_to_string(&src_file).unwrap();
     out!("  还原后内容：{restored}");
-    let log = crate::backup::read_log(&root, 5);
-    out!("  操作日志：{} 行", log.len());
+    let log = run_log::read(5);
+    out!("  运行日志：{} 行", log.len());
     check("备份与还原", restored == "原始内容", "内容正确恢复".into());
     out!("");
 

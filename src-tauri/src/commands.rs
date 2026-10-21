@@ -419,7 +419,7 @@ fn open_entity_db(app: &tauri::AppHandle) -> Option<std::sync::Arc<crate::entity
         Err(e) => {
             // 不静默：贴图库损坏会让实体渲染全部没有贴图，
             // 必须留下线索，否则用户只会看到一堆白模
-            eprintln!("载入实体贴图库失败 {}：{e}", path.display());
+            crate::run_log::error(&format!("载入实体贴图库失败 {}：{e}", path.display()));
             return None;
         }
     };
@@ -528,7 +528,7 @@ fn open_db(app: &tauri::AppHandle) -> AppResult<std::sync::Arc<LoadedDb>> {
     let (db, failures) =
         crate::base_db::load_base_block_db(&crate::base_db::base_blocks_dir(app)?)?;
     for (file, reason) in &failures {
-        eprintln!("基础库的版本包 {file} 未能载入：{reason}");
+        crate::run_log::error(&format!("基础库的版本包 {file} 未能载入：{reason}"));
     }
 
     let loaded = std::sync::Arc::new(LoadedDb { db: std::sync::Arc::new(db) });
@@ -640,10 +640,14 @@ pub fn apply_replace(
         .file_name()
         .map(|v| v.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let _ = backup::append_log(
-        &backup::backup_root(&exe_dir()),
-        &replace_log_line(db, Some(vi), &name, &rule.from_name, &rule.to_name, out.replaced),
-    );
+    crate::run_log::info(&replace_log_line(
+        db,
+        Some(vi),
+        &name,
+        &rule.from_name,
+        &rule.to_name,
+        out.replaced,
+    ));
     Ok(out.into())
 }
 
@@ -839,10 +843,10 @@ pub fn apply_conversion(
         .file_name()
         .map(|v| v.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let _ = backup::append_log(
-        &backup::backup_root(&exe_dir()),
-        &format!("转换 {name}：替换 {} 种方块，{} 种未指定", out.replaced_kinds, out.skipped_kinds),
-    );
+    crate::run_log::info(&format!(
+        "转换 {name}：替换 {} 种方块，{} 种未指定",
+        out.replaced_kinds, out.skipped_kinds
+    ));
 
     Ok(ConvertOutcomeDto {
         replaced_kinds: out.replaced_kinds,
@@ -971,7 +975,7 @@ pub fn restore_backup(backup_path: String, target_path: String) -> Result<(), St
     }
     backup::restore(&b, &t).map_err(|e| e.to_string())?;
     let name = t.file_name().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
-    let _ = backup::append_log(&backup::backup_root(&exe_dir()), &format!("还原 {name} <- {backup_path}"));
+    crate::run_log::info(&format!("还原 {name} <- {backup_path}"));
     Ok(())
 }
 
@@ -987,42 +991,146 @@ pub fn delete_backup(backup_path: String) -> Result<(), String> {
     }
     backup::delete(&p).map_err(|e| e.to_string())?;
     let name = p.file_name().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
-    let _ = backup::append_log(&backup::backup_root(&exe_dir()), &format!("删除备份 {name}"));
+    crate::run_log::info(&format!("删除备份 {name}"));
     Ok(())
 }
 
-/// 读取操作日志，由新到旧。
+/// 读取运行日志，由新到旧。
 #[tauri::command]
-pub fn read_operation_log(max_lines: Option<usize>) -> Vec<String> {
-    backup::read_log(&backup::backup_root(&exe_dir()), max_lines.unwrap_or(200).min(5000))
+pub fn read_run_log(max_lines: Option<usize>) -> Vec<String> {
+    crate::run_log::read(max_lines.unwrap_or(200).min(5000))
 }
 
-/// 清空操作日志。
+/// 清空运行日志。
 ///
-/// 只清空内容、不删文件（理由见 `backup::clear_log`）。这是用户显式要求的
+/// 只清空内容、不删文件（理由见 `RunLog::clear`）。这是用户显式要求的
 /// 动作，失败必须报出来——不像写日志那样可以悄悄放过。
 #[tauri::command]
-pub fn clear_operation_log() -> Result<(), String> {
-    backup::clear_log(&backup::backup_root(&exe_dir())).map_err(|e| e.to_string())
+pub fn clear_run_log() -> Result<(), String> {
+    crate::run_log::clear().map_err(|e| e.to_string())
 }
 
-/// 在文件管理器里打开操作日志所在的目录。
+/// 在文件管理器里打开运行日志所在的目录。
 ///
-/// 路径在后端算：日志位置是后端的约定（`backup::log_path`），
-/// 前端再拼一遍就成了两处规则，改一处必然对不上。
+/// 路径在后端算：日志位置是后端的约定（`run_log` 决定），前端再拼一遍
+/// 就成了两处规则，改一处必然对不上。
 #[tauri::command]
-pub fn open_operation_log_dir() -> Result<(), String> {
-    let root = backup::backup_root(&exe_dir());
-    let log = backup::log_path(&root);
+pub fn open_run_log_dir() -> Result<(), String> {
+    let Some(log) = crate::run_log::path() else {
+        return Err("运行日志尚未启用，无法定位所在目录".to_string());
+    };
     // 日志存在就定位到它：资源管理器会打开所在目录并选中该文件。
-    // 从没写过日志时它还不存在，那就先建出备份目录再打开目录本身——
+    // 从没写过日志时它还不存在，那就先建出日志目录再打开目录本身——
     // 用户此刻想知道的正是「日志放在哪」。
     if log.exists() {
         return crate::file_ops::reveal_in_file_manager(&log).map_err(|e| e.to_string());
     }
-    std::fs::create_dir_all(&root)
-        .map_err(|e| format!("创建目录 {} 失败：{e}", root.display()))?;
-    crate::file_ops::open_directory(&root).map_err(|e| e.to_string())
+    let dir = log.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("创建目录 {} 失败：{e}", dir.display()))?;
+    crate::file_ops::open_directory(&dir).map_err(|e| e.to_string())
+}
+
+/// 界面把自身遇到的警告与错误交给后端记录。
+///
+/// 界面侧的问题（界面状态读写失败、未捕获异常等）只有界面知道，不交给后端就
+/// 永远不会出现在运行日志里，用户报「界面不对劲」时也就无据可查。
+/// 等级非法时直接报错：把界面拼错的等级静默当成默认等级，等于让日志悄悄丢内容。
+#[tauri::command]
+pub fn log_ui_event(level: String, message: String) -> Result<(), String> {
+    let parsed = crate::run_log::Level::parse(&level)
+        .ok_or_else(|| format!("无法识别的日志等级：{level}"))?;
+    // 前缀标明来源：日志里界面与后端的行混在一起，不标就分不清是谁写的
+    crate::run_log::write(parsed, &format!("界面 {message}"));
+    Ok(())
+}
+
+/// 运行日志所在目录；日志没启用时返回 None。
+///
+/// 目录由后端算（`run_log` 决定），界面拿来显示给用户看。让界面自己拼一遍
+/// 应用数据目录就成了两处规则，identifier 一变就会指向不存在的位置——
+/// 这个项目已经改过一次 identifier（见 `data_dir`）。
+#[tauri::command]
+pub fn run_log_dir() -> Option<String> {
+    crate::run_log::path()
+        .and_then(|p| p.parent().map(|d| d.display().to_string()))
+}
+
+/// 界面把日志等级与本地日期交给后端。
+/// 等级由界面持久化（界面状态文件），这里只负责落地：等级决定写入哪些行，
+/// 本地日期只用于归档文件名——Rust 侧不存本地时间，避免为文件名引入时区依赖。
+/// 界面每次改等级、每次打开日志窗口都会调用，因此日期跟着刷新。
+#[tauri::command]
+pub fn configure_run_log(level: String, local_date: String) -> Result<(), String> {
+    let parsed = crate::run_log::Level::parse(&level)
+        .ok_or_else(|| format!("无法识别的日志等级：{level}"))?;
+    // 日期会被拼进归档文件名，因此按约定形状校验：只认 YYYY-MM-DD。
+    // 界面那边固定这么产出，这里是防「拼进去一个奇怪的路径片段」这类意外。
+    if !is_local_date(&local_date) {
+        return Err(format!("本地日期格式应为 YYYY-MM-DD：{local_date}"));
+    }
+    let changed =
+        crate::run_log::configure(parsed, &local_date).map_err(|e| e.to_string())?;
+    // 只在真的变了时记一行：界面每开一次日志窗口都会同步一次同样的设置，
+    // 每次都记就成了噪音
+    if changed {
+        crate::run_log::info(&format!(
+            "日志等级设为 {}，归档日期 {}",
+            parsed.token(),
+            local_date
+        ));
+    }
+    Ok(())
+}
+
+/// 是不是 `YYYY-MM-DD` 形状的本地日期。
+fn is_local_date(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit())
+}
+
+/// 启动时按界面存下的等级取值；没存过或认不出时用 info（默认等级）。
+///
+/// 之所以从界面状态文件里读而不是等界面推过来：debug 用户要的是**从启动第一行**
+/// 起的完整日志，如果等事件循环里界面来设置，启动阶段早就记完了。
+///
+/// 读的是前端 `uiState.ts` 写下的 `logLevel` 键：界面是这份状态的唯一作者，
+/// 因此键改名要两边一起改（见 src/store/uiState.ts 的 UiState）。
+pub(crate) fn saved_log_level(app: &tauri::AppHandle) -> crate::run_log::Level {
+    let path = match ui_state_path(app) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::run_log::warn(&format!("读取界面状态路径失败，日志等级按默认：{e}"));
+            return crate::run_log::Level::Info;
+        }
+    };
+    match read_ui_state_file(&path) {
+        Ok(Some(json)) => log_level_from_ui_state(&json),
+        // 从未保存过界面状态：正常情况，用默认等级
+        Ok(None) => crate::run_log::Level::Info,
+        Err(e) => {
+            crate::run_log::warn(&format!("读取界面状态失败，日志等级按默认：{e}"));
+            crate::run_log::Level::Info
+        }
+    }
+}
+
+/// 从界面状态 JSON 里取日志等级；取不到或认不出时用默认的 info。
+fn log_level_from_ui_state(json: &str) -> crate::run_log::Level {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| {
+            v.get("logLevel")
+                .and_then(|l| l.as_str())
+                .and_then(crate::run_log::Level::parse)
+        })
+        .unwrap_or(crate::run_log::Level::Info)
 }
 
 /// 组装前端 Three.js 渲染所需的场景。
@@ -1467,8 +1575,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // 注意：这里的路径必须与平台无关。
-    // std::path::Path 按各平台的分隔符切分，在 Unix 上反斜杠只是普通字符，
+    // 注意：这里的路径必须与平台无关。    // std::path::Path 按各平台的分隔符切分，在 Unix 上反斜杠只是普通字符，
     // 因此 Windows 风格的 "Z:\\x.litematic" 在 Linux 上会被整体当作文件名。
     // 测试只关心「文件不存在时的行为」，用纯文件名即可。
     #[test]
@@ -1634,6 +1741,64 @@ mod tests {
         }
     }
 
+    /// 界面状态里记下的日志等级要被启动流程采纳，认不出或缺键时回落 info。
+    ///
+    /// 这条守住的是「debug 用户从启动第一行起就有完整日志」：等级存在界面状态里，
+    /// 键名或取值一变，这段就只会静默回落，用户再也拿不到启动阶段的调试日志。
+    #[test]
+    fn saved_log_level_comes_from_ui_state_and_falls_back_to_info() {
+        assert_eq!(
+            log_level_from_ui_state(r#"{"version":1,"logLevel":"debug"}"#),
+            crate::run_log::Level::Debug
+        );
+        assert_eq!(
+            log_level_from_ui_state(r#"{"version":1,"sidebarWidth":419}"#),
+            crate::run_log::Level::Info,
+            "没记过等级时用默认等级"
+        );
+        assert_eq!(
+            log_level_from_ui_state(r#"{"version":1,"logLevel":"verbose"}"#),
+            crate::run_log::Level::Info,
+            "认不出的取值不该当成某个等级"
+        );
+        assert_eq!(
+            log_level_from_ui_state("这不是 JSON"),
+            crate::run_log::Level::Info,
+            "界面状态坏了也不该影响启动"
+        );
+    }
+
+    /// 仅接受 `YYYY-MM-DD`：这个值会被拼进归档文件名。
+    #[test]
+    fn local_date_must_be_a_plain_calendar_date() {
+        assert!(is_local_date("2026-10-19"));
+        assert!(!is_local_date("2026-1-9"), "位数不对就不是约定形状");
+        assert!(!is_local_date("2026/10/19"), "分隔符必须是短横线");
+        assert!(!is_local_date("../2026-10-19"), "路径片段不能被当成日期");
+        assert!(!is_local_date(""), "空串不该通过");
+    }
+
+    /// 界面送来的等级/日期不合约定时要如实报错，不能悄悄按默认处理。
+    ///
+    /// 静默按默认的后果是：用户在界面上选了「调试」，日志却仍按 info 记，
+    /// 而他以为已经开了——这类「以为开了其实没开」最难排查。
+    #[test]
+    fn log_commands_reject_values_that_do_not_match_the_contract() {
+        let bad_level = configure_run_log("verbose".to_string(), "2026-10-19".to_string());
+        assert!(bad_level.is_err(), "认不出的等级要报错");
+        assert!(
+            bad_level.unwrap_err().contains("verbose"),
+            "报错要说清是哪个取值不认"
+        );
+        assert!(
+            configure_run_log("info".to_string(), "2026/10/19".to_string()).is_err(),
+            "日期形状不对要报错"
+        );
+        assert!(
+            log_ui_event("loud".to_string(), "随便一条".to_string()).is_err(),
+            "界面报的事件等级同样要校验"
+        );
+    }
 }
 
 // ---------------------------------------------------------------- 目录栏文件操作
@@ -1651,10 +1816,11 @@ pub fn delete_files(paths: Vec<String>) -> Result<FileOpOutcome, String> {
     let files = crate::file_ops::check_files(&paths).map_err(|e| e.to_string())?;
     crate::file_ops::delete_to_trash(&files).map_err(|e| e.to_string())?;
     let names: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
-    let _ = backup::append_log(
-        &backup::backup_root(&exe_dir()),
-        &format!("删除到回收站 {} 个文件：{}", names.len(), names.join("、")),
-    );
+    crate::run_log::info(&format!(
+        "删除到回收站 {} 个文件：{}",
+        names.len(),
+        names.join("、")
+    ));
     Ok(FileOpOutcome {
         total_bytes: files.iter().map(|f| f.size).sum(),
         names,
@@ -1683,15 +1849,12 @@ pub fn copy_files_to_dir(paths: Vec<String>, dest_dir: String) -> Result<FileOpO
     let dest = PathBuf::from(&dest_dir);
     let written = crate::file_ops::copy_into(&files, &dest).map_err(|e| e.to_string())?;
     let names: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
-    let _ = backup::append_log(
-        &backup::backup_root(&exe_dir()),
-        &format!(
-            "复制 {} 个文件到 {}：{}",
-            names.len(),
-            dest.display(),
-            names.join("、")
-        ),
-    );
+    crate::run_log::info(&format!(
+        "复制 {} 个文件到 {}：{}",
+        names.len(),
+        dest.display(),
+        names.join("、")
+    ));
     Ok(FileOpOutcome {
         total_bytes: files.iter().map(|f| f.size).sum(),
         names,
@@ -1743,7 +1906,7 @@ pub fn rename_schematic(path: String, new_name: String) -> Result<RenameOutcomeD
         Some(e) => format!("重命名 {old_name} -> {file_name}（备份重新链接失败：{e}）"),
         None => format!("重命名 {old_name} -> {file_name}（重新链接备份 {relinked} 组）"),
     };
-    let _ = crate::backup::append_log(&root, &summary);
+    crate::run_log::info(&summary);
     Ok(RenameOutcomeDto {
         path: dest.to_string_lossy().into_owned(),
         file_name,
@@ -1845,7 +2008,7 @@ fn emit_setup_progress(app: &tauri::AppHandle, p: BaseSetupProgress) {
     use tauri::Emitter;
     // 发送失败只说明窗口已关闭或前端还没监听，本身不该中断补版本流程
     if let Err(e) = app.emit(BASE_SETUP_PROGRESS_EVENT, p) {
-        eprintln!("发送版本库进度事件失败：{e}");
+        crate::run_log::warn(&format!("发送版本库进度事件失败：{e}"));
     }
 }
 
@@ -1900,6 +2063,10 @@ pub fn default_minecraft_dir() -> Option<String> {
 #[tauri::command]
 pub fn scan_minecraft(dir: String) -> Result<McScanDto, String> {
     let scan = crate::base_db::scan_minecraft(Path::new(&dir)).map_err(|e| e.to_string())?;
+    // 读不出版本信息的目录会被跳过，用户在清单里少看到一个版本时要能查到原因
+    for w in &scan.warnings {
+        crate::run_log::warn(&format!("扫描 Minecraft 目录时跳过：{w}"));
+    }
     Ok(McScanDto {
         versions: scan
             .versions
@@ -1995,18 +2162,32 @@ fn run_setup(
             Err(_) => setup_one(app, v, None, source, &blocks_dir, &jars_dir, &entities_path),
         };
         outcomes.push(match r {
-            Ok(warning) => SetupVersionOutcomeDto {
-                id: v.id.clone(),
-                ok: true,
-                error: String::new(),
-                warning,
-            },
-            Err(e) => SetupVersionOutcomeDto {
-                id: v.id.clone(),
-                ok: false,
-                error: e.to_string(),
-                warning: None,
-            },
+            Ok(warning) => {
+                if let Some(code) = warning.as_deref() {
+                    // 提示码本身是给界面做翻译的，日志里要写清楚是哪一步没成
+                    crate::run_log::warn(&format!(
+                        "准备 {} 完成，但有提示：{code}",
+                        v.id
+                    ));
+                }
+                crate::run_log::info(&format!("准备 {} 完成", v.id));
+                SetupVersionOutcomeDto {
+                    id: v.id.clone(),
+                    ok: true,
+                    error: String::new(),
+                    warning,
+                }
+            }
+            Err(e) => {
+                // 用户报「某个版本准备不了」时，日志里得有版本号与原因
+                crate::run_log::error(&format!("准备 {} 失败：{e}", v.id));
+                SetupVersionOutcomeDto {
+                    id: v.id.clone(),
+                    ok: false,
+                    error: e.to_string(),
+                    warning: None,
+                }
+            }
         });
     }
     // 库内容变了，清掉缓存让下一次打开投影按新库重建
@@ -2169,7 +2350,10 @@ fn fill_missing_langs(
         }
         Err(e) => {
             // 不能让失败消失：用户看到英文名时，得能查到是因为没取到语言表
-            eprintln!("版本 {} 的语言表未能取得，界面将显示英文名：{e}", v.id);
+            crate::run_log::warn(&format!(
+                "版本 {} 的语言表未能取得，界面将显示英文名：{e}",
+                v.id
+            ));
             Some("lang-unavailable".to_string())
         }
     }

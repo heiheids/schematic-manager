@@ -101,10 +101,12 @@ pub fn download_to(
         .get(url)
         .call()
         .map_err(|e| http_err(url, e))?;
+    let status = resp.status();
     let total: u64 = resp
         .header("Content-Length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    crate::run_log::debug(&format!("GET {url} -> {status}，开始下载，共 {total} 字节"));
     let mut reader = resp.into_reader();
     write_body(&mut reader, dest, total, on_progress)
 }
@@ -148,7 +150,7 @@ fn write_body(
     if let Err(e) = read_all(&tmp) {
         // 清掉半截文件；删不掉也不掩盖原始错误，原样把它报上去
         if let Err(rm) = std::fs::remove_file(&tmp) {
-            eprintln!("清理未完成的下载 {tmp:?} 失败：{rm}");
+            crate::run_log::warn(&format!("清理未完成的下载 {tmp:?} 失败：{rm}"));
         }
         return Err(e);
     }
@@ -190,17 +192,32 @@ pub struct LangDownload<'a> {
 /// 拉取一个文本资源（版本清单、version.json、资源索引都是 JSON 文本）
 pub fn fetch_text(url: &str) -> AppResult<String> {
     let resp = agent().get(url).call().map_err(|e| http_err(url, e))?;
-    resp.into_string()
-        .map_err(|e| AppError::Parse(format!("读取 {url} 失败：{e}")))
+    let status = resp.status();
+    let text = resp
+        .into_string()
+        .map_err(|e| AppError::Parse(format!("读取 {url} 失败：{e}")))?;
+    // debug 等级记请求与响应：用户报「下载失败」「拿不到中文名」时，
+    // 这两行就能看出请求打到哪、对方回了什么
+    if crate::run_log::enabled(crate::run_log::Level::Debug) {
+        crate::run_log::debug(&format!(
+            "GET {url} -> {status}\n{}",
+            crate::run_log::clip_body(&text)
+        ));
+    }
+    Ok(text)
 }
 
 /// 拉取一个小的二进制资源（语言表约几百 KB，不需要落盘）
 pub fn fetch_bytes(url: &str) -> AppResult<Vec<u8>> {
     let resp = agent().get(url).call().map_err(|e| http_err(url, e))?;
+    let status = resp.status();
     let mut out = Vec::new();
     resp.into_reader()
         .read_to_end(&mut out)
         .map_err(|e| AppError::Parse(format!("读取 {url} 失败：{e}")))?;
+    // 二进制正文不写进日志，只记长度：语言表这类内容写进去既不可读，
+    // 也会把日志文件迅速撑到滚动上限
+    crate::run_log::debug(&format!("GET {url} -> {status}，{} 字节", out.len()));
     Ok(out)
 }
 
@@ -512,6 +529,41 @@ mod tests {
             text.contains("\"block.minecraft.stone\": \"石头\""),
             "取到的应当是中文语言表，实际开头是：{}",
             &text.chars().take(80).collect::<String>()
+        );
+    }
+
+    /// 联网验证 debug 等级真的会把请求与响应写进运行日志。
+    ///
+    /// 默认不跑（`cargo test -- --ignored`）。验的是「等级门控 + 网络层打点」
+    /// 合起来的效果：断言的请求行、状态码与响应正文片段都由真实网络产生，
+    /// 只测 `clip_body` 之类的纯函数证明不了这些行真的落进了文件。
+    #[test]
+    #[ignore = "需要联网，手动运行 cargo test -- --ignored"]
+    fn debug_level_records_requests_and_responses_in_the_run_log() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test_tmp")
+            .join("sm_run_log_network");
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::run_log::open(&dir).expect("应能打开运行日志");
+        crate::run_log::configure(crate::run_log::Level::Debug, "2026-10-19")
+            .expect("应能配置运行日志");
+
+        let manifest = fetch_manifest().expect("应能取到版本清单");
+        assert!(manifest.contains("versions"), "清单应是 JSON");
+
+        let lines = crate::run_log::read(50);
+        assert!(
+            lines.iter().any(|l| l.contains("GET ") && l.contains("200")),
+            "debug 等级应记下请求行与状态码：{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("versions")),
+            "debug 等级应记下响应正文片段：{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains('\n')),
+            "每条日志必须是一行，响应里的换行要被转义：{lines:?}"
         );
     }
 }

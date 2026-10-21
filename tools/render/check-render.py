@@ -305,13 +305,15 @@ SHIM = r"""
         { index: 0, name: "1.20.1", dataVersion: 3465, blockCount: 1234, isOverlay: false }
       ]);
       case "list_backups": return Promise.resolve([]);
-      // 日志行按后端真实格式：纳秒时间戳（19 位，与 backup::timestamp 一致）
-      // + 制表符 + 说明。给空数组时「操作日志」页签永远显示空状态，日志的
-      // 排版就没人看得见；位数写错则会显示成 2537 年之类的怪时间。
-      case "read_operation_log": return Promise.resolve([
-        "1792140065882147800\t删除到回收站 3 个文件：丐版高效凋灵骷髅塔3.5头每分-无凋灵玫瑰版-下界主体.litematic、空岛水流刷怪塔(双舟)金合欢.litematic、刷石机5w无侦测器附体带石材工厂.litematic",
-        "1792138661871480600\t还原 丐版高效凋灵骷髅塔3.5头每分-无凋灵玫瑰版-下界主体.litematic",
-        "1792138651762518000\t替换 丐版高效凋灵骷髅塔3.5头每分-无凋灵玫瑰版-下界主体.litematic：平滑石头台阶（minecraft:smooth_stone_slab） -> 安山岩台阶（minecraft:andesite_slab），共 1119 个",
+      // 日志行按后端真实格式：纳秒时间戳（19 位）+ 制表符 + 大写等级 + 制表符
+      // + 说明。给空数组时「运行日志」页签永远显示空状态，日志的排版（含等级
+      // 标签）就没人看得见；位数写错则会显示成 2537 年之类的怪时间。
+      case "read_run_log": return Promise.resolve([
+        "1792140065882147800\tINFO\t删除到回收站 3 个文件：丐版高效凋灵骷髅塔3.5头每分-无凋灵玫瑰版-下界主体.litematic、空岛水流刷怪塔(双舟)金合欢.litematic、刷石机5w无侦测器附体带石材工厂.litematic",
+        "1792138661871480600\tWARN\t版本 1.21.1 的语言表未能取得，界面将显示英文名：连接超时",
+        "1792138661871480500\tERROR\t准备 1.21.4 失败：下载客户端失败",
+        "1792138651762518000\tINFO\t替换 丐版高效凋灵骷髅塔3.5头每分-无凋灵玫瑰版-下界主体.litematic：平滑石头台阶（minecraft:smooth_stone_slab） -> 安山岩台阶（minecraft:andesite_slab），共 1119 个",
+        "1792138651762517000\tDEBUG\tGET https://piston-meta.mojang.com/mc/game/version_manifest_v2.json -> 200",
       ]);
       // 各功能对话框打开时会调的命令，必须回合法结构，
       // 否则前端会走到 catch 分支、对话框内一片空白
@@ -339,6 +341,13 @@ SHIM = r"""
       // 回数组会让 App 走进 JSON 解析失败分支并弹出警告（替身类型给错）。
       case "load_ui_state": return Promise.resolve(null);
       case "save_ui_state": return Promise.resolve(undefined);
+      // 运行日志：等级同步返回空；目录给一个真实形状的路径，否则说明文案里的
+      // 「日志位置」会渲染成空串，排版对不对就看不出来了。
+      case "configure_run_log": return Promise.resolve(undefined);
+      case "log_ui_event": return Promise.resolve(undefined);
+      case "run_log_dir": return Promise.resolve(
+        "C:\\\\Users\\\\演示\\\\AppData\\\\Roaming\\\\io.github.heiheids.schematic-manager\\\\logs"
+      );
       // 「更新」窗口：版本号取本地命令，检测结果给一份「有新版本」的样本，
       // 这样窗口里三种结论各自的排版都能被渲染出来核对。
       case "app_version": return Promise.resolve("0.0.2");

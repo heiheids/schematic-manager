@@ -207,18 +207,39 @@ describe("重复筛查与备份", () => {
     });
   });
 
-  it("readOperationLog 传 maxLines", async () => {
-    await expectCall(() => api.readOperationLog(10), "read_operation_log", {
+  it("readRunLog 传 maxLines", async () => {
+    await expectCall(() => api.readRunLog(10), "read_run_log", {
       maxLines: 10,
     });
   });
 
-  it("clearOperationLog 不带参数", async () => {
-    await expectCall(() => api.clearOperationLog(), "clear_operation_log");
+  it("configureRunLog 传 level 与 localDate", async () => {
+    // 日期是命令的一部分：后端按它决定日志写进哪一天的文件
+    await expectCall(() => api.configureRunLog("debug", "2026-10-19"), "configure_run_log", {
+      level: "debug",
+      localDate: "2026-10-19",
+    });
   });
 
-  it("openOperationLogDir 不带参数", async () => {
-    await expectCall(() => api.openOperationLogDir(), "open_operation_log_dir");
+  it("clearRunLog 不带参数", async () => {
+    await expectCall(() => api.clearRunLog(), "clear_run_log");
+  });
+
+  it("openRunLogDir 不带参数", async () => {
+    await expectCall(() => api.openRunLogDir(), "open_run_log_dir");
+  });
+
+  it("logUiEvent 传 level 与 message", async () => {
+    await expectCall(
+      () => api.logUiEvent("warn", "保存界面状态失败：磁盘只读"),
+      "log_ui_event",
+      { level: "warn", message: "保存界面状态失败：磁盘只读" },
+    );
+  });
+
+  it("runLogDir 只发命令名、不带参数", async () => {
+    await expectCall(() => api.runLogDir(), "run_log_dir");
+    expect(mockInvoke.mock.calls.at(-1)?.length, "只应传命令名").toBe(1);
   });
 });
 
@@ -246,9 +267,12 @@ describe("契约整体性", () => {
       () => api.listBackups(),
       () => api.restoreBackup("b", "t"),
       () => api.deleteBackup("b"),
-      () => api.readOperationLog(),
-      () => api.clearOperationLog(),
-      () => api.openOperationLogDir(),
+      () => api.readRunLog(),
+      () => api.configureRunLog("info", "2026-10-19"),
+      () => api.clearRunLog(),
+      () => api.openRunLogDir(),
+      () => api.logUiEvent("warn", "x"),
+      () => api.runLogDir(),
       () => api.mcVersionName(1),
     ];
     const names: string[] = [];
@@ -277,6 +301,8 @@ describe("契约整体性", () => {
       () => api.applyConversion("a", 0, []),
       () => api.analyzeSchematic("a"),
       () => api.saveMetadata("a", { name: "n", author: "au" }),
+      // localDate 尤其要盯着：写成 local_date 后端就匹配不上了
+      () => api.configureRunLog("info", "2026-10-19"),
     ];
     for (const c of cases) {
       mockInvoke.mockClear();
@@ -292,5 +318,37 @@ describe("契约整体性", () => {
   it("appVersion 与 checkUpdate 都是无参命令", async () => {
     await expectCall(() => api.appVersion(), "app_version");
     await expectCall(() => api.checkUpdate(), "check_update");
+  });
+});
+
+describe("命令失败的上报", () => {
+  it("命令失败时既抛给调用方，也记一条带命令名的 error 日志", async () => {
+    // 用户报「点了报错」时，日志里得能查到是哪条命令、报了什么。
+    // 界面弹的提示关掉就没了，因此这条链路要单独钉住。
+    mockInvoke.mockImplementation((async (cmd: string) => {
+      if (cmd === "delete_backup") throw new Error("权限不足");
+      return undefined;
+    }) as never);
+
+    // (a) 原始错误照旧抛给调用方，不能被上报动作替换或吞掉
+    await expect(api.deleteBackup("/b/x")).rejects.toThrow("权限不足");
+
+    // (b) 上报一条 error 级日志，说明里带上命令名
+    const events = mockInvoke.mock.calls.filter((c) => c[0] === "log_ui_event");
+    expect(events.length, "失败应上报一条界面日志").toBe(1);
+    const args = events[0][1] as { level: string; message: string };
+    expect(args.level, "命令失败属于错误").toBe("error");
+    expect(args.message, "说明里要带上命令名才好查").toContain("delete_backup");
+  });
+
+  it("上报本身失败时仍然把原始错误抛给调用方", async () => {
+    // 写日志的通道不能把主流程带崩，也不能盖掉真正的原因
+    mockInvoke.mockImplementation((async (cmd: string) => {
+      if (cmd === "delete_backup") throw new Error("权限不足");
+      if (cmd === "log_ui_event") throw new Error("日志目录不可写");
+      return undefined;
+    }) as never);
+
+    await expect(api.deleteBackup("/b/x")).rejects.toThrow("权限不足");
   });
 });

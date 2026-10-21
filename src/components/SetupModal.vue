@@ -51,6 +51,18 @@ function downloadProgress(name: string): number | null {
   return Math.min(1, p.received / p.total);
 }
 
+/** 进度条上的百分比文字：最多两位小数，整数不补零。
+ *
+ * 为什么不直接用 Arco 的默认文本：它把比例乘 100 后原样输出浮点，
+ * 实测出现过「6.886031082519097%」。这里只改显示，不动传入的 `:percent`，
+ * 因此条宽仍是精确比例。
+ */
+function formatPercent(ratio: number): string {
+  const pct = Math.max(0, Math.min(100, ratio * 100));
+  // 先按两位取整再转字符串，最后去掉「.00」「.50」这类多余的零
+  return `${Number(pct.toFixed(2))}%`;
+}
+
 /** 逐版本进度/结果的展示文本。
  *
  * 下载阶段不在这里写百分比：进度条自己就带着 Arco 渲染的百分比（进度条右侧），
@@ -182,13 +194,17 @@ function warningText(code: string): string {
         </template>
         <template #result="{ record }">
           <template v-if="progress.has(record.name) || outcomes.some((o) => o.id === record.name)">
-            <!-- 百分比由进度条自己显示（Arco 内置文本），这里不再重复写一遍 -->
+            <!-- 百分比由进度条显示，但文本自己给：Arco 的默认文本是把比例原样乘 100
+                 后输出浮点（progress/line.js 的 `${percent * 100}%`），实测会出现
+                 「6.886031082519097%」。用 #text 插槽换成两位小数。 -->
             <a-progress
               v-if="downloadProgress(record.name) !== null"
               size="small"
               :percent="downloadProgress(record.name)!"
               style="width: 160px; display: inline-block; margin-right: 8px"
-            />
+            >
+              <template #text="{ percent }">{{ formatPercent(percent) }}</template>
+            </a-progress>
             <span :class="{ 'hint-dim': !outcomes.some((o) => o.id === record.name && !o.ok) }">
               {{ resultText(record.name) }}
             </span>

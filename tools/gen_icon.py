@@ -1,19 +1,17 @@
-"""绘制程序图标（以立方体为主图案的候选，以及最终使用的那一个）。
+"""绘制图标候选图：六个以立方体为主图案的设计方案，各画一张大图看效果。
 
-为什么留这个脚本而不是直接放成品 PNG：图标是纯几何图形，用脚本画才能改
+这个脚本**不产出应用图标**，只用来比较候选设计。当前应用图标由
+`tools/gen_app_icons.py` 从 `docs/` 下两张母版按尺寸分档生成（见 README 的
+「应用图标」一节）。留在这里的候选里，C（选中框）是早期采用过的那一版。
+
+为什么用脚本画而不是直接放成品 PNG：图标是纯几何图形，用脚本画才能改
 （线宽、颜色、括号长度、立方体比例），也才能保证每一档尺寸都是按该尺寸
 单独绘制并超采样缩小的，而不是拿一张大图硬缩——16px 若按比例给线宽会糊成
 一团，脚本里对线宽设了与尺寸相关的下限。
 
 用法：
-    python tools/gen_icon.py            # 写出最终图标主图（1024）与各档预览
+    python tools/gen_icon.py            # 写出主图（1024）与各档预览
     python tools/gen_icon.py --all      # 另外写出 A~F 六个候选与对照图
-
-输出的主图只是候选图，不生成应用图标集：当前的应用图标由
-`tools/gen_app_icons.py` 从 `docs/` 下两张母版按尺寸分档生成（见 README 的
-「应用图标」一节）。
-注意：只改图标文件时增量构建不会重跑 build.rs，exe 会继续留着旧图标资源，
-需要先清掉 target 里本 crate 的 build-script 缓存再构建。
 
 颜色全部是自己配的纯色，不含任何游戏贴图素材。
 """
@@ -148,7 +146,10 @@ def icon_grid_top(size):
 
 
 def icon_selection(size):
-    """C：深色底 + 线稿立方体 + 四角选中括号（当前使用的图标）
+    """C：深色底 + 线稿立方体 + 四角选中括号
+
+    这是早期用过的设计，留作候选与历史参考。当前应用图标是「双子立方体 +
+    RGB 三轴」，由 `tools/gen_app_icons.py` 从 `docs/` 母版生成，与本脚本无关。
 
     线宽与括号长度按 size 的比例给，但设了下限：16px 那种小图标若线太细，
     缩小后括号与立方体会挤成一团，几乎认不出。
@@ -250,7 +251,8 @@ CANDIDATES = [
     ("F", "体素簇", icon_voxel),
 ]
 
-# 当前采用的那一个
+# 画主图时用的那一个候选。只是给这六个候选做一张 1024 主图看看效果，
+# 与应用图标无关——真正进程序的是 `tools/gen_app_icons.py` 的产物。
 CHOSEN = icon_selection
 CHOSEN_NAME = "icon_master"
 
@@ -264,7 +266,7 @@ def write_master(size=1024):
         CHOSEN(s).save(os.path.join(OUT_DIR, f"preview_{s}.png"))
     print("主图：", path)
     print("各档预览：", OUT_DIR)
-    print("下一步： pnpm tauri icon", path)
+    print("这只是候选图。应用图标请用： python tools/gen_app_icons.py")
 
 
 def write_candidates(cell=256, pad=24):

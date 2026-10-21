@@ -1,9 +1,13 @@
-"""从两张母版生成应用图标集。
+"""从两张母版生成应用图标集，以及界面里当标识用的那几张位图。
 
 为什么需要这个脚本：图标按显示尺寸分两档——小于等于 48 像素的用
 `docs/48x.png`（去掉了取景框那类细装饰、主图更大，缩到十几像素时才不糊），
 大于 48 的用 `docs/256x.png`。而 `pnpm tauri icon` 只接受一张母版，没法按尺寸
 混用两张，所以 `.ico` 与 `.icns` 这两个「一个文件装多档尺寸」的容器得自己组装。
+
+界面标题栏的标识也在这里出图（`src/assets/`），而不是让组件手写一份 SVG：
+手写的那份曾经因为图标换版而没跟着改，界面上就一直显示旧标识——
+从母版出图，标识与程序图标就不可能再脱节。
 
 组装靠 Pillow 的 `append_images`：对每个目标尺寸给一张尺寸**完全相等**的图，
 Pillow 就直接采用它，而不是把基准图缩下来（见 IcoImagePlugin / IcnsImagePlugin
@@ -38,6 +42,12 @@ PNG_OUTPUTS = (
     (256, "128x128@2x.png"),
     (512, "icon.png"),
 )
+
+# 界面标识：标题栏按 18px 显示，出一张 3 倍的图由浏览器缩到目标尺寸，
+# 这样 1x/2x/3x 屏都清晰。固定用小母版——它去掉了细装饰，缩到十几像素才不糊。
+UI_LOGO_DIR = os.path.join(ROOT, "src", "assets")
+UI_LOGO_SIZE = 54
+UI_LOGO_NAME = "app-icon.png"
 
 # 容器内的档位。ICO 的集合与替换前一致（Pillow 默认还含 128，必须显式覆盖）
 ICO_SIZES = (16, 24, 32, 48, 64, 256)
@@ -79,6 +89,13 @@ def render(masters, size):
 def write_pngs(masters):
     for size, name in PNG_OUTPUTS:
         render(masters, size).save(os.path.join(ICON_DIR, name), "PNG")
+
+
+def write_ui_logo(masters):
+    """写界面标识用的位图：固定取小母版，与图标集的小尺寸档同源。"""
+    os.makedirs(UI_LOGO_DIR, exist_ok=True)
+    logo = masters["small"].resize((UI_LOGO_SIZE, UI_LOGO_SIZE), Image.Resampling.LANCZOS)
+    logo.save(os.path.join(UI_LOGO_DIR, UI_LOGO_NAME), "PNG")
 
 
 def write_ico(masters):
@@ -185,6 +202,7 @@ def main():
     write_pngs(masters)
     write_ico(masters)
     write_icns(masters)
+    write_ui_logo(masters)
 
     verify(masters)
     print(f"已写出并校验：{os.path.relpath(ICON_DIR, ROOT)}")
@@ -193,6 +211,10 @@ def main():
         print(f"  {name:<16} {size:>4}px  {band}")
     print(f"  {'icon.ico':<16} {sorted(ICO_SIZES)}")
     print(f"  {'icon.icns':<16} {sorted({s for _, s in ICNS_TYPES})}")
+    print(
+        f"界面标识：{os.path.relpath(os.path.join(UI_LOGO_DIR, UI_LOGO_NAME), ROOT)}"
+        f"  {UI_LOGO_SIZE}px（小母版）"
+    )
 
 
 if __name__ == "__main__":

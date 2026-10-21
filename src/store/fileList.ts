@@ -35,6 +35,21 @@ import type {
   SceneData,
 } from "../types";
 
+/** 可排序的字段，与列表列一一对应（#43 点名的五项）。
+ *
+ * 定义在模块级而不是 slice 内部：界面状态域要用它校验从磁盘恢复的值，
+ * 写在 slice 里就没法引用。 */
+export type SortKey =
+  | "fileName"
+  | "name"
+  | "mcVersionName"
+  | "timeModified"
+  | "author";
+
+/** 排序方向。Arco 的列头第三次点击是「取消」，因此调用方还会传空值，
+ *  这个类型只覆盖有方向的那两种。 */
+export type SortOrder = "ascend" | "descend";
+
 /** 文件列表域用到的其他域成员。
  *
  * 各域只声明自己用到的依赖，而不是参数化整棵 store：AppStore 由所有域的
@@ -349,16 +364,75 @@ export function createFileListSlice(s: FileListDeps) {
     clearDuplicateScan();
   });
 
+  // ---------------------------------------------------------------- 排序
+  //
+  // 排序只改变**显示**顺序：files / orderedFiles 的语义（路径序、重复组置顶）
+  // 仍被筛查、勾选、选中收敛等逻辑依赖，不能动它。因此这里在列表交给表格前
+  // 单独排一次。
+  //
+  // 用工具条上的排序控件，而不是 Arco 的列头排序：要排的五个字段里，
+  // 名称、时间、作者都不是列表列（列表只有文件名/版本/尺寸/方块数），
+  // 为了排序把它们都加成列会把目录栏撑宽，而这一版正在做的正是布局优化。
+  const sortKey = ref<SortKey | null>(null);
+  const sortOrder = ref<SortOrder | null>(null);
+
+  /** 指定排序字段与方向；两者都传 null 表示回到默认的路径序。 */
+  function setSort(key: SortKey | null, order: SortOrder | null) {
+    // 只给字段不给方向时按升序：调用方（下拉框）表达的是「按这个字段排」，
+    // 不该要求它同时知道方向状态
+    sortKey.value = key;
+    sortOrder.value = key === null ? null : (order ?? "ascend");
+  }
+
+  /** 排序用的取值：字符串统一转小写比较，数字原样。
+   *  作者、名称可能为空，空值统一排到末尾（不随升降序翻转），
+   *  否则降序时一堆空作者会顶到最前面，盖住真正有内容的那几行。 */
+  function sortValue(f: SchematicSummary, key: SortKey): string | number {
+    if (key === "timeModified") return f.timeModified;
+    if (key === "author") return (f.author ?? "").toLowerCase();
+    if (key === "name") return (f.name ?? "").toLowerCase();
+    if (key === "mcVersionName") return (f.mcVersionName ?? "").toLowerCase();
+    return (f.fileName ?? "").toLowerCase();
+  }
+
+  /** 按当前排序规则排出一份新数组；未选排序时按路径（与原行为一致） */
+  function sortFiles(list: SchematicSummary[]): SchematicSummary[] {
+    const key = sortKey.value;
+    const order = sortOrder.value;
+    if (!key || !order) return [...list].sort((a, b) => a.path.localeCompare(b.path));
+    const dir = order === "descend" ? -1 : 1;
+    return [...list].sort((a, b) => {
+      const va = sortValue(a, key);
+      const vb = sortValue(b, key);
+      // 空字符串排末尾，与升降序无关
+      const ea = va === "";
+      const eb = vb === "";
+      if (ea !== eb) return ea ? 1 : -1;
+      if (ea && eb) return a.path.localeCompare(b.path);
+      const cmp =
+        typeof va === "number" && typeof vb === "number"
+          ? va - vb
+          : String(va).localeCompare(String(vb), "zh-Hans-CN");
+      // 值相同时按路径定序，保证顺序稳定（否则每次重排都可能换位置）
+      return cmp !== 0 ? cmp * dir : a.path.localeCompare(b.path);
+    });
+  }
+
   /** 列表显示顺序：重复文件排在最前（同组相邻），其次是疑似重复组，
-   *  其余仍按路径排序。
+   *  其余按当前排序规则（未选排序时仍按路径）。
    *
    * 「靠前」是为了让用户一眼看到筛查结果，不必在几百行里自己找；
    * 同组相邻才谈得上顺着颜色一份份核对。没做过筛查时顺序与原来完全一致。
+   *
+   * 排序只在同一层级、同一组内部生效，不会把筛查结果排散——
+   * 那些标记是用来顺着颜色核对的，一旦被排序拆开就失去了意义。
    */
   const orderedFiles = computed<SchematicSummary[]>(() => {
-    if (!dupResult.value && dupSuspects.value.length === 0) return files.value;
+    if (!dupResult.value && dupSuspects.value.length === 0) {
+      return sortFiles(files.value);
+    }
     // 值里的两个数依次是「层级」与「组序号」：先按层级（重复在前、疑似在后），
-    // 同层再按组序，同组内部仍按路径排
+    // 同层再按组序，同组内部按当前排序规则
     const rank = new Map<string, [number, number]>();
     (dupResult.value?.groups ?? []).forEach((g, i) => {
       for (const p of g.paths) rank.set(p, [0, i]);
@@ -366,14 +440,14 @@ export function createFileListSlice(s: FileListDeps) {
     dupSuspects.value.forEach((g, i) => {
       for (const p of g.paths) rank.set(p, [1, i]);
     });
-    if (rank.size === 0) return files.value;
-    return [...files.value].sort((a, b) => {
+    if (rank.size === 0) return sortFiles(files.value);
+    return sortFiles(files.value).sort((a, b) => {
       const ra = rank.get(a.path);
       const rb = rank.get(b.path);
-      if (ra && rb) return ra[0] - rb[0] || ra[1] - rb[1] || a.path.localeCompare(b.path);
+      if (ra && rb) return ra[0] - rb[0] || ra[1] - rb[1];
       if (ra) return -1;
       if (rb) return 1;
-      return a.path.localeCompare(b.path);
+      return 0;
     });
   });
 
@@ -1113,6 +1187,9 @@ export function createFileListSlice(s: FileListDeps) {
     files,
     filteredFiles,
     searchText,
+    sortKey,
+    sortOrder,
+    setSort,
     selected,
     analysis,
     analyzing,

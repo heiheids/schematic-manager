@@ -1,10 +1,11 @@
 /**
- * 备份与操作日志域：备份抽屉的清单、还原与删除，以及全局操作日志。
+ * 备份与运行日志域：备份抽屉的清单、还原与删除，以及全局运行日志。
  *
  * 备份只跟「当前选中的投影」有关，日志是全局的。两者放成一个域，
  * 一是共用同一组刷新动作，二是日志同时供备份抽屉的页签和独立的
  * 「日志管理」窗口使用（见 components/LogModal.vue），两边共用同一份
- * logs 状态就不会出现一个清空了、另一个还显示旧内容。
+ * logs 状态就不会出现一个清空了、另一个还显示旧内容。日志等级同理放在这里：
+ * 它既决定后端收下哪些行，也要由界面状态域记住，只留一份才不会两处不一致。
  *
  * 与其他域的协作：还原成功后经 BackupsDeps 让文件列表域重扫、让 3D
  * 预览域重建场景，保证界面显示的是还原后的真实内容。
@@ -15,13 +16,15 @@ import type { ComputedRef, Ref } from "vue";
 import { Message } from "@arco-design/web-vue";
 import { t } from "../i18n";
 import {
-  clearOperationLog,
+  clearRunLog,
+  configureRunLog,
   deleteBackup,
   listBackups,
-  openOperationLogDir,
-  readOperationLog,
+  openRunLogDir,
+  readRunLog,
   restoreBackup,
 } from "../api";
+import type { LogLevel } from "../utils/run_log";
 import type { BackupEntry, SchematicSummary } from "../types";
 
 /** 备份与日志域用到的其他域成员（循环引用回避见 fileList.ts） */
@@ -44,6 +47,14 @@ export interface BackupsDeps {
  */
 const LOG_MAX_LINES = 300;
 
+/** 用户没调过等级时的取值：常规操作已足够说明「程序做过什么」 */
+const DEFAULT_LOG_LEVEL: LogLevel = "info";
+
+/** 两位补零：日期与时间的字符串拼装都要用 */
+function two(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
 export function createBackupsSlice(s: BackupsDeps) {
   // 备份与日志
   const backupOpen = ref(false);
@@ -51,9 +62,16 @@ export function createBackupsSlice(s: BackupsDeps) {
   const backupLoading = ref(false);
   const logs = ref<string[]>([]);
   const logLoading = ref(false);
+  const logLevel = ref<LogLevel>(DEFAULT_LOG_LEVEL);
   /** 独立的「日志管理」窗口。与备份抽屉里的日志页签看的是同一份内容，
-   *  入口在备份与日志的「操作日志」页签里。 */
+   *  入口在备份与日志的「运行日志」页签里。 */
   const logOpen = ref(false);
+
+  /** 本地日期 YYYY-MM-DD。后端按它决定日志写进哪一天的文件、滚动时归档成什么名字。 */
+  function localDate(): string {
+    const d = new Date();
+    return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}`;
+  }
 
   function formatTime(ns: string): string {
     if (!ns) return "—";
@@ -67,7 +85,6 @@ export function createBackupsSlice(s: BackupsDeps) {
     // 逐段拼出 YYYY/MM/DD HH:mm:ss，不用 toLocaleString：后者按运行环境的
     // 区域设置排版，英文环境会给出 10/16/2026, 8:17:31 AM，同一份日志在不同
     // 机器上格式不一致，也让断言随环境时好时坏。
-    const two = (n: number) => String(n).padStart(2, "0");
     const date = `${d.getFullYear()}/${two(d.getMonth() + 1)}/${two(d.getDate())}`;
     return `${date} ${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
   }
@@ -86,12 +103,31 @@ export function createBackupsSlice(s: BackupsDeps) {
   async function refreshLogs() {
     logLoading.value = true;
     try {
-      logs.value = await readOperationLog(LOG_MAX_LINES);
+      logs.value = await readRunLog(LOG_MAX_LINES);
     } catch (e) {
       Message.error(t("backup.logLoadFailed", { error: String(e) }));
     } finally {
       logLoading.value = false;
     }
+  }
+
+  /** 把当前等级与本地日期推给后端。
+   *
+   * 后端按这套设置决定收下哪些行、写进哪一天的文件，因此界面恢复状态之后
+   * 与用户改等级之后都要推一次，而不是只在启动时推。
+   */
+  async function syncRunLogLevel() {
+    try {
+      await configureRunLog(logLevel.value, localDate());
+    } catch (e) {
+      Message.error(t("backup.logLevelFailed", { error: String(e) }));
+    }
+  }
+
+  /** 切换日志等级：记下来（界面状态域会持久化它），再同步给后端 */
+  function setLogLevel(level: LogLevel) {
+    logLevel.value = level;
+    void syncRunLogLevel();
   }
 
   async function onRestore(row: BackupEntry) {
@@ -128,20 +164,25 @@ export function createBackupsSlice(s: BackupsDeps) {
 
   async function openBackups() {
     backupOpen.value = true;
-    await Promise.all([refreshBackups(), refreshLogs()]);
+    // 抽屉里也有日志页签，因此和「日志管理」窗口一样顺手推一次当前日期：
+    // 只开抽屉、从不打开窗口的用户，跨天后归档日期同样要刷新。
+    // 后端只在等级或日期真的变了时才记一条，重复同步不会产生噪音。
+    await Promise.all([refreshBackups(), refreshLogs(), syncRunLogLevel()]);
   }
 
   /** 打开「日志管理」窗口。打开即刷新：日志随时可能被其它操作写入，
    *  显示上一次打开时的旧内容会误导用户。 */
   async function openLogs() {
     logOpen.value = true;
-    await refreshLogs();
+    // 顺带把等级与**当前**本地日期再推一次：跨天挂机时，按大小滚动的归档
+    // 会用启动那天的日期命名。失败提示由 syncRunLogLevel 自己弹，这里不重复。
+    await Promise.all([refreshLogs(), syncRunLogLevel()]);
   }
 
-  /** 清空操作日志。清空是有破坏性的，二次确认由界面负责。 */
+  /** 清空运行日志。清空是有破坏性的，二次确认由界面负责。 */
   async function clearLogs() {
     try {
-      await clearOperationLog();
+      await clearRunLog();
       Message.success(t("backup.logsCleared"));
       await refreshLogs();
     } catch (e) {
@@ -152,7 +193,7 @@ export function createBackupsSlice(s: BackupsDeps) {
   /** 在系统文件管理器里打开日志所在目录 */
   async function openLogDir() {
     try {
-      await openOperationLogDir();
+      await openRunLogDir();
     } catch (e) {
       Message.error(t("backup.openDirFailed", { error: String(e) }));
     }
@@ -164,11 +205,14 @@ export function createBackupsSlice(s: BackupsDeps) {
     backupLoading,
     logs,
     logLoading,
+    logLevel,
     logOpen,
     logMaxLines: LOG_MAX_LINES,
     formatTime,
     refreshBackups,
     refreshLogs,
+    syncRunLogLevel,
+    setLogLevel,
     onRestore,
     onDelete,
     openBackups,

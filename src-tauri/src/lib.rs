@@ -34,6 +34,7 @@ mod replace;
 // 针对任意真实投影集合的端到端核对，按需运行（标了 #[ignore]）
 #[cfg(test)]
 mod real_project;
+mod run_log;
 mod scene;
 mod tint;
 mod startup;
@@ -41,6 +42,15 @@ mod transform;
 mod update;
 mod visibility;
 mod zip;
+
+/// 运行日志所在目录：应用数据目录下的 `logs`。
+///
+/// 与界面状态（配置目录）分开：日志是运行期产物，会随滚动不断累积，
+/// 不该和用户设置混在一个目录里。
+fn log_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+    app.path().app_data_dir().ok().map(|d| d.join("logs"))
+}
 
 /// 应用入口。以库形式导出，便于将来接入移动端入口。
 ///
@@ -65,10 +75,54 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
+            // 日志要尽早打开：数据目录搬迁与后续启动流程都可能失败，
+            // 而失败的现场只有日志能留下。打不开也不阻断启动——日志不可用
+            // 是遗憾，程序起不来才是故障。
+            //
+            // 但也不能只有标准错误：发布版是 windows_subsystem = "windows"，
+            // 没有控制台，用户什么都看不到，于是「日志功能整个没起来」这件事
+            // 会一直没人发现。这里复用启动失败那条消息框通道（同样受
+            // SCHEMATIC_MANAGER_NO_ERROR_DIALOG 抑制），让用户能看见并处理。
+            match log_dir(app.handle()) {
+                Some(dir) => match run_log::open(&dir) {
+                    Ok(()) => {
+                        // 等级先按界面上次存下的取值，debug 用户才能从第一行起
+                        // 就有完整日志，而不是等界面把等级推过来才开始记
+                        run_log::set_level(commands::saved_log_level(app.handle()));
+                        let info = app.package_info();
+                        run_log::info(&format!(
+                            "启动 {} {}，数据目录 {}",
+                            info.name,
+                            info.version,
+                            dir.parent()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default()
+                        ));
+                    }
+                    Err(e) => {
+                        let text = format!(
+                            "运行日志无法启用，本次运行的日志不会写入。\n\n目录：{}\n原因：{e}\n\n请检查该目录是否可写。",
+                            dir.display()
+                        );
+                        eprintln!("{text}");
+                        startup::show_message(&text);
+                    }
+                },
+                None => {
+                    let text = "运行日志无法启用，本次运行的日志不会写入：定位应用数据目录失败。";
+                    eprintln!("{text}");
+                    startup::show_message(text);
+                }
+            }
+
             // 应用数据被读写前最早的时机：窗口已由 Tauri 建好（webview 的数据
             // 目录那时也建了），但前端命令要等事件循环才开始，界面状态与方块库
             // 都还没被碰过
-            data_dir::migrate_legacy_data(app.handle())?;
+            if let Err(e) = data_dir::migrate_legacy_data(app.handle()) {
+                // 搬迁失败会让用户以为「更新完东西全没了」，先记下来再向上报
+                run_log::error(&format!("应用数据目录搬迁失败：{e}"));
+                return Err(e.into());
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -81,9 +135,12 @@ pub fn run() {
             commands::list_backups,
             commands::restore_backup,
             commands::delete_backup,
-            commands::read_operation_log,
-            commands::clear_operation_log,
-            commands::open_operation_log_dir,
+            commands::configure_run_log,
+            commands::read_run_log,
+            commands::clear_run_log,
+            commands::open_run_log_dir,
+            commands::log_ui_event,
+            commands::run_log_dir,
             commands::search_blocks,
             commands::list_block_versions,
             commands::preview_replace,

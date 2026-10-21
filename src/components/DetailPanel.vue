@@ -11,6 +11,13 @@ import SceneViewer from "./SceneViewer.vue";
 import BlockStatTable from "./BlockStatTable.vue";
 import EntityTable from "./EntityTable.vue";
 import { EXPORT_SIZES } from "../render/scene3d";
+import {
+  PREVIEW_MAX_H,
+  PREVIEW_MAX_W,
+  PREVIEW_MIN_H,
+  PREVIEW_MIN_W,
+} from "../composables/usePreviewResize";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { displayName } from "../i18n";
 import { useAppStore } from "../store";
@@ -19,6 +26,18 @@ import { formatDims, formatSize } from "../utils/format";
 const { t } = useI18n();
 
 const {
+  previewHeight,
+  previewWidth,
+  previewStageHeight,
+  measurePreviewRowHeight,
+  previewHorizResizing,
+  previewVertResizing,
+  startPreviewHeightResize,
+  startPreviewWidthResize,
+  togglePreviewHeight,
+  togglePreviewWidth,
+  onPreviewHeightKey,
+  onPreviewWidthKey,
   viewer,
   scene,
   sceneLoading,
@@ -43,16 +62,48 @@ const {
   saveDraft,
   checkedCount,
   hasChecked,
+  openConvert,
 } = useAppStore();
+
+/** 预览行的 DOM，用于实测它拿到的高度 */
+const previewRowEl = ref<HTMLElement | null>(null);
+let rowObserver: ResizeObserver | null = null;
+
+onMounted(() => {
+  // 舞台尺寸必须按实测高度算：控制条是 flex-wrap 的，预览区窄到放不下
+  // 那一排控件时会折行，固定常数就偏了（多算的高度会把舞台顶出面板）。
+  const el = previewRowEl.value;
+  if (!el) return;
+  rowObserver = new ResizeObserver(() => {
+    measurePreviewRowHeight(el.getBoundingClientRect().height);
+  });
+  rowObserver.observe(el);
+  measurePreviewRowHeight(el.getBoundingClientRect().height);
+});
+
+onBeforeUnmount(() => {
+  rowObserver?.disconnect();
+  rowObserver = null;
+});
+
 </script>
 
 <template>
-  <div class="detail">
-    <div class="preview">
+  <div
+    class="detail"
+    :class="{
+      'is-resizing-h': previewHorizResizing,
+      'is-resizing-v': previewVertResizing,
+    }"
+  >
+    <div class="preview" :style="{ height: previewHeight + 'px' }">
       <!-- 预览与信息并排：左边是 3D 视图，右边是该投影的基本信息与元数据。
            用横向 flex 让「信息在预览右侧」这条要求不随窗口宽度漂移。 -->
-      <div class="preview__main">
-        <div class="preview__stage">
+      <div ref="previewRowEl" class="preview__main">
+        <div
+          class="preview__stage"
+          :style="{ width: previewWidth + 'px', height: previewStageHeight + 'px' }"
+        >
           <!-- 方块数超过阈值：默认不生成几何，等用户点「开始渲染」。
                三万块以上的场景建几何并上传显存会明显卡顿，何时做由用户定。 -->
           <div v-if="sceneGate" class="scene-gate">
@@ -79,6 +130,26 @@ const {
             />
           </a-spin>
         </div>
+
+        <!-- 舞台与信息列之间的垂直分隔条：拖动它改舞台宽度，
+             信息列吃掉剩余宽度，两者合起来占满预览行、右侧不留空白。
+             只在有信息列时出现——没有可分隔的对象时留一条空条没有意义。 -->
+        <div
+          v-if="selected"
+          class="splitter"
+          role="separator"
+          aria-orientation="vertical"
+          :aria-label="t('detail.previewWidthSplitterAria')"
+          :aria-valuenow="previewWidth"
+          :aria-valuemin="PREVIEW_MIN_W"
+          :aria-valuemax="PREVIEW_MAX_W"
+          tabindex="0"
+          :title="t('detail.previewWidthSplitterTitle')"
+          @pointerdown="startPreviewWidthResize"
+          @dblclick="togglePreviewWidth"
+          @keydown="onPreviewWidthKey"
+        />
+
         <div class="preview__info" v-if="selected">
           <!-- 可编辑区：文件名、投影名称、作者、描述。操作行在它外面，
                因此内容再长也不会把保存按钮挤出可视范围。
@@ -138,9 +209,13 @@ const {
           </a-scrollbar>
           </div>
           <!-- 操作行钉在面板底部，不随内容一起滚。
-               面板高度是固定的（$preview-row-h），不钉住的话保存按钮会
-               落到折叠线以下，用户得先滚动才能保存，等于按钮藏起来了。 -->
+               面板高度由用户拖动决定，不钉住的话保存按钮会落到折叠线以下，
+               用户得先滚动才能保存，等于按钮藏起来了。 -->
           <div class="preview__actions">
+            <!-- 版本转换放在投影信息区：它读的是当前选中投影的信息再另存一份 -->
+            <a-button size="small" @click="openConvert">
+              {{ t("detail.convert") }}
+            </a-button>
             <a-button
               type="primary"
               size="small"
@@ -224,6 +299,24 @@ const {
         <span v-else-if="sceneInfo" class="preview__info">{{ sceneInfo }}</span>
       </div>
     </div>
+
+    <!-- 预览区与页签区之间的水平分隔条：往上拖让预览占更多高度，
+         往下拖把空间让给页签区。它只改高度，舞台宽度由上面那条垂直分隔条控制。 -->
+    <div
+      class="splitter splitter--horizontal"
+      role="separator"
+      aria-orientation="horizontal"
+      :aria-label="t('detail.previewSplitterAria')"
+      :aria-valuenow="previewHeight"
+      :aria-valuemin="PREVIEW_MIN_H"
+      :aria-valuemax="PREVIEW_MAX_H"
+      tabindex="0"
+      :title="t('detail.previewSplitterTitle')"
+      @pointerdown="startPreviewHeightResize"
+      @dblclick="togglePreviewHeight"
+      @keydown="onPreviewHeightKey"
+    />
+
     <a-tabs
       class="detail__tabs"
       default-active-key="info"
