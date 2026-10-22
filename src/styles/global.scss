@@ -127,9 +127,20 @@ body[arco-theme='dark'] .titlebar__logo {
   // 表格占满整个高度，内部滚动条由 a-table 的 :scroll="{ y: '100%' }" 提供。
   // 关键点：这里必须是 min-height:0 + flex:1，否则表格会按内容高度撑开，
   // 既撑不满底部，也不会出现纵向滚动条。
-  > .arco-table {
+  //
+  // 表格外面套了一层 .sidebar__table-host（键盘导航的挂载点），因此高度链
+  // 要多走一环：包裹层先吃掉剩余高度，表格再把包裹层撑满。少了这一环，
+  // 包裹层按内容高度收缩，表格的 y:'100%' 就无从计算，纵向滚动条随之消失。
+  > .sidebar__table-host {
     flex: 1 1 auto;
     min-height: 0;
+    display: flex;
+    flex-direction: column;
+
+    > .arco-table {
+      flex: 1 1 auto;
+      min-height: 0;
+    }
   }
 
   // Arco 在表格内部套了多层：.arco-table → .arco-spin → .arco-table-container
@@ -368,6 +379,136 @@ body[arco-theme='dark'] .titlebar__logo {
       background: var(--color-fill-2);
       outline: none;
     }
+  }
+  // 分组标题：不可点，只用来分隔「投影方式」与「预设角度」两组
+  &__label {
+    padding: 4px 10px 2px;
+    color: var(--color-text-3);
+    font-size: 11px;
+  }
+
+  // 分组之间的横线
+  &__sep {
+    height: 1px;
+    margin: 4px 2px;
+    background: var(--color-border-1);
+  }
+}
+
+// 预览区右键菜单：比投影列表那个宽一些（预设名最长有「真等距右」四个字），
+// 十个预设纵向排开会比较高，因此限高并允许滚动。
+.view-menu {
+  min-width: 168px;
+  max-height: 340px;
+  overflow-y: auto;
+  // 滚动条按 Arco 的色板调成细条并去掉轨道，与项目里其它滚动区视觉一致。
+  // 这里没用 a-scrollbar：本菜单是 position: fixed 且高度由内容决定，
+  // 而 a-scrollbar 需要确定的像素高度才能算出可视区，套进来就得把菜单
+  // 写死 340px 高，内容少时也会空出一大块。将来若改成固定高度应换回去。
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-fill-4) transparent;
+
+  &::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background: var(--color-fill-4);
+    border-radius: 3px;
+  }
+
+  &::-webkit-scrollbar-thumb:hover {
+    background: var(--color-fill-3);
+  }
+
+  // 勾选标记占一个字符宽度，未选中时也留位，避免文字左右跳动
+  &__check {
+    display: inline-block;
+    width: 14px;
+    color: rgb(var(--primary-6));
+    font-weight: 600;
+  }
+
+  // 预设角度子菜单的触发项：文字占左、箭头贴右
+  &__sub {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  &__arrow {
+    flex: 0 0 auto;
+    color: var(--color-text-3);
+    font-size: 11px;
+  }
+
+  // 子菜单：叠在主菜单之上，定位由 submenuStyle 算。
+  // 滚动条处理与主菜单同理（见上方 .view-menu 的说明）
+  &__submenu {
+    z-index: 2001;
+    min-width: 150px;
+    max-height: 340px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-fill-4) transparent;
+
+    &::-webkit-scrollbar {
+      width: 6px;
+    }
+
+    &::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    &::-webkit-scrollbar-thumb {
+      background: var(--color-fill-4);
+      border-radius: 3px;
+    }
+
+    &::-webkit-scrollbar-thumb:hover {
+      background: var(--color-fill-3);
+    }
+  }
+
+  // 自定义预设那一行：名字占满，删除按钮挤在右侧
+  &__custom {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  &__name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  // 删除入口平时低调，鼠标移到该行才显出来——
+  // 常驻一个红叉会让菜单看起来像一列危险操作
+  &__del {
+    flex: 0 0 auto;
+    padding: 0 4px;
+    color: var(--color-text-3);
+    font-size: 14px;
+    line-height: 1;
+    border-radius: 3px;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+
+    &:hover {
+      background: var(--color-fill-3);
+      color: rgb(var(--danger-6));
+    }
+  }
+
+  &__custom:hover &__del {
+    opacity: 1;
   }
 }
 
@@ -815,6 +956,13 @@ $preview-stage-h: 344px;
     &:hover {
       background-color: var(--color-fill-1);
     }
+
+    // 被方向键选中的那条：与 hover 同一底色再加左侧色条，
+    // 键盘用户在鼠标不动时也能看出当前停在哪一条
+    &--active {
+      background-color: var(--color-fill-2);
+      box-shadow: inset 3px 0 0 0 rgb(var(--primary-6));
+    }
   }
 
   // 时间列：等宽字体 + 不换行，多行日志的时间里也对得齐
@@ -925,8 +1073,14 @@ $preview-stage-h: 344px;
     flex-direction: column;
   }
 
-  // 页签：作为 flex 子项吃掉内容项的高度（不再依赖 height:100%）
-  .arco-tabs-pane,
+  // 页签：作为 flex 子项吃掉内容项的高度（不再依赖 height:100%）。
+  //
+  // 选择器必须限定在**活动**内容项之下。Arco 用 `.arco-tabs-content-item`
+  // 的 display 切换活动页签（非活动的算 block、高度 0，靠外层裁切隐藏），
+  // 这里若对所有 pane 无条件设 display:flex，非活动 pane 的 flex 会让它
+  // 按内容撑开、从高度为 0 的父级里溢出来，结果是三个页签的内容叠在一起
+  // （实测「方块」「实体」的表格压在了「信息」明细上）。
+  .arco-tabs-content-item-active .arco-tabs-pane,
   .arco-spin,
   .arco-spin-children {
     display: flex;
@@ -946,6 +1100,17 @@ $preview-stage-h: 344px;
 
   // 表格本体：占满剩余高度，滚动交给 Arco 的滚动容器。
   // 它下面还有 .arco-spin 等层级，见顶层的「Arco 表格的滚动链」。
+  //
+  // 表格外面套了一层 .block-table-host（键盘导航的挂载点）：这层要先作为
+  // flex 子项吃掉剩余高度，表格才能在里面撑满。直接给表格 flex 而包裹层
+  // 没有的话，包裹层按内容收缩，纵向滚动条就没了。
+  .block-table-host {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-height: 0;
+  }
+
   .block-table {
     display: flex;
     flex: 1 1 auto;
@@ -1167,6 +1332,13 @@ body[arco-theme='dark'] .dup-chip--suspect {
   min-height: 0;
 }
 
+// 键盘导航的挂载点：夹在 .scroll-fill__inner 与表格之间，必须把高度继续
+// 传下去，否则内层表格拿不到确定高度，Arco 的滚动条就不出现。
+.conv-table-host {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 .conv-split__pane--pick {
   flex: 0 0 330px;
   overflow: hidden;
@@ -1300,6 +1472,31 @@ body[arco-theme='dark'] .conv-block--auto .arco-input-wrapper {
 }
 
 body[arco-theme='dark'] .conv-window .arco-table tr.conv-row--active > .arco-table-td {
+  background-color: rgba(var(--primary-6), 0.22);
+}
+
+// 备份表里被方向键选中的那一行：只加左侧色条与浅底，
+// 与转换窗口那条整行主色区分开——这里选中不表示「正在编辑」，
+// 只是让键盘操作有个可见的落点。
+.backup-table-host .arco-table tr.backup-row--active > .arco-table-td {
+  background-color: var(--color-fill-2);
+  box-shadow: inset 3px 0 0 0 rgb(var(--primary-6));
+}
+
+// 实体表同理：选中只表示键盘停在这一行
+.entity-table-host .arco-table tr.entity-row--active > .arco-table-td {
+  background-color: var(--color-fill-2);
+  box-shadow: inset 3px 0 0 0 rgb(var(--primary-6));
+}
+
+// 方块表：选中即「当前替换源」，与转换窗口一样属于「正在编辑」，
+// 因此用主色底而不是浅灰底
+.block-table-host .arco-table tr.block-row--active > .arco-table-td {
+  background-color: var(--color-primary-light-2);
+  box-shadow: inset 3px 0 0 0 rgb(var(--primary-6));
+}
+
+body[arco-theme='dark'] .block-table-host .arco-table tr.block-row--active > .arco-table-td {
   background-color: rgba(var(--primary-6), 0.22);
 }
 
@@ -1659,4 +1856,74 @@ body[arco-theme='dark'] .repl-block--empty .arco-input-wrapper {
 .arco-table .arco-scrollbar-track {
   background-color: transparent;
   border: 0;
+}
+
+// ---------------------------------------------------------------- 导出尺寸面板
+//
+// 每行一个宽高比、四个短边档位。用 a-form-item 让比例名占一个固定宽度的
+// label 位，五行左边缘因此对齐；label 太宽会挤掉按钮，太窄则放不下「16 : 9」。
+.export-dialog {
+  &__label {
+    margin: 4px 0 8px;
+    color: var(--color-text-2);
+    font-weight: 500;
+  }
+
+  &__presets {
+    .arco-form-item {
+      margin-bottom: 8px;
+    }
+
+    .arco-form-item-label-col {
+      // 只放「16 : 9」这类比例文字，固定宽度避免各行错位
+      flex: 0 0 64px;
+    }
+  }
+
+  // 自定义尺寸那一行与预设之间留出分组间距
+  > .arco-space {
+    margin-bottom: 4px;
+  }
+}
+// ---------------------------------------------------------------- XYZ 方向标
+//
+// X/Y/Z 用红绿蓝是工程制图与 3D 软件的通行约定，不随主题换色调；
+// 但深色主题下纯红在深底上偏暗，因此各提亮一档。
+// 写在全局样式里而不是组件的 scoped 样式里：CSS 变量需要能被
+// body[arco-theme='dark'] 覆盖，scoped 选择器挂在组件根上会失效。
+:root {
+  --gizmo-x: #e34a4a;
+  --gizmo-y: #4aa94a;
+  --gizmo-z: #4a6fe3;
+}
+
+body[arco-theme='dark'] {
+  --gizmo-x: #ff6b6b;
+  --gizmo-y: #63d063;
+  --gizmo-z: #6b8cff;
+}
+
+.view-gizmo {
+  // 方向标只是读数，不能收指针事件：收了以后在它上面按住拖动就转不动画面
+  // （画布拿不到 pointerdown）。点击由画布统一做命中检测，见 hitGizmo。
+  pointer-events: none;
+  user-select: none;
+
+  &__dot {
+    stroke: var(--color-bg-2);
+    stroke-width: 1.5;
+  }
+
+  &__label {
+    fill: var(--color-bg-2);
+    font-size: 7px;
+    font-weight: 600;
+    pointer-events: none;
+  }
+
+  &__center {
+    fill: var(--color-fill-3);
+    stroke: var(--color-border-2);
+    stroke-width: 1;
+  }
 }

@@ -25,14 +25,21 @@ describe("输出路径拼接", () => {
 });
 
 describe("导出文件名", () => {
-  it("去掉 .litematic 后缀并带上尺寸", () => {
-    expect(previewStem("A.litematic", 1024)).toBe("A_preview_1024");
+  it("去掉 .litematic 后缀并带上宽高", () => {
+    expect(previewStem("A.litematic", 1024, 1024)).toBe("A_preview_1024x1024");
     // 后缀大小写不敏感：真实文件里有 .LITEMATIC
-    expect(previewStem("B.LITEMATIC", 512)).toBe("B_preview_512");
+    expect(previewStem("B.LITEMATIC", 1024, 768)).toBe("B_preview_1024x768");
     // 不含后缀的文件名不应被截断
-    expect(previewStem("无后缀", 2048)).toBe("无后缀_preview_2048");
+    expect(previewStem("无后缀", 768, 1024)).toBe("无后缀_preview_768x1024");
     // 名字里本来就有点，只去末尾的 .litematic
-    expect(previewStem("v1.2.litematic", 3072)).toBe("v1.2_preview_3072");
+    expect(previewStem("v1.2.litematic", 1366, 768)).toBe("v1.2_preview_1366x768");
+  });
+
+  it("同样的短边、不同的比例得到不同文件名，不会互相覆盖", () => {
+    // 这是改用「宽×高」而不是只写短边的原因：1024 是 1:1 与 4:3 共有的短边
+    expect(previewStem("A.litematic", 1024, 1024)).not.toBe(
+      previewStem("A.litematic", 1024, 768),
+    );
   });
 
   it("同一批内重名时自动加序号，互不覆盖", () => {

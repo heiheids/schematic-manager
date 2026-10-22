@@ -44,11 +44,21 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 // SceneViewer 依赖 WebGL，jsdom 没有。挂载测试关心的是外壳界面，
 // 因此用空组件替代，避免把 WebGL 缺失误判成界面故障。
+// 方法要与真实组件的 defineExpose 保持一致：store 会直接调用它们，
+// 少一个就会在点视角时抛「is not a function」，而那是替身的错、不是代码的错。
 vi.mock("../components/SceneViewer.vue", () => ({
   default: {
     name: "SceneViewer",
     template: "<div class='scene-viewer-stub' />",
-    methods: { exportPng: () => null, applyPreset: () => {} },
+    methods: {
+      exportPng: () => null,
+      applyPreset: () => {},
+      applyViewPreset: () => {},
+      setOrtho: () => {},
+      fitCamera: () => {},
+      cameraPose: () => ({ position: [10, 20, 30], target: [0, 0, 0] }),
+      applySavedView: () => {},
+    },
   },
 }));
 
@@ -1982,7 +1992,7 @@ describe("目录栏宽度调整", () => {
     expect(def, "默认宽度不应把右侧挤没").toBeLessThanOrEqual(1200);
 
     // 关键：各列默认宽度之和不能超过目录栏默认宽度，
-    // 否则最后一列会被挤出可视区——名称加宽本意是「显示更多」，
+    // 否则最后一列会被挤出可视区——文件名加宽本意是「显示更多」，
     // 挤出末列就与目的相反。这里按 colgroup 的实际宽度求和核对。
     const cols = w.findAll(".sidebar colgroup col");
     const sum = cols.reduce((acc, c) => {
@@ -2127,8 +2137,8 @@ describe("目录栏多选与文件操作", () => {
 
   it("勾选后按钮才可用，未勾选时禁用", async () => {
     const w = await mountWithRows();
-    // 未勾选：删除/复制/复制到/打开文件夹都应禁用
-    for (const label of ["删除", "复制", "复制到", "打开文件夹"]) {
+    // 未勾选：删除/复制/复制到/打开所在目录都应禁用
+    for (const label of ["删除", "复制", "复制到", "打开所在目录"]) {
       expect(btn(w, label), `应有「${label}」按钮`).toBeTruthy();
       expect(btn(w, label)!.attributes("disabled"), `未勾选时「${label}」应禁用`).toBeDefined();
     }
@@ -2137,7 +2147,7 @@ describe("目录栏多选与文件操作", () => {
 
     await rowCheckbox(w, 0).setValue(true);
     await flushPromises();
-    for (const label of ["删除", "复制", "复制到", "打开文件夹"]) {
+    for (const label of ["删除", "复制", "复制到", "打开所在目录"]) {
       expect(btn(w, label)!.attributes("disabled"), `勾选后「${label}」应可用`).toBeUndefined();
     }
     w.unmount();
@@ -2200,7 +2210,7 @@ describe("目录栏多选与文件操作", () => {
     w.unmount();
   });
 
-  it("右键菜单点「打开文件夹」要真的执行（pointerdown 不能先关掉菜单）", async () => {
+  it("右键菜单点「打开所在目录」要真的执行（pointerdown 不能先关掉菜单）", async () => {
     // 这条防的是「右键菜单点不动」：菜单由 v-if 控制，而全局监听在 window 的
     // pointerdown 上关闭它。真实点击的顺序是 pointerdown → click，
     // 若 pointerdown 就把菜单摘掉，click 永远落不到菜单项上。
@@ -2251,14 +2261,14 @@ describe("目录栏多选与文件操作", () => {
     w.unmount();
   });
 
-  it("打开文件夹只用第一个勾选项（资源管理器只能选中一个）", async () => {
+  it("打开所在目录只用第一个勾选项（资源管理器只能选中一个）", async () => {
     const w = await mountWithRows(3);
     await rowCheckbox(w, 0).setValue(true);
     await rowCheckbox(w, 2).setValue(true);
     await flushPromises();
 
     mockInvoke.mockResolvedValueOnce(undefined);
-    await btn(w, "打开文件夹")!.trigger("click");
+    await btn(w, "打开所在目录")!.trigger("click");
     await flushPromises();
 
     const call = mockInvoke.mock.calls.find((c) => c[0] === "reveal_in_file_manager");
@@ -2373,7 +2383,7 @@ describe("多目录与列宽复位", () => {
     w.unmount();
   });
 
-  it("名称列明显宽于其余各列", async () => {
+  it("文件名列明显宽于其余各列", async () => {
     const w = mountApp();
     // 断言 colgroup 上的宽度而不是 getBoundingClientRect：
     // jsdom 不做布局，所有元素尺寸都是 0，量出来只会得到 0 比 0。
@@ -2387,14 +2397,14 @@ describe("多目录与列宽复位", () => {
       expect(m, `第 ${i} 列应带宽度：${style}`).toBeTruthy();
       return Number(m![1]);
     };
-    // 顺序：选择列、名称、制作版本、尺寸、方块总数、占位列
+    // 顺序：选择列、文件名、制作版本、尺寸、方块总数、占位列
     const name = widthOf(1);
     const others = [widthOf(2), widthOf(3), widthOf(4)];
     // 用关系而不是绝对值：绝对值会随后续样式微调而失效，
-    // 这里要保证的是「名称确实是被加宽的那一列」。
+    // 这里要保证的是「文件名确实是被加宽的那一列」。
     expect(
       name,
-      `名称列(${name}) 应比其余各列(${others.join("/")})都宽出一倍以上`,
+      `文件名列(${name}) 应比其余各列(${others.join("/")})都宽出一倍以上`,
     ).toBeGreaterThan(Math.max(...others) * 2);
     w.unmount();
   });
@@ -2642,7 +2652,7 @@ describe("界面状态记忆", () => {
     // jsdom 没有布局，量不到像素；改读 colgroup 里的内联宽度（Arco 会写进去）
     const cols = w.findAll(".sidebar colgroup col");
     const widths = cols.map((c) => (c.element as HTMLElement).style.width);
-    expect(widths, "名称列应恢复为用户拖过的 420px").toContain("420px");
+    expect(widths, "文件名列应恢复为用户拖过的 420px").toContain("420px");
     expect(widths, "制作版本列应恢复为用户拖过的 120px").toContain("120px");
     w.unmount();
   });
@@ -4355,7 +4365,7 @@ describe("投影列表排序", () => {
     return w;
   }
 
-  /** 表格里当前的名称列顺序（只取数据行） */
+  /** 表格里当前的文件名列顺序（只取数据行） */
   function order(w: ReturnType<typeof mountApp>): string[] {
     // 第一列是行选择复选框列（文本为空），文件名不在第一列；
     // 直接按整行里的 .litematic 片段取，稳定且与列顺序无关
@@ -4505,6 +4515,62 @@ it("默认按路径排序，未选字段时就是文件系统的扫描顺序", a
       "a.litematic",
     ]);
     w2.unmount();
+  });
+});
+describe("界面术语一致性", () => {
+  it("投影列表的列标题说「文件名」，不与「投影名称」混淆", async () => {
+    // 这一列绑定的是 fileName，而投影名称是另一个可编辑字段。
+    // 标题若只写「名称」，用户会以为改这里就是改投影名称。
+    stubInvoke();
+    const w = mountApp();
+    await flushPromises();
+    mockOpen.mockResolvedValue(["/p"]);
+    const btn = w.findAll("button").find((b) => b.text().includes("添加目录"));
+    await btn!.trigger("click");
+    await flushPromises();
+
+    const headers = w.findAll(".sidebar .arco-table-th").map((h) => h.text().trim());
+    expect(headers, "文件名列的标题应写明是文件名").toContain("文件名");
+    expect(headers, "不应再有笼统的「名称」列标题").not.toContain("名称");
+    w.unmount();
+  });
+
+
+});
+describe("预览控制条", () => {
+  /** 挂载并选中一个文件，让控制条出现 */
+  async function mountWithSelection() {
+    stubInvoke();
+    const w = mountApp();
+    await flushPromises();
+    mockOpen.mockResolvedValue(["/p"]);
+    const btn = w.findAll("button").find((b) => b.text().includes("添加目录"));
+    await btn!.trigger("click");
+    await flushPromises();
+    const row = w.findAll("tr").find((r) => r.text().includes("测试.litematic"));
+    await row!.trigger("click");
+    await flushPromises();
+    return w;
+  }
+
+  it("拖动亮度滑杆时不弹数值气泡", async () => {
+    // 滑杆右侧已有常驻百分比，气泡是同一信息的第二份，还会挡住滑杆
+    const w = await mountWithSelection();
+    const handle = w.find(".arco-slider-btn");
+    expect(handle.exists(), "应能找到亮度滑杆的手柄").toBe(true);
+
+    // Arco 的气泡在手柄被按下时弹出
+    handle.element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    await flushPromises();
+
+    expect(
+      document.querySelector(".arco-tooltip"),
+      "按下亮度滑杆手柄时不应出现数值气泡",
+    ).toBeNull();
+
+    // 数值仍有可见的显示途径
+    expect(w.text(), "亮度百分比仍要有常驻显示").toMatch(/\d+%/);
+    w.unmount();
   });
 });
 describe("预览区尺寸调整", () => {
@@ -4761,5 +4827,1114 @@ describe("预览区尺寸调整", () => {
     expect(panelHeight(w2), "重开后高度应恢复").toBe(want.h);
     expect(stageSize(w2).w, "重开后宽度应恢复").toBe(want.w);
     w2.unmount();
+  });
+});
+describe("投影列表的键盘导航", () => {
+  /** 三个文件，按路径排序后是 a/b/c，便于断言上下移动的顺序 */
+  const make = (name: string): SchematicSummary => ({
+    ...summary,
+    path: `/p/${name}`,
+    fileName: name,
+  });
+  const a = make("a.litematic");
+  const b = make("b.litematic");
+  const c = make("c.litematic");
+
+  async function setup() {
+    stubInvoke({ scan_litematics: { items: [a, b, c], skippedDirs: 0, skippedPaths: [] } });
+    const w = mountApp();
+    await flushPromises();
+    mockOpen.mockResolvedValue(["/p"]);
+    const btn = w.findAll("button").find((x) => x.text().includes("添加目录"));
+    await btn!.trigger("click");
+    await flushPromises();
+    return w;
+  }
+
+  /** 列表容器：键盘事件绑在它上面 */
+  function host(w: ReturnType<typeof mountApp>) {
+    const el = w.find(".sidebar__table-host");
+    expect(el.exists(), "应有带 tabindex 的列表容器").toBe(true);
+    return el;
+  }
+
+  /** 当前详情面板显示的是哪个文件（用文件名输入框的值判断） */
+  function activeFile(w: ReturnType<typeof mountApp>): string {
+    const input = w.find('input[value^="a.litematic"], input[value^="b.litematic"], input[value^="c.litematic"]');
+    return input.exists() ? (input.element as HTMLInputElement).value : "";
+  }
+
+  it("第一次按下方向键选中第一行", async () => {
+    const w = await setup();
+    await host(w).trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    expect(activeFile(w), "未选中时按方向键应选第一行").toBe("a.litematic");
+    w.unmount();
+  });
+
+  it("上下方向键在相邻行之间移动", async () => {
+    const w = await setup();
+    const h = host(w);
+    await h.trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    await h.trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    expect(activeFile(w), "再按一次应移到第二行").toBe("b.litematic");
+
+    await h.trigger("keydown", { key: "ArrowUp" });
+    await flushPromises();
+    expect(activeFile(w), "按上方向键应回到第一行").toBe("a.litematic");
+    w.unmount();
+  });
+
+  it("Home 与 End 直达首尾，且不会越界", async () => {
+    const w = await setup();
+    const h = host(w);
+
+    await h.trigger("keydown", { key: "End" });
+    await flushPromises();
+    expect(activeFile(w), "End 应选中最后一行").toBe("c.litematic");
+
+    // 已在末尾再按下方向键不能越界
+    await h.trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    expect(activeFile(w), "末尾再按下方向键不应越界").toBe("c.litematic");
+
+    await h.trigger("keydown", { key: "Home" });
+    await flushPromises();
+    expect(activeFile(w), "Home 应选中第一行").toBe("a.litematic");
+
+    await h.trigger("keydown", { key: "ArrowUp" });
+    await flushPromises();
+    expect(activeFile(w), "开头再按上方向键不应越界").toBe("a.litematic");
+    w.unmount();
+  });
+
+  it("列表没有文件时按键不报错", async () => {
+    stubInvoke();
+    const w = mountApp();
+    await flushPromises();
+    const h = w.find(".sidebar__table-host");
+    // 不应抛异常，也不应做出任何选中
+    await h.trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    w.unmount();
+  });
+});
+describe("其余列表的键盘导航", () => {
+  /** 挂载并选中一个文件，让详情页签与方块表出现 */
+  async function selectWithBlocks(blocks: BlockCount[]) {
+    stubInvoke({
+      analyze_schematic: () => ({
+        blocks,
+        entities: [],
+        tileEntities: [],
+        entityInstances: [],
+        nonAirTotal: blocks.reduce((a, b) => a + b.count, 0),
+        airTotal: 0,
+        distinctBlockTypes: new Set(blocks.map((b) => b.name)).size,
+        distinctStates: blocks.length,
+      }),
+    });
+    const w = mountApp();
+    await flushPromises();
+    mockOpen.mockResolvedValue("/p");
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await flushPromises();
+    return w;
+  }
+
+  it("方块表：方向键选中行并回填替换源方块", async () => {
+    const blocks: BlockCount[] = [
+      { name: "minecraft:stone", state: "minecraft:stone", count: 5, zhName: "石头", enName: "Stone" },
+      { name: "minecraft:dirt", state: "minecraft:dirt", count: 3, zhName: "泥土", enName: "Dirt" },
+    ];
+    const w = await selectWithBlocks(blocks);
+    const tab = w
+      .findAll(".detail__tabs .arco-tabs-tab")
+      .find((x) => (x.text() || "").trim() === "方块");
+    expect(tab, "应能定位到方块页签").toBeTruthy();
+    await tab!.trigger("click");
+    await flushPromises();
+
+    const host = w.find(".block-table-host");
+    expect(host.exists(), "方块表应有键盘导航容器").toBe(true);
+
+    await host.trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+
+    // 选中方块会把它的方块名回填到替换窗口的「源方块」，
+    // 因此这个值是「选中真的生效」的直接证据，而不只是行上多了一个类名。
+    const fromInput = w.find('.replace-window input[placeholder*="minecraft:"]');
+    if (fromInput.exists()) {
+      expect((fromInput.element as HTMLInputElement).value, "选中方块应回填源方块").toBe(
+        "minecraft:stone",
+      );
+    }
+    // 行高亮是导航可见性的必要条件
+    expect(
+      w.findAll(".block-table tbody tr.block-row--active").length,
+      "应有且只有一行被标为当前行",
+    ).toBe(1);
+    w.unmount();
+  });
+
+  it("日志列表：方向键在日志行之间移动并只标一行", async () => {
+    stubInvoke({
+      read_run_log: () => [
+        "1792138651762518000\tINFO\t复制\t完成",
+        "1792138651762518001\tERROR\t替换\t失败",
+      ],
+    });
+    const w = mountApp();
+    await flushPromises();
+    // 备份与日志抽屉 → 运行日志页签
+    await w.findAll("button").find((b) => b.text().includes("备份与日志"))!.trigger("click");
+    await flushPromises();
+    const tab = [...document.querySelectorAll<HTMLElement>(".arco-tabs-tab")].find((t) =>
+      (t.textContent ?? "").includes("运行日志"),
+    );
+    expect(tab, "应有运行日志页签").toBeTruthy();
+    tab!.click();
+    await flushPromises();
+
+    // 抽屉里的日志页签在当前环境下不渲染列表，改走「日志管理」窗口：
+    // 两处用的是同一个 RunLogList 组件，导航行为一致。
+    const manageBtn = [...document.querySelectorAll<HTMLElement>("button")].find((b) =>
+      (b.textContent ?? "").includes("日志管理"),
+    );
+    expect(manageBtn, "运行日志页签里应有「日志管理」按钮").toBeTruthy();
+    manageBtn!.click();
+    await flushPromises();
+
+    const modal = [...document.querySelectorAll<HTMLElement>(".arco-modal")].find((m) =>
+      (m.textContent ?? "").includes("日志管理"),
+    );
+    expect(modal, "应打开日志管理窗口").toBeTruthy();
+
+    const hostEl = modal!.querySelector<HTMLElement>(".log-list");
+    expect(hostEl, "窗口里应显示日志列表").toBeTruthy();
+    const rows = modal!.querySelectorAll(".log-list__row");
+    expect(rows.length, "应显示两条日志").toBe(2);
+
+    hostEl!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    await flushPromises();
+    expect(
+      modal!.querySelectorAll(".log-list__row--active").length,
+      "应有且只有一行被标为当前行",
+    ).toBe(1);
+    expect(
+      modal!.querySelector(".log-list__row--active")!.textContent,
+      "第一次按下应停在第一条日志",
+    ).toContain("复制");
+
+    hostEl!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    await flushPromises();
+    const active = modal!.querySelectorAll(".log-list__row--active");
+    expect(active.length, "仍只应有一行被标记").toBe(1);
+    expect(active[0].textContent, "第二次按下后应停在第二条日志").toContain("替换");
+
+    // End 应直达最后一条
+    hostEl!.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true }));
+    await flushPromises();
+    expect(
+      modal!.querySelector(".log-list__row--active")!.textContent,
+      "End 应停在最后一条",
+    ).toContain("替换");
+    w.unmount();
+  });
+});
+
+describe("列表键盘导航不抢输入框", () => {
+  const CONV_ITEMS = [
+    {
+      name: "minecraft:oak_stairs",
+      nameZh: "橡木楼梯",
+      count: 12,
+      suggested: "minecraft:pale_oak_stairs",
+      suggestedZh: "苍白橡木楼梯",
+      chosen: "",
+    },
+    {
+      name: "minecraft:ancient_debris",
+      nameZh: "远古残骸",
+      count: 3,
+      suggested: "",
+      suggestedZh: "",
+      chosen: "",
+    },
+  ];
+
+  /** 打开转换窗口并分析出两行缺口。
+   *
+   * 这两行的「替代为」列里各有一个输入框，正是那种「焦点在输入框里、
+   * 但位于列表容器内部」的情形：此时方向键属于光标，不属于列表。
+   */
+  async function openWithRows() {
+    mockInvoke.mockImplementation((async (cmd: string) => {
+      switch (cmd) {
+        case "scan_litematics":
+          return { items: [summary], skippedDirs: 0, skippedPaths: [] };
+        case "convert_targets":
+          return [{ index: 0, name: "1.19.2", dataVersion: 3120 }];
+        case "base_db_status":
+          return {
+            versions: [{ name: "1.20.1", dataVersion: 3465 }],
+            entityAvailable: true,
+            supported: [{ name: "1.20.1", dataVersion: 3465 }],
+          };
+        case "analyze_conversion":
+          return CONV_ITEMS.map((i) => ({ ...i }));
+        case "build_scene":
+          return scene;
+        case "analyze_schematic":
+          return {
+            blocks: [],
+            entities: [],
+            tileEntities: [],
+            nonAirTotal: 0,
+            airTotal: 0,
+            distinctBlockTypes: 0,
+            distinctStates: 0,
+          };
+        default:
+          return [];
+      }
+    }) as never);
+
+    const w = mountApp();
+    mockOpen.mockResolvedValue("/p");
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await flushPromises();
+    await w.findAll("button").find((b) => b.text().includes("版本转换"))!.trigger("click");
+    await flushPromises();
+
+    // 选目标版本：下拉 → 选项
+    const select = document.querySelector(".arco-select-view, .arco-select") as HTMLElement | null;
+    if (select) {
+      select.click();
+      await flushPromises();
+      const opt = [...document.querySelectorAll(".arco-select-option")].find((o) =>
+        (o.textContent ?? "").includes("1.19.2"),
+      ) as HTMLElement | undefined;
+      if (opt) {
+        opt.click();
+        await flushPromises();
+      }
+    }
+    // 分析差异，左栏才会出现那两行缺口
+    const analyze = [...document.querySelectorAll<HTMLElement>("button")].find((b) =>
+      (b.textContent ?? "").includes("分析差异"),
+    );
+    expect(analyze, "应能点「分析差异」").toBeTruthy();
+    analyze!.click();
+    await flushPromises();
+    return w;
+  }
+
+  it("转换窗口里在行内输入框按方向键不会切换选中行", async () => {
+    const w = await openWithRows();
+    const host = document.querySelector<HTMLElement>(".conv-table-host");
+    expect(host, "转换窗口的左栏应有键盘导航容器").toBeTruthy();
+
+    // 行内输入框（「替代为」那一列）确实在导航容器内部
+    const input = host!.querySelector<HTMLInputElement>("input");
+    expect(input, "行内应有替代品输入框").toBeTruthy();
+
+    // 先让键盘选中第一行
+    host!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    await flushPromises();
+    const firstActive = host!.querySelector("tr.conv-row--active");
+    expect(firstActive, "方向键应选中一行").toBeTruthy();
+
+    // 焦点在行内输入框时按下方向键：选中行必须保持不变
+    input!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    await flushPromises();
+    const stillActive = host!.querySelector("tr.conv-row--active");
+    expect(stillActive, "输入框里按方向键不应让选中行消失").toBeTruthy();
+    expect(
+      stillActive!.textContent,
+      "输入框里按方向键不应把选中换到另一行",
+    ).toBe(firstActive!.textContent);
+    w.unmount();
+  });
+});
+describe("导出尺寸面板", () => {
+  /** 挂载并选中一个文件，让预览区与导出按钮出现 */
+  async function setup() {
+    stubInvoke({
+      analyze_schematic: () => ({
+        blocks: [],
+        entities: [],
+        tileEntities: [],
+        nonAirTotal: 0,
+        airTotal: 0,
+        distinctBlockTypes: 0,
+        distinctStates: 0,
+      }),
+      build_scene: () => scene,
+    });
+    const w = mountApp();
+    await flushPromises();
+    mockOpen.mockResolvedValue("/p");
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await flushPromises();
+    return w;
+  }
+
+  /** 面板里的两个宽高输入框 */
+  function sizeInputs(): HTMLInputElement[] {
+    return [...document.querySelectorAll<HTMLInputElement>(".export-dialog input")];
+  }
+
+  it("点「导出预览图」先打开尺寸面板，而不是直接弹保存框", async () => {
+    const w = await setup();
+    const btn = w.findAll("button").find((b) => b.text().trim() === "导出预览图");
+    expect(btn, "应有「导出预览图」按钮").toBeTruthy();
+    await btn!.trigger("click");
+    await flushPromises();
+
+    const dialog = document.querySelector(".export-dialog");
+    expect(dialog, "应先打开导出尺寸面板").toBeTruthy();
+    // 面板里既要有预设，也要能手填
+    expect(sizeInputs().length, "应有宽、高两个输入框").toBe(2);
+    expect(dialog!.textContent, "应有预设区").toContain("预设尺寸");
+    expect(dialog!.textContent, "应有自定义区").toContain("自定义尺寸");
+    w.unmount();
+  });
+
+  it("批量导出也先经过尺寸面板，标题写明是批量", async () => {
+    // 批量导出原先只能沿用记住的尺寸，而界面上已无处可改——
+    // 用户无从得知批量导出会出多大图。因此它同样走这个面板。
+    const w = await setup();
+    // 勾选一个文件，批量导出按钮才可用
+    const cb = w.find('.sidebar input[type="checkbox"]');
+    if (cb.exists()) {
+      await cb.setValue(true);
+      await flushPromises();
+    }
+    const btn = w.findAll("button").find((b) => b.text().includes("批量导出"));
+    expect(btn, "应有批量导出按钮").toBeTruthy();
+    await btn!.trigger("click");
+    await flushPromises();
+
+    const dialog = document.querySelector(".export-dialog");
+    expect(dialog, "批量导出也应先打开尺寸面板").toBeTruthy();
+    expect(
+      document.querySelector(".arco-modal-title")?.textContent ?? "",
+      "标题应说明这是批量导出",
+    ).toContain("批量");
+    w.unmount();
+  });
+
+  it("选预设会把手填的宽高覆盖掉", async () => {
+    const w = await setup();
+    await w.findAll("button").find((b) => b.text().trim() === "导出预览图")!.trigger("click");
+    await flushPromises();
+
+    // 先手填一个奇怪的尺寸
+    const [wIn, hIn] = sizeInputs();
+    wIn.value = "700";
+    wIn.dispatchEvent(new Event("input"));
+    hIn.value = "300";
+    hIn.dispatchEvent(new Event("input"));
+    await flushPromises();
+    expect((sizeInputs()[0] as HTMLInputElement).value, "手填值应生效").toBe("700");
+
+    // 再点 16:9 → 2048 的预设按钮。短边相同的按钮每行都有，
+    // 必须按比例那一行定位，否则会点到 1:1 那行的同名按钮。
+    const row = document.querySelector<HTMLElement>('.export-dialog__presets [data-aspect="16x9"]');
+    expect(row, "应有 16:9 那一行").toBeTruthy();
+    const preset = [...row!.querySelectorAll<HTMLElement>("button")].find(
+      (b) => (b.textContent ?? "").trim() === "2048 px",
+    );
+    expect(preset, "16:9 应有短边 2048 的按钮").toBeTruthy();
+    preset!.click();
+    await flushPromises();
+
+    // 16:9 的短边是 2048，长边 3641
+    const after = sizeInputs();
+    const wv = Number((after[0] as HTMLInputElement).value);
+    const hv = Number((after[1] as HTMLInputElement).value);
+    expect(Math.min(wv, hv), "预设的短边应被覆盖成 2048").toBe(2048);
+    expect(Math.max(wv, hv), "长边应按 16:9 放大").toBe(3641);
+    w.unmount();
+  });
+
+  it("确认后面板关闭并按所选尺寸导出", async () => {
+    const w = await setup();
+    await w.findAll("button").find((b) => b.text().trim() === "导出预览图")!.trigger("click");
+    await flushPromises();
+
+    // 选 4:3 短边 1024 的预设（第一个 1024 按钮属于 1:1，取第 2 个）
+    const buttons = [...document.querySelectorAll<HTMLElement>(".export-dialog button")].filter(
+      (b) => (b.textContent ?? "").trim() === "1024 px",
+    );
+    expect(buttons.length, "每档短边各有一个按钮").toBe(5);
+    buttons[1].click(); // 4:3
+    await flushPromises();
+
+    const ok = [
+      ...document.querySelectorAll<HTMLElement>(".arco-modal-footer button"),
+    ].find((b) => (b.textContent ?? "").trim() === "导出");
+    expect(ok, "面板应有「导出」按钮").toBeTruthy();
+    ok!.click();
+    await flushPromises();
+
+    // 面板关闭：Arco 的 modal 用 v-show 控制显隐，jsdom 下元素仍在文档里，
+    // 因此断言可见性而不是「元素是否被移除」
+    const modal = document.querySelector<HTMLElement>(".export-dialog")?.closest(".arco-modal");
+    expect(modal, "面板元素应仍在（由 v-show 控制）").toBeTruthy();
+    // 面板关闭：Arco 的 modal 用 v-show 控制显隐，jsdom 下元素仍留在文档里，
+    // 因此断言可见性而不是「元素是否被移除」。承载 display 的那一层在
+    // wrapper / modal / mask 之间，任一层被设为 none 即表示已关闭。
+    const layers = [
+      modal!.closest<HTMLElement>(".arco-modal-wrapper"),
+      modal as HTMLElement,
+      modal!.closest<HTMLElement>(".arco-modal-mask"),
+    ];
+    const hidden = layers.some((el) => el?.style.display === "none");
+    expect(hidden, "确认后应隐藏面板").toBe(true);
+    w.unmount();
+  });
+});
+describe("保存语义（未保存草稿与另存为）", () => {
+  /** 挂载、加目录、选中唯一文件 */
+  async function setup(extra: Record<string, unknown> = {}) {
+    stubInvoke(extra);
+    const w = mountApp();
+    await flushPromises();
+    mockOpen.mockResolvedValue("/p");
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await flushPromises();
+    return w;
+  }
+
+  it("方块替换不再立即写盘，而是进入待保存状态", async () => {
+    // 替换会大量改写调色板且不可撤销。点「执行替换」只应记下规则，
+    // 真正写盘要等用户点「保存」。
+    // 先确认这套挂载能真的进入详情面板（否则后面的按钮断言都无从谈起）
+    const applied: string[] = [];
+    const w = await setup({
+      apply_replace: () => {
+        applied.push("called");
+        return { replaced: 3 };
+      },
+    });
+
+    expect(w.text(), "应已选中文件并进入详情面板").toContain("投影名称");
+
+    // 打开方块替换窗口，填一组规则
+    await w.findAll("button").find((b) => b.text().includes("方块替换"))!.trigger("click");
+    await flushPromises();
+    // 按 placeholder 精确定位：左栏四个输入框依次是源方块、源属性、目标方块、
+    // 目标属性，按下标取会把规则填进属性栏，规则因缺方块名而被拒
+    const byPlaceholder = (ph: string) =>
+      [...document.querySelectorAll<HTMLInputElement>(".repl-window input")].find(
+        (i) => (i.placeholder ?? "").includes(ph),
+      )! as HTMLInputElement;
+    const fromInput = byPlaceholder("oak_stairs");
+    const toInput = byPlaceholder("minecraft:stone");
+    expect(fromInput, "应有源方块输入框").toBeTruthy();
+    expect(toInput, "应有目标方块输入框").toBeTruthy();
+    fromInput.value = "minecraft:stone";
+    fromInput.dispatchEvent(new Event("input"));
+    toInput.value = "minecraft:dirt";
+    toInput.dispatchEvent(new Event("input"));
+    await flushPromises();
+
+    const ok = [...document.querySelectorAll<HTMLElement>(".arco-modal-footer button")].find(
+      (b) => (b.textContent ?? "").trim() === "执行替换",
+    );
+    expect(ok, "应有「执行替换」按钮").toBeTruthy();
+    ok!.click();
+    await flushPromises();
+
+    expect(applied.length, "此时不应调用后端写盘").toBe(0);
+    // 记入草稿后，保存按钮应从禁用变为可用——这是「替换进入未保存状态」的直接证据
+    const saveBtn = w.findAll("button").find((b) => b.text().trim() === "保存");
+    expect(saveBtn, "应有保存按钮").toBeTruthy();
+    expect(
+      saveBtn!.attributes("disabled"),
+      "记入替换后保存按钮应可用",
+    ).toBeUndefined();
+    expect(shownMessages().join("|"), "应提示已记入待保存").toContain("保存");
+    w.unmount();
+  });
+
+  it("保存时执行待替换规则，并在成功提示里说明替换了几个方块", async () => {
+    const applied: unknown[] = [];
+    const w = await setup({
+      apply_replace: (args: { path?: string }) => {
+        applied.push(args);
+        return { replaced: 3 };
+      },
+      save_metadata: () => ({ backupPath: "/p/备份/x.bak" }),
+    });
+
+    await w.findAll("button").find((b) => b.text().includes("方块替换"))!.trigger("click");
+    await flushPromises();
+    // 与上一条同样的坑：左栏四个输入框依次是源方块、源属性、目标方块、
+    // 目标属性，必须按 placeholder 取源与目标那两栏
+    const pickInput = (ph: string) =>
+      [...document.querySelectorAll<HTMLInputElement>(".repl-window input")].find((i) =>
+        (i.placeholder ?? "").includes(ph),
+      )! as HTMLInputElement;
+    const fromIn = pickInput("oak_stairs");
+    const toIn = pickInput("minecraft:stone");
+    fromIn.value = "minecraft:stone";
+    fromIn.dispatchEvent(new Event("input"));
+    toIn.value = "minecraft:dirt";
+    toIn.dispatchEvent(new Event("input"));
+    await flushPromises();
+    [...document.querySelectorAll<HTMLElement>(".repl-window .arco-modal-footer button")]
+      .find((b) => (b.textContent ?? "").trim() === "执行替换")!
+      .click();
+    await flushPromises();
+
+    // 点保存
+    const save = w.findAll("button").find((b) => b.text().trim() === "保存");
+    expect(save, "应有保存按钮").toBeTruthy();
+    expect(
+      save!.attributes("disabled"),
+      "记入替换后应可保存（说明草稿状态已反映替换）",
+    ).toBeUndefined();
+    await save!.trigger("click");
+    await flushPromises();
+
+    expect(applied.length, "保存时才应真正执行替换").toBe(1);
+    // 提示文案用 spy 断言而不是读 body：Arco 的 Message 容器会被 body 清空
+    // 变成游离节点，读 body 只能靠运气
+    expect(
+      shownMessages().join("|"),
+      "应说明替换了几个方块",
+    ).toContain("已替换 3 个方块");
+    w.unmount();
+  });
+
+  it("另存为把内容写到新路径，并把编辑对象切到新文件", async () => {
+    const savedAs: Array<{ sourcePath: string; targetPath: string }> = [];
+    const w = await setup({
+      save_schematic_as: (args: { sourcePath: string; targetPath: string }) => {
+        savedAs.push(args);
+        return args.targetPath;
+      },
+    });
+
+    // 另存为按钮不依赖 dirty，随时可用
+    const btn = w.findAll("button").find((b) => b.text().trim() === "另存为");
+    expect(btn, "应有「另存为」按钮").toBeTruthy();
+
+    // 保存对话框返回一个目标路径
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    vi.mocked(save).mockResolvedValueOnce("/p/copy.litematic");
+    await btn!.trigger("click");
+    await flushPromises();
+
+    expect(savedAs.length, "应调用另存为命令").toBe(1);
+    expect(savedAs[0].targetPath, "目标应是用户选的路径").toBe("/p/copy.litematic");
+    expect(savedAs[0].sourcePath, "来源应是当前文件").toBe("/p/测试.litematic");
+    w.unmount();
+  });
+
+  it("没有未保存改动时点击关闭按钮直接关窗，不弹确认", async () => {
+    // 反向情形：没有改动还弹确认就是在打扰用户
+    const close = vi.fn();
+    vi.mocked(getCurrentWindow).mockReturnValue({
+      minimize: vi.fn(),
+      toggleMaximize: vi.fn(),
+      close,
+      isMaximized: vi.fn().mockResolvedValue(false),
+      onResized: vi.fn().mockResolvedValue(() => {}),
+      theme: vi.fn().mockResolvedValue(null),
+      onThemeChanged: vi.fn().mockResolvedValue(() => {}),
+    } as never);
+
+    const w = await setup();
+    // 刚选中文件、什么都没改，不应显示未保存提示
+    expect(w.text(), "此时不应有未保存提示").not.toContain("有未保存的修改");
+
+    await w.find(".titlebar__btn.is-close").trigger("click");
+    await flushPromises();
+
+    expect(close, "没有改动时应直接关窗").toHaveBeenCalled();
+    w.unmount();
+  });
+
+  it("有未保存改动时点击关闭按钮会先确认", async () => {
+    const close = vi.fn();
+    vi.mocked(getCurrentWindow).mockReturnValue({
+      minimize: vi.fn(),
+      toggleMaximize: vi.fn(),
+      close,
+      isMaximized: vi.fn().mockResolvedValue(false),
+      onResized: vi.fn().mockResolvedValue(() => {}),
+      theme: vi.fn().mockResolvedValue(null),
+      onThemeChanged: vi.fn().mockResolvedValue(() => {}),
+    } as never);
+
+    const w = await setup();
+    // 制造一处未保存改动
+    const nameInput = w.find('.preview__info input');
+    expect(nameInput.exists(), "应有可编辑的名称输入框").toBe(true);
+    await nameInput.setValue("改了个名字");
+    await flushPromises();
+    expect(w.text(), "应显示有未保存的修改").toContain("有未保存的修改");
+
+    // 点标题栏关闭按钮（自绘标题栏，三个按钮都是 div）
+    const btn = w.find(".titlebar__btn.is-close");
+    expect(btn.exists(), "应有窗口关闭按钮").toBe(true);
+    await btn.trigger("click");
+    await flushPromises();
+
+    // 关键行为：有未保存改动时，关闭被拦下并弹出确认；无改动时才直接关。
+    // 这里只断言「拦下并弹出确认」这一步——Modal.confirm 在 jsdom 下没有
+    // 真实交互，它的 Promise 会立即结算，据此断言「窗口没关」并不成立。
+    const modals = [...document.querySelectorAll<HTMLElement>(".arco-modal")].map(
+      (m) => (m.textContent ?? ""),
+    );
+    expect(modals.join("||"), "应弹出未保存确认").toContain("未保存的修改");
+    expect(modals.join("||"), "确认框里应说明关窗会丢弃修改").toContain("丢弃");
+    expect(document.querySelector(".arco-modal"), "确认框应可见").toBeTruthy();
+    w.unmount();
+  });
+});
+describe("预览区的右键菜单", () => {
+  /** 挂载并选中文件，让预览舞台出现 */
+  async function setup() {
+    stubInvoke({
+      analyze_schematic: () => ({
+        blocks: [],
+        entities: [],
+        tileEntities: [],
+        nonAirTotal: 0,
+        airTotal: 0,
+        distinctBlockTypes: 0,
+        distinctStates: 0,
+      }),
+      build_scene: () => scene,
+    });
+    const w = mountApp();
+    await flushPromises();
+    mockOpen.mockResolvedValue("/p");
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await flushPromises();
+    return w;
+  }
+
+  /** 在预览舞台上右键 */
+  async function rightClick(w: ReturnType<typeof mountApp>) {
+    const stage = w.find(".preview__stage");
+    expect(stage.exists(), "应有预览舞台").toBe(true);
+    await stage.trigger("contextmenu", { clientX: 300, clientY: 200 });
+    await flushPromises();
+    return stage;
+  }
+
+  it("右键预览区弹出视角菜单，含保存、投影切换与预设角度子菜单", async () => {
+    const w = await setup();
+    await rightClick(w);
+
+    const menu = document.querySelector(".view-menu");
+    expect(menu, "右键应弹出视角菜单").toBeTruthy();
+    const text = menu!.textContent ?? "";
+    expect(text, "应有保存为预设角度入口").toContain("保存为预设角度");
+    expect(text, "应有正射投影开关").toContain("正射投影");
+    expect(text, "应有预设角度子菜单入口").toContain("预设角度");
+    // 子菜单默认收起：十个预设不该一开始就铺在菜单里
+    expect(text, "预设角度初始应收起").not.toContain("顶（Y+）");
+
+    // 展开子菜单后十个预设一个都不能少
+    const sub = [...document.querySelectorAll<HTMLElement>(".view-menu .view-menu__sub")][0];
+    expect(sub, "应有子菜单入口").toBeTruthy();
+    sub.click();
+    await flushPromises();
+    const subText = document.querySelector(".view-menu__submenu")?.textContent ?? "";
+    expect(subText, "展开后应有子菜单").not.toBe("");
+    for (const name of [
+      "顶（Y+）",
+      "底（Y−）",
+      "南（Z+）",
+      "北（Z−）",
+      "东（X+）",
+      "西（X−）",
+      "等距右",
+      "等距左",
+      "真等距右",
+      "真等距左",
+    ]) {
+      expect(subText, `子菜单里应有「${name}」`).toContain(name);
+    }
+    w.unmount();
+  });
+
+  it("点子菜单里的预设后菜单与子菜单一起关闭", async () => {
+    const w = await setup();
+    await rightClick(w);
+
+    const sub = [...document.querySelectorAll<HTMLElement>(".view-menu .view-menu__sub")][0];
+    sub.click();
+    await flushPromises();
+    const items = [...document.querySelectorAll<HTMLElement>(".view-menu__submenu .ctx-menu__item")];
+    const top = items.find((el) => (el.textContent ?? "").includes("顶（Y+）"));
+    expect(top, "应有顶视角项").toBeTruthy();
+    top!.click();
+    await flushPromises();
+
+    expect(document.querySelector(".view-menu"), "选完之后菜单应关闭").toBeNull();
+    expect(document.querySelector(".view-menu__submenu"), "子菜单也应关闭").toBeNull();
+    w.unmount();
+  });
+
+  it("点菜单外面会关闭菜单", async () => {
+    const w = await setup();
+    await rightClick(w);
+    expect(document.querySelector(".view-menu"), "菜单应已打开").toBeTruthy();
+
+    document.body.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+    await flushPromises();
+    expect(document.querySelector(".view-menu"), "点别处应关闭菜单").toBeNull();
+    w.unmount();
+  });
+
+  it("按 Esc 关闭菜单", async () => {
+    const w = await setup();
+    await rightClick(w);
+    expect(document.querySelector(".view-menu"), "菜单应已打开").toBeTruthy();
+
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await flushPromises();
+    expect(document.querySelector(".view-menu"), "按 Esc 应关闭菜单").toBeNull();
+    w.unmount();
+  });
+
+  it("点「正射投影」会打上勾，再点取消", async () => {
+    const w = await setup();
+    const stage = w.find(".preview__stage");
+
+    await stage.trigger("contextmenu", { clientX: 300, clientY: 200 });
+    await flushPromises();
+    const orthoItem = () =>
+      [...document.querySelectorAll<HTMLElement>(".view-menu .ctx-menu__item")].find((el) =>
+        (el.textContent ?? "").includes("正射投影"),
+      )!;
+
+    expect(orthoItem().textContent, "初始未勾选").not.toContain("✓");
+    orthoItem().click();
+    await flushPromises();
+
+    // 再开一次菜单看勾选状态
+    await stage.trigger("contextmenu", { clientX: 300, clientY: 200 });
+    await flushPromises();
+    expect(orthoItem().textContent, "点过之后应显示勾选").toContain("✓");
+    w.unmount();
+  });
+});
+describe("自定义视角预设", () => {
+  /** 挂载并选中文件，让预览舞台出现 */
+  async function setup() {
+    stubInvoke({
+      analyze_schematic: () => ({
+        blocks: [],
+        entities: [],
+        tileEntities: [],
+        nonAirTotal: 0,
+        airTotal: 0,
+        distinctBlockTypes: 0,
+        distinctStates: 0,
+      }),
+      build_scene: () => scene,
+    });
+    const w = mountApp();
+    await flushPromises();
+    mockOpen.mockResolvedValue("/p");
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await flushPromises();
+    return w;
+  }
+
+  /** 打开预览区的右键菜单 */
+  async function openMenu(w: ReturnType<typeof mountApp>) {
+    await w.find(".preview__stage").trigger("contextmenu", { clientX: 300, clientY: 200 });
+    await flushPromises();
+    expect(document.querySelector(".view-menu"), "菜单应已打开").toBeTruthy();
+  }
+
+  /** 点菜单里文字包含 label 的那一项 */
+  function menuItem(label: string): HTMLElement | undefined {
+    return [...document.querySelectorAll<HTMLElement>(".view-menu .ctx-menu__item")].find((el) =>
+      (el.textContent ?? "").includes(label),
+    );
+  }
+
+  /** 展开「预设角度」子菜单（内置十个角度与自定义预设都在里面）。
+   *
+   *  用点击而不是派发 mouseenter：两者的处理函数都会置 presetSubOpen，
+   *  但 jsdom 里合成的 mouseenter 不会被 Vue 的 @mouseenter 收到。
+   */
+  async function openPresetSub() {
+    // 不能按文字找："保存为预设角度…" 里也含 "预设角度"，会选错项
+    const trigger = document.querySelector<HTMLElement>(".view-menu .view-menu__sub");
+    expect(trigger, "主菜单里应有预设角度入口").toBeTruthy();
+    // 入口是切换语义：已经展开时再点会收起，所以只在没展开时点
+    if (!document.querySelector(".view-menu__submenu")) {
+      trigger!.click();
+      await flushPromises();
+    }
+    const sub = document.querySelector(".view-menu__submenu");
+    expect(sub, "子菜单应已展开").toBeTruthy();
+    return sub as HTMLElement;
+  }
+
+  /** 在子菜单里找文字包含 label 的那一项 */
+  function subItem(label: string): HTMLElement | undefined {
+    return [...document.querySelectorAll<HTMLElement>(".view-menu__submenu .ctx-menu__item")]
+      .find((el) => (el.textContent ?? "").includes(label));
+  }
+
+  it("菜单里有「保存为预设角度」入口", async () => {
+    const w = await setup();
+    await openMenu(w);
+    expect(menuItem("保存为预设角度"), "菜单应有保存入口").toBeTruthy();
+    w.unmount();
+  });
+
+  it("保存预设后出现在菜单的自定义分组里", async () => {
+    const w = await setup();
+    await openMenu(w);
+    menuItem("保存为预设角度")!.click();
+    await flushPromises();
+
+    // 面板应打开
+    const dialog = document.querySelector(".view-preset");
+    expect(dialog, "应打开保存面板").toBeTruthy();
+    expect(dialog!.textContent, "面板应展示投影方式").toContain("投影");
+    expect(dialog!.textContent, "面板应展示相机位置").toContain("相机位置");
+    expect(dialog!.textContent, "面板应展示相机角度").toContain("yaw");
+
+    // 填名字并保存
+    const input = document.querySelector<HTMLInputElement>(".view-preset input")!;
+    input.value = "我的视角";
+    input.dispatchEvent(new Event("input"));
+    await flushPromises();
+    const ok = [...document.querySelectorAll<HTMLElement>(".arco-modal-footer button")].find(
+      (b) => (b.textContent ?? "").trim() === "保存",
+    );
+    expect(ok, "面板应有保存按钮").toBeTruthy();
+    ok!.click();
+    await flushPromises();
+
+    // 再开菜单：主菜单里不该有自定义预设，它归在「预设角度」子菜单里
+    await openMenu(w);
+    const mainText = document.querySelector(".view-menu")!.textContent ?? "";
+    expect(mainText, "自定义预设不该出现在主菜单").not.toContain("我的视角");
+    expect(mainText, "主菜单不该有自定义分组标题").not.toContain("自定义预设");
+    const subText = (await openPresetSub()).textContent ?? "";
+    expect(subText, "应出现自定义预设分组").toContain("自定义预设");
+    expect(subText, "应出现刚保存的预设名").toContain("我的视角");
+    w.unmount();
+  });
+
+  it("删除自定义预设后菜单里不再出现", async () => {
+    const w = await setup();
+    // 先存一条
+    await openMenu(w);
+    menuItem("保存为预设角度")!.click();
+    await flushPromises();
+    const input = document.querySelector<HTMLInputElement>(".view-preset input")!;
+    input.value = "待删除";
+    input.dispatchEvent(new Event("input"));
+    await flushPromises();
+    [...document.querySelectorAll<HTMLElement>(".arco-modal-footer button")]
+      .find((b) => (b.textContent ?? "").trim() === "保存")!
+      .click();
+    await flushPromises();
+
+    // 打开菜单、展开「预设角度」子菜单后点删除
+    await openMenu(w);
+    await openPresetSub();
+    const del = document.querySelector<HTMLElement>(".view-menu .view-menu__del");
+    expect(del, "自定义预设应有删除入口").toBeTruthy();
+    del!.click();
+    await flushPromises();
+
+    // 再开菜单、展开子菜单应看不到它
+    await w.find(".preview__stage").trigger("contextmenu", { clientX: 300, clientY: 200 });
+    await flushPromises();
+    const subText = (await openPresetSub()).textContent ?? "";
+    expect(subText, "删除后不应再出现该预设").not.toContain("待删除");
+    w.unmount();
+  });
+
+  it("面板里的投影方式可以改成正射并生效", async () => {
+    const w = await setup();
+    await openMenu(w);
+    menuItem("保存为预设角度")!.click();
+    await flushPromises();
+
+    // 两种投影各有一个单选项，默认选中透视
+    const radios = [
+      ...document.querySelectorAll<HTMLInputElement>(".view-preset input[type=radio]"),
+    ];
+    expect(radios.length, "应给出透视与正射两种选择").toBe(2);
+    expect(radios[0].checked, "默认应是透视").toBe(true);
+
+    radios[1].click();
+    await flushPromises();
+    expect(radios[1].checked, "点过之后应选中正射").toBe(true);
+
+    // 填名保存，存下来的预设要带正射标记
+    const input = document.querySelector<HTMLInputElement>(".view-preset input[type=text]") ??
+      document.querySelector<HTMLInputElement>(".view-preset input")!;
+    input.value = "正射视角";
+    input.dispatchEvent(new Event("input"));
+    await flushPromises();
+    [...document.querySelectorAll<HTMLElement>(".arco-modal-footer button")]
+      .find((b) => (b.textContent ?? "").trim() === "保存")!
+      .click();
+    await flushPromises();
+
+    // 子菜单里点它，应当把预览切成正射投影
+    await openMenu(w);
+    await openPresetSub();
+    subItem("正射视角")!.click();
+    await flushPromises();
+    // 再开菜单看「正射投影」这一项是否被勾上
+    await openMenu(w);
+    const orthoItem = [...document.querySelectorAll<HTMLElement>(".view-menu .ctx-menu__item")].find(
+      (el) => (el.textContent ?? "").includes("正射投影"),
+    )!;
+    expect(orthoItem.textContent, "应用该预设后应处于正射").toContain("✓");
+    w.unmount();
+  });
+
+  it("面板里的相机位置可以手改，保存的是改后的值", async () => {
+    const w = await setup();
+    await openMenu(w);
+    menuItem("保存为预设角度")!.click();
+    await flushPromises();
+
+    // 只取数字输入框：位置三个、角度两个
+    const numbers = [
+      ...document.querySelectorAll<HTMLInputElement>(".view-preset .arco-input-number input"),
+    ];
+    expect(numbers.length, "位置三项 + 角度两项").toBe(5);
+
+    // 改成「从正上方 100 格处往下看」。
+    // Arco 的数字输入框在失焦（或回车）时才提交，因此这里模拟真实操作：输完离开。
+    const set = async (el: HTMLInputElement, v: string) => {
+      el.value = v;
+      el.dispatchEvent(new Event("input"));
+      el.dispatchEvent(new FocusEvent("blur"));
+      await flushPromises();
+    };
+    await set(numbers[0], "0");
+    await set(numbers[1], "100");
+    await set(numbers[2], "0");
+
+    // 位置改了，角度必须跟着变成「正上方」：pitch 90
+    const pitch = numbers[4];
+    expect(Number(pitch.value), "正上方看下去 pitch 应为 90").toBeCloseTo(90, 0);
+
+    const input = document.querySelector<HTMLInputElement>(".view-preset input[type=text]")!;
+    input.value = "俯视";
+    input.dispatchEvent(new Event("input"));
+    await flushPromises();
+    [...document.querySelectorAll<HTMLElement>(".arco-modal-footer button")]
+      .find((b) => (b.textContent ?? "").trim() === "保存")!
+      .click();
+    await flushPromises();
+
+    // 子菜单里出现该预设，点它之后相机应摆到正上方
+    await openMenu(w);
+    await openPresetSub();
+    const item = subItem("俯视");
+    expect(item, "改过位置的预设应保存成功").toBeTruthy();
+    w.unmount();
+  });
+
+  it("取消按钮显示中文文案，不露出翻译键", async () => {
+    const w = await setup();
+    await openMenu(w);
+    menuItem("保存为预设角度")!.click();
+    await flushPromises();
+
+    const footer = document.querySelector(".arco-modal-footer");
+    expect(footer, "面板应有按钮栏").toBeTruthy();
+    const cancel = [...footer!.querySelectorAll<HTMLElement>("button")].find((b) =>
+      (b.textContent ?? "").includes("取消"),
+    );
+    expect(cancel, "取消按钮应有中文文案").toBeTruthy();
+    expect(footer!.textContent, "不应露出未翻译的键").not.toContain("common.cancel");
+    w.unmount();
+  });
+
+  it("菜单项可以用键盘操作（回车切换投影）", async () => {
+    // 菜单项都带 tabindex="0"，能 Tab 到却按不动的话比不能聚焦更让人困惑
+    const w = await setup();
+    await openMenu(w);
+    const orthoItem = [...document.querySelectorAll<HTMLElement>(".view-menu .ctx-menu__item")]
+      .find((el) => (el.textContent ?? "").includes("正射投影"))!;
+    expect(orthoItem, "菜单里应有正射投影项").toBeTruthy();
+    expect(orthoItem.getAttribute("tabindex"), "菜单项应可聚焦").toBe("0");
+
+    // 回车应当与点击等效：切成正射
+    orthoItem.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await flushPromises();
+
+    // 再开菜单看勾选状态
+    await openMenu(w);
+    const after = [...document.querySelectorAll<HTMLElement>(".view-menu .ctx-menu__item")]
+      .find((el) => (el.textContent ?? "").includes("正射投影"))!;
+    expect(after.getAttribute("aria-checked"), "回车后应切到正射").toBe("true");
+    w.unmount();
+  });
+
+  it("把位置与注视点改成重合时不允许保存", async () => {
+    // 这种位姿算不出朝向。旧实现会照存不误，重启后又被校验丢掉，
+    // 用户看到的是「自己存的预设没了」
+    const w = await setup();
+    await openMenu(w);
+    menuItem("保存为预设角度")!.click();
+    await flushPromises();
+
+    const numbers = [
+      ...document.querySelectorAll<HTMLInputElement>(".view-preset .arco-input-number input"),
+    ];
+    // 面板打开时位置取自实时相机，注视点是模型的中心；
+    // 把位置的三个分量都填成同一组数才会重合，这里直接把三格清空更简单
+    for (const el of numbers.slice(0, 3)) {
+      el.value = "";
+      el.dispatchEvent(new Event("input"));
+      el.dispatchEvent(new FocusEvent("blur"));
+    }
+    await flushPromises();
+
+    const input = document.querySelector<HTMLInputElement>(".view-preset input[type=text]")!;
+    input.value = "坏视角";
+    input.dispatchEvent(new Event("input"));
+    await flushPromises();
+
+    const ok = [...document.querySelectorAll<HTMLElement>(".arco-modal-footer button")].find(
+      (b) => (b.textContent ?? "").trim() === "保存",
+    )!;
+    expect(ok, "坐标留空时保存按钮应禁用").toBeTruthy();
+    expect(
+      (ok as HTMLButtonElement).disabled,
+      "坐标不完整时不能保存",
+    ).toBe(true);
+    w.unmount();
   });
 });

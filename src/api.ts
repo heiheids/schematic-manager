@@ -77,6 +77,20 @@ export function saveMetadata(
 }
 
 /**
+ * 把当前投影另存为新文件，并把未保存的元数据改动一并写进去。
+ *
+ * 原文件不动，也不产生备份：产物是一个全新文件。
+ * 目标已存在时后端直接报错，不会覆盖。
+ */
+export function saveSchematicAs(
+  sourcePath: string,
+  targetPath: string,
+  fields: { name?: string; author?: string; description?: string },
+): Promise<string> {
+  return logged<string>("save_schematic_as", { sourcePath, targetPath, ...fields });
+}
+
+/**
  * 组装前端渲染所需的场景。
  * 基础库由后端按「版本库」准备的内容解析，前端只提供投影文件路径。
  */

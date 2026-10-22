@@ -35,6 +35,8 @@ export interface BlockReplaceDeps {
   resetDraft: (rec: SchematicSummary) => void;
   /** 3D 预览域的场景加载；替换后重建场景 */
   loadScene: (record: SchematicSummary) => void;
+  /** 把替换规则记入待保存的草稿；保存时才写回文件 */
+  stageReplace: (rule: ReplaceRule) => void;
 }
 
 export function createBlockReplaceSlice(s: BlockReplaceDeps) {
@@ -399,6 +401,12 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
     }
   }
 
+  /** 把当前规则记入草稿，等用户点「保存」时才真正写进文件。
+   *
+   * 不在这里直接写盘：方块替换会大量改写调色板，一旦执行就不可撤销。
+   * 让它与其它改动一起进入未保存状态后，用户可以先看一眼再决定存不存，
+   * 关窗口或切文件时也会有明确的提醒。
+   */
   async function doReplace() {
     const cur = s.selected.value;
     if (!cur) return;
@@ -407,29 +415,9 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
       Message.warning(t("replace.emptyFromTo"));
       return;
     }
-    replaceBusy.value = true;
-    try {
-      const r = await applyReplace(cur.path, rule);
-      if (r.replaced === 0) {
-        Message.info(t("replace.nothingToReplace"));
-      } else {
-        Message.success(t("replace.replaced", { count: r.replaced }));
-        replaceOpen.value = false;
-        await s.rescanAll();
-        const hit = s.files.value.find((f) => f.path === cur.path);
-        if (hit) {
-          s.selected.value = hit;
-          s.resetDraft(hit);
-          const idx = s.files.value.findIndex((f) => f.path === hit.path);
-          if (idx >= 0) s.files.value[idx] = hit;
-          void s.loadScene(hit);
-        }
-      }
-    } catch (e) {
-      Message.error(t("replace.replaceFailed", { error: String(e) }));
-    } finally {
-      replaceBusy.value = false;
-    }
+    s.stageReplace(rule);
+    Message.success(t("replace.staged"));
+    replaceOpen.value = false;
   }
 
   return {

@@ -10,15 +10,18 @@
 import SceneViewer from "./SceneViewer.vue";
 import BlockStatTable from "./BlockStatTable.vue";
 import EntityTable from "./EntityTable.vue";
-import { EXPORT_SIZES } from "../render/scene3d";
+import ExportDialog from "./ExportDialog.vue";
+import ViewPresetDialog from "./ViewPresetDialog.vue";
+import { PRESET_MENU } from "../render/scene3d";
 import {
   PREVIEW_MAX_H,
   PREVIEW_MAX_W,
   PREVIEW_MIN_H,
   PREVIEW_MIN_W,
 } from "../composables/usePreviewResize";
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
+import { Message } from "@arco-design/web-vue";
 import { displayName } from "../i18n";
 import { useAppStore } from "../store";
 import { formatDims, formatSize } from "../utils/format";
@@ -46,28 +49,119 @@ const {
   sceneGate,
   sceneBlockLimit,
   brightness,
-  activeView,
-  exportSize,
+  exportOpen,
+  exportBatchMode,
   exporting,
   exportingProgress,
   setView,
   startRender,
   exportPreview,
-  exportBatch,
   selected,
   draft,
   dirty,
+  dirtyMeta,
   saving,
   resetDraft,
   saveDraft,
+  saveAs,
   checkedCount,
   hasChecked,
   openConvert,
+  viewMenu,
+  savedViews,
+  viewPresetOpen,
+  applySavedViewByName,
+  removeSavedView,
+  orthoView,
+  setOrthoView,
+  openViewMenu,
+  closeViewMenu,
 } = useAppStore();
 
 /** 预览行的 DOM，用于实测它拿到的高度 */
 const previewRowEl = ref<HTMLElement | null>(null);
 let rowObserver: ResizeObserver | null = null;
+
+/** 视角右键菜单的尺寸，与 global.scss 里 `.view-menu` / `&__submenu` 的
+ *  min-width 与 max-height 保持一致；改样式时必须同步这里，否则翻转定位会算偏。 */
+const VIEW_MENU_W = 168;
+const VIEW_MENU_H = 340;
+const VIEW_SUB_W = 150;
+const VIEW_SUB_H = 340;
+
+/** 在预览舞台上右键：打开视角菜单。
+ *
+ * 菜单靠下/靠右时向内翻，避免被窗口边缘裁掉。翻转后还要夹一下上/左边界：
+ * 在窗口左上角附近右键时，`clientY - MENU_H` 会算出负值，菜单顶部跑到窗口外。
+ */
+function onStageContextMenu(e: MouseEvent) {
+  e.preventDefault();
+  const rawX = e.clientX + VIEW_MENU_W > window.innerWidth ? e.clientX - VIEW_MENU_W : e.clientX;
+  const rawY = e.clientY + VIEW_MENU_H > window.innerHeight ? e.clientY - VIEW_MENU_H : e.clientY;
+  openViewMenu(Math.max(rawX, 4), Math.max(rawY, 4));
+}
+
+/** 点在菜单外面或按 Esc 时关闭 */
+function onDocPointerDown(e: Event) {
+  if (!viewMenu.value.open) return;
+  const target = e.target as HTMLElement | null;
+  if (target?.closest(".view-menu")) return;
+  closeViewMenu();
+}
+
+function onDocKeydown(e: KeyboardEvent) {
+  if (e.key === "Escape") closeViewMenu();
+}
+
+/** 预设角度子菜单是否展开 */
+const presetSubOpen = ref(false);
+
+/** 子菜单位置：贴着主菜单右侧，右边放不下就翻到左侧 */
+const submenuStyle = computed(() => {
+  const right = viewMenu.value.x + VIEW_MENU_W + VIEW_SUB_W;
+  const left =
+    right > window.innerWidth
+      ? Math.max(viewMenu.value.x - VIEW_SUB_W, 4)
+      : viewMenu.value.x + VIEW_MENU_W - 4;
+  // 上边界同时受「主菜单自身位置」与「窗口高度」约束：主菜单上翻过的话，
+  // 子菜单跟着它的顶端走，否则会脱节飘到别处
+  const limit = Math.max(window.innerHeight - VIEW_SUB_H - 4, 4);
+  const top = Math.min(Math.max(viewMenu.value.y, 4), limit);
+  return { left: left + "px", top: top + "px" };
+});
+
+// 菜单关掉时把子菜单也收起来，否则下次右键会带着上次的展开状态出现
+watch(
+  () => viewMenu.value.open,
+  (open) => {
+    if (!open) presetSubOpen.value = false;
+  },
+);
+
+/** 从菜单里选一个预设角度：先关菜单再切视角，
+ *  否则菜单会停在原地挡住刚换好的画面。 */
+function pickViewFromMenu(key: string) {
+  closeViewMenu();
+  setView(key);
+}
+
+/** 应用一条自定义预设 */
+function pickCustomPreset(name: string) {
+  closeViewMenu();
+  applySavedViewByName(name);
+}
+
+/** 删除一条自定义预设 */
+function deletePreset(name: string) {
+  removeSavedView(name);
+  Message.success(t("view.deletePresetDone", { name }));
+}
+
+/** 打开「保存为预设」面板：先关菜单，否则两个浮层叠在一起 */
+function openSavePreset() {
+  closeViewMenu();
+  viewPresetOpen.value = true;
+}
 
 onMounted(() => {
   // 舞台尺寸必须按实测高度算：控制条是 flex-wrap 的，预览区窄到放不下
@@ -79,11 +173,18 @@ onMounted(() => {
   });
   rowObserver.observe(el);
   measurePreviewRowHeight(el.getBoundingClientRect().height);
+
+  // 关闭视角菜单的两个入口：点别处、按 Esc。绑在 document 上而不是菜单上，
+  // 否则点在画布上时事件根本到不了这里，菜单会一直挂着。
+  document.addEventListener("pointerdown", onDocPointerDown, true);
+  document.addEventListener("keydown", onDocKeydown);
 });
 
 onBeforeUnmount(() => {
   rowObserver?.disconnect();
   rowObserver = null;
+  document.removeEventListener("pointerdown", onDocPointerDown, true);
+  document.removeEventListener("keydown", onDocKeydown);
 });
 
 </script>
@@ -103,6 +204,7 @@ onBeforeUnmount(() => {
         <div
           class="preview__stage"
           :style="{ width: previewWidth + 'px', height: previewStageHeight + 'px' }"
+          @contextmenu="onStageContextMenu"
         >
           <!-- 方块数超过阈值：默认不生成几何，等用户点「开始渲染」。
                三万块以上的场景建几何并上传显存会明显卡顿，何时做由用户定。 -->
@@ -127,6 +229,7 @@ onBeforeUnmount(() => {
               ref="viewer"
               :scene="scene"
               :brightness="brightness"
+              @pick-view="setView"
             />
           </a-spin>
         </div>
@@ -170,7 +273,7 @@ onBeforeUnmount(() => {
               class="preview__row-control"
               v-model="draft.fileName"
               :disabled="!!selected.error"
-              @input="dirty = true"
+              @input="dirtyMeta = true"
             />
           </div>
           <div class="hint-dim" style="margin: -6px 0 10px 66px">
@@ -184,7 +287,7 @@ onBeforeUnmount(() => {
                 class="preview__row-control"
                 v-model="draft.name"
                 :disabled="!!selected.error"
-                @input="dirty = true"
+                @input="dirtyMeta = true"
               />
             </div>
             <div class="preview__row">
@@ -193,7 +296,7 @@ onBeforeUnmount(() => {
                 class="preview__row-control"
                 v-model="draft.author"
                 :disabled="!!selected.error"
-                @input="dirty = true"
+                @input="dirtyMeta = true"
               />
             </div>
             <a-form-item :label="t('detail.description')">
@@ -202,7 +305,7 @@ onBeforeUnmount(() => {
                 :auto-size="{ minRows: 6, maxRows: 14 }"
                 :placeholder="t('detail.descriptionPlaceholder')"
                 :disabled="!!selected.error"
-                @input="dirty = true"
+                @input="dirtyMeta = true"
               />
             </a-form-item>
             </a-form>
@@ -225,6 +328,10 @@ onBeforeUnmount(() => {
             >
               {{ t("detail.save") }}
             </a-button>
+            <!-- 另存为：把当前内容连同未保存的元数据写到新文件，原文件不动 -->
+            <a-button size="small" :disabled="!!selected.error" @click="saveAs">
+              {{ t("files.saveAs") }}
+            </a-button>
             <a-button size="small" :disabled="!dirty" @click="resetDraft(selected)">
               {{ t("detail.undo") }}
             </a-button>
@@ -239,38 +346,29 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <div class="preview__bar">
-        <a-radio-group
-          v-model="activeView"
-          type="button"
-          size="small"
-          :disabled="!scene"
-          @change="setView(String(activeView))"
-        >
-          <a-radio value="front">{{ t("detail.viewFront") }}</a-radio>
-          <a-radio value="left45">{{ t("detail.viewLeft45") }}</a-radio>
-          <a-radio value="right45">{{ t("detail.viewRight45") }}</a-radio>
-          <a-radio value="back">{{ t("detail.viewBack") }}</a-radio>
-        </a-radio-group>
+        <!-- 视角切换改为画布里的 XYZ 方向标：它本身就是「当前朝向的读数」，
+             比一排文字按钮更直观，也不占控制条。等距与轴向视角的完整清单
+             在预览区的右键菜单里。 -->
         <span class="preview__label">{{ t("detail.brightness") }}</span>
+        <!-- 关掉拖动手柄上的数值气泡：右侧已有常驻百分比，气泡是同一信息的第二份，
+             拖动时还会挡住滑杆本身 -->
         <a-slider
           v-model="brightness"
           :min="0.5"
           :max="2"
           :step="0.05"
+          :show-tooltip="false"
           :style="{ width: '140px' }"
         />
         <span class="preview__value">{{ Math.round(brightness * 100) }}%</span>
-        <!-- 导出尺寸：四档可选，单个与批量共用。
-             选项来自 EXPORT_SIZES，避免与 scene3d.ts 的定义各写一份而漂移 -->
-        <a-select v-model="exportSize" size="small" style="width: 104px">
-          <a-option v-for="s in EXPORT_SIZES" :key="s" :value="s">{{ s }}</a-option>
-        </a-select>
+        <!-- 尺寸改在导出面板里选：系统保存框放不下自定义控件，
+             而尺寸与「存到哪」本来就是两件事 -->
         <a-button
           size="small"
           type="primary"
           :loading="exporting && !exportingProgress"
           :disabled="!scene || exporting"
-          @click="exportPreview"
+          @click="exportBatchMode = false; exportOpen = true"
         >
           {{ t("detail.exportPng") }}
         </a-button>
@@ -284,7 +382,7 @@ onBeforeUnmount(() => {
               ? t('detail.batchExportHint', { count: checkedCount })
               : t('detail.batchExportEmpty')
           "
-          @click="exportBatch"
+          @click="exportBatchMode = true; exportOpen = true"
         >
           {{ t("detail.exportBatch") }}
           <template v-if="exportingProgress">
@@ -389,5 +487,115 @@ onBeforeUnmount(() => {
         <EntityTable />
       </a-tab-pane>
     </a-tabs>
+
+    <!-- 导出尺寸面板：点「导出预览图」先在这里定尺寸，确认后才走系统保存框 -->
+    <ExportDialog />
+
+    <!-- 预览区右键菜单：保存为预设、投影方式、预设角度子菜单。
+         定位用 fixed，跟着鼠标走；点击别处或按 Esc 关闭（见 onDocPointerDown）。 -->
+    <div
+      v-if="viewMenu.open"
+      class="view-menu ctx-menu"
+      :style="{ left: viewMenu.x + 'px', top: viewMenu.y + 'px' }"
+      role="menu"
+      @contextmenu.prevent
+    >
+      <div
+        class="ctx-menu__item"
+        role="menuitem"
+        tabindex="0"
+        @click="openSavePreset"
+        @keydown.enter.prevent="openSavePreset"
+        @keydown.space.prevent="openSavePreset"
+      >
+        {{ t("view.menuSavePreset") }}
+      </div>
+
+      <div
+        class="ctx-menu__item"
+        role="menuitemcheckbox"
+        tabindex="0"
+        :aria-checked="orthoView"
+        @click="setOrthoView(!orthoView)"
+        @keydown.enter.prevent="setOrthoView(!orthoView)"
+        @keydown.space.prevent="setOrthoView(!orthoView)"
+      >
+        <span class="view-menu__check">{{ orthoView ? "✓" : "" }}</span>
+        {{ t("view.menuOrtho") }}
+      </div>
+
+      <!-- 预设角度：悬停或点击展开子菜单。十个项目太多，平铺会把主菜单
+           撑得很长，且 issue 指定的就是子菜单形态。
+           自定义预设也归进这个子菜单：它们同样是「按角度切视角」，
+           和内置的十个放在一起才找得到，分到主菜单上是两类东西混排。 -->
+      <div
+        class="ctx-menu__item view-menu__sub"
+        role="menuitem"
+        tabindex="0"
+        aria-haspopup="true"
+        :aria-expanded="presetSubOpen"
+        @mouseenter="presetSubOpen = true"
+        @click.stop="presetSubOpen = !presetSubOpen"
+        @keydown.enter.prevent="presetSubOpen = true"
+        @keydown.space.prevent="presetSubOpen = true"
+        @keydown.right.prevent="presetSubOpen = true"
+      >
+        <span class="view-menu__sub-label">{{ t("view.menuPresets") }}</span>
+        <span class="view-menu__arrow">▸</span>
+      </div>
+      <div
+        v-if="presetSubOpen"
+        class="view-menu__submenu ctx-menu"
+        :style="submenuStyle"
+        role="menu"
+        @mouseenter="presetSubOpen = true"
+      >
+        <div
+          v-for="item in PRESET_MENU"
+          :key="item.key"
+          class="ctx-menu__item"
+          role="menuitem"
+          tabindex="0"
+          @click="pickViewFromMenu(item.key)"
+          @keydown.enter.prevent="pickViewFromMenu(item.key)"
+          @keydown.space.prevent="pickViewFromMenu(item.key)"
+        >
+          {{ t(item.labelKey) }}
+        </div>
+
+        <!-- 自定义预设：存在时接在十个内置预设后面，每项带删除入口 -->
+        <template v-if="savedViews.length > 0">
+          <div class="ctx-menu__sep" role="none" />
+          <div class="ctx-menu__label" role="none">
+            {{ t("view.menuCustomPresets") }}
+          </div>
+          <div
+            v-for="preset in savedViews"
+            :key="preset.name"
+            class="ctx-menu__item view-menu__custom"
+            role="menuitem"
+            tabindex="0"
+            @click="pickCustomPreset(preset.name)"
+            @keydown.enter.prevent="pickCustomPreset(preset.name)"
+            @keydown.space.prevent="pickCustomPreset(preset.name)"
+          >
+            <span class="view-menu__name">{{ preset.name }}</span>
+            <a
+              class="view-menu__del"
+              role="button"
+              tabindex="0"
+              :title="t('view.menuDeletePreset')"
+              @click.stop="deletePreset(preset.name)"
+              @keydown.enter.prevent.stop="deletePreset(preset.name)"
+              @keydown.space.prevent.stop="deletePreset(preset.name)"
+              >×</a
+            >
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- 保存为预设角度的面板 -->
+    <ViewPresetDialog />
   </div>
 </template>

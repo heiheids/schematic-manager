@@ -1146,6 +1146,73 @@ pub fn build_scene(app: tauri::AppHandle, schematic_path: String) -> Result<Scen
         .map_err(|e| e.to_string())
 }
 
+/// 把当前投影另存为一个新文件，并把未保存的元数据改动一并写进去。
+///
+/// 与 save_metadata 的区别：那个写回原文件并先备份原件；这个的产物是一个
+/// 全新文件，原文件一个字节都不动，因此既不需要备份、也不该产生备份——
+/// 「另存为」本就是在保留原稿的前提下再存一份。
+///
+/// 目标路径已存在时直接报错而不是覆盖：用户是拿它来选新名字的，
+/// 覆盖掉一个已有投影属于不可接受的意外。
+#[tauri::command]
+pub fn save_schematic_as(
+    source_path: String,
+    target_path: String,
+    name: Option<String>,
+    author: Option<String>,
+    description: Option<String>,
+) -> Result<String, String> {
+    const MAX_META_CHARS: usize = 20000;
+    for (label, v) in [
+        ("名称", &name),
+        ("作者", &author),
+        ("描述", &description),
+    ] {
+        if let Some(s) = v {
+            let n = s.chars().count();
+            if n > MAX_META_CHARS {
+                return Err(format!("{label}过长：{n} 个字符，上限 {MAX_META_CHARS} 个字符"));
+            }
+        }
+    }
+
+    let src = PathBuf::from(&source_path);
+    if !src.is_file() {
+        return Err(format!("文件不存在：{source_path}"));
+    }
+    let dst = PathBuf::from(&target_path);
+    if dst.exists() {
+        return Err(format!("目标文件已存在：{target_path}"));
+    }
+    // 目标目录必须已在：保存对话框允许用户新建目录，但若那一步失败，
+    // 这里要给出明确原因，而不是一句笼统的写入失败
+    if let Some(dir) = dst.parent() {
+        if !dir.is_dir() {
+            return Err(format!("目标目录不存在：{}", dir.display()));
+        }
+    }
+
+    let mut sc = litematic::Schematic::load(&source_path).map_err(|e| e.to_string())?;
+    if let Some(v) = name {
+        sc.set_meta_name(&v);
+    }
+    if let Some(v) = author {
+        sc.set_meta_author(&v);
+    }
+    if let Some(v) = description {
+        sc.set_meta_description(&v);
+    }
+    sc.save_to(&target_path).map_err(|e| format!("写入失败：{e}"))?;
+
+    let file_name = dst
+        .file_name()
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    crate::run_log::info(&format!("另存为 {file_name}：{source_path} -> {target_path}"));
+
+    Ok(target_path)
+}
+
 /// 保存元数据（投影名称 / 作者 / 描述）。
 ///
 /// 写入前先在 backups/ 下留一份原件：这几项都是用户手动输入的内容，

@@ -38,6 +38,8 @@ export interface VersionConvertDeps {
   syncSelection: (items: SchematicSummary[]) => void;
   /** 文件列表域的勾选清理；清单变化后去掉已不存在的勾选 */
   pruneChecks: (items: SchematicSummary[]) => void;
+  /** 确认丢弃未保存的改动；用户在确认框里选取消时返回 false */
+  confirmDiscard: (messageKey: string) => Promise<boolean>;
 }
 
 export function createVersionConvertSlice(s: VersionConvertDeps) {
@@ -274,6 +276,9 @@ export function createVersionConvertSlice(s: VersionConvertDeps) {
   }
 
   async function openConvert() {
+    // 转换的产物是一个新文件，不带未保存的改动；先问一句免得用户以为会带上。
+    // 放在打开窗口之前：用户若选择返回，不该看到一个已经打开的转换窗口。
+    if (!(await s.confirmDiscard("files.unsavedReplace"))) return;
     convOpen.value = true;
     convItems.value = [];
     convAnalyzed.value = false;

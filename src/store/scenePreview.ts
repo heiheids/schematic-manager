@@ -11,6 +11,7 @@
  * 而不是整棵 store，避免类型上的循环引用（见 store/fileList.ts）。
  */
 import { computed, ref, watch } from "vue";
+import * as THREE from "three";
 import type { ComputedRef, Ref } from "vue";
 import { Message } from "@arco-design/web-vue";
 import type { TableColumnData } from "@arco-design/web-vue";
@@ -19,7 +20,16 @@ import { writeFile } from "@tauri-apps/plugin-fs";
 import { displayName, t } from "../i18n";
 import { buildScene, renderBlockIcons } from "../api";
 import type SceneViewer from "../components/SceneViewer.vue";
-import { OffscreenRenderer } from "../render/scene3d";
+import {
+  OffscreenRenderer,
+  anglesFromPosition,
+  exportPixelSize,
+  isBuiltinView,
+  isPresetNameUsable,
+  presetIsOrtho,
+  sanitizeViewPreset,
+} from "../render/scene3d";
+import type { ExportAspect, SavedViewPreset } from "../render/scene3d";
 import { NamePool, joinPath, previewStem } from "../render/export_name";
 import type { AnalysisResult, BlockRow, SceneData, SchematicSummary } from "../types";
 import { itemsForState } from "../utils/material_items";
@@ -53,8 +63,33 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
   const sceneError = ref("");
   const brightness = ref(1.45);
   const activeView = ref("left45");
-  const exportSize = ref(1024);
+  /** 预览区右键菜单的位置；open 为 false 时不显示。
+   *
+   * 与投影列表的行右键菜单分开存放：那个作用于文件行，这个作用于 3D 画布，
+   * 两者同时在屏上没有任何意义，混用一份状态会让它们互相顶掉。
+   */
+  const viewMenu = ref<{ open: boolean; x: number; y: number }>({
+    open: false,
+    x: 0,
+    y: 0,
+  });
+  /** 当前是否正射投影。与 activeView 分开记录：用户可以手动切投影而
+   *  不换角度，此时 activeView 仍然是原来那个键。 */
+  const orthoView = ref(false);
+  /** 用户保存的自定义视角预设 */
+  const savedViews = ref<SavedViewPreset[]>([]);
+  /** 「保存为预设」面板是否打开 */
+  const viewPresetOpen = ref(false);
+  const exportSize = ref<number>(1024);
+  /** 导出尺寸的宽高比；与 exportSize（短边像素）一起决定实际宽高 */
+  const exportAspect = ref<ExportAspect>("1x1");
+  /** 当前导出尺寸换算出的像素宽高 */
+  const exportPixels = computed(() => exportPixelSize(exportAspect.value, exportSize.value));
   const exporting = ref(false);
+  /** 导出设置面板是否打开 */
+  const exportOpen = ref(false);
+  /** 本次打开导出面板是为了导出当前文件，还是批量导出勾选项 */
+  const exportBatchMode = ref(false);
   /** 批量导出的进度（null 表示未在批量导出） */
   const exportingProgress = ref<{ done: number; total: number } | null>(null);
 
@@ -104,25 +139,116 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
   );
 
   const sceneInfo = computed(() => {
-    if (!scene.value) return "";
     const cur = scene.value;
-    const parts = [t("export.triangles", { count: cur.totalTriangles.toLocaleString() })];
-    if (cur.unresolvedBlocks > 0) {
-      parts.push(t("export.unresolved", { count: cur.unresolvedBlocks }));
-    }
-    return parts.join(t("export.infoSeparator"));
+    // 三角形数改到 3D 视图右下角常驻显示，这条只留「有哪些方块没贴图」
+    // 这类需要提醒的异常，正常时整条不显示
+    if (!cur || cur.unresolvedBlocks <= 0) return "";
+    return t("export.unresolved", { count: cur.unresolvedBlocks });
   });
 
+  /** 切到某个视角预设。
+   *
+   * 投影方式由预设自己决定（真等距是正射，其余是透视），因此统一走
+   * applyViewPreset 而不是 applyPreset——否则切到「真等距」时只会换角度、
+   * 投影仍是上一次的。
+   */
   function setView(name: string) {
     activeView.value = name;
-    viewer.value?.applyPreset(name);
+    // 记下这次切换带上了投影方式：右键菜单里「正射投影」的勾选状态、
+    // 以及下次保存自定义预设都要读它
+    orthoView.value = presetIsOrtho(name);
+    viewer.value?.applyViewPreset(name);
   }
 
-  /** 导出当前视角为透明背景 PNG（单个文件） */
-  async function exportPreview() {
+  /** 手动切换正射/透视，不改角度。
+   *
+   * 与 setView 的区别：它只换投影方式，当前朝向保持不变。
+   * 用户想「用同一个角度看看正射什么效果」时用这个。
+   */
+  function setOrthoView(ortho: boolean) {
+    orthoView.value = ortho;
+    viewer.value?.setOrtho(ortho);
+  }
+
+  /** 在预览区某处打开右键菜单 */
+  function openViewMenu(x: number, y: number) {
+    viewMenu.value = { open: true, x, y };
+  }
+
+  function closeViewMenu() {
+    if (viewMenu.value.open) viewMenu.value = { ...viewMenu.value, open: false };
+  }
+
+  /** 把当前视角存成一条自定义预设。
+   *
+   * 位姿可传可不传：不传就取当前相机的快照（「照我现在看到的存」），
+   * 传了就按传入的值存（面板里改过角度之后存的就是改后的值）。
+   *
+   * 候选预设必须过一遍 `sanitizeViewPreset`——那是从磁盘读回来时用的同一套
+   * 校验。写读两侧用同一条规则，才不会出现「存得进、重启后被静默丢弃」：
+   * 位置与目标重合、坐标里有 NaN 这类值当次看着正常，重开就没了。
+   *
+   * 返回失败原因（用于提示），成功返回空字符串。名字不可用、或场景还没就绪
+   * 时不能存——存一条点下去没反应的预设比不存更糟。
+   */
+  function saveCurrentView(
+    name: string,
+    edited?: {
+      ortho: boolean;
+      position: [number, number, number];
+      target: [number, number, number];
+    },
+  ): string {
+    if (!scene.value) return t("view.saveNotReady");
+    const snapshot = viewer.value?.cameraPose() ?? null;
+    const pose = edited ?? snapshot;
+    if (!pose) return t("view.saveNotReady");
+    const ortho = edited ? edited.ortho : orthoView.value;
+    if (!isPresetNameUsable(name, savedViews.value)) {
+      return savedViews.value.some((p) => p.name === name.trim())
+        ? t("view.saveDuplicate")
+        : t("view.saveInvalidName");
+    }
+    const { yaw, pitch } = anglesFromPosition(
+      new THREE.Vector3(...pose.position),
+      new THREE.Vector3(...pose.target),
+    );
+    const candidate = sanitizeViewPreset({
+      name: name.trim(),
+      ortho,
+      position: pose.position,
+      target: pose.target,
+      yaw,
+      pitch,
+    });
+    if (!candidate) return t("view.saveInvalidPose");
+    savedViews.value = [...savedViews.value, candidate];
+    return "";
+  }
+
+  /** 删除一条自定义预设 */
+  function removeSavedView(name: string) {
+    savedViews.value = savedViews.value.filter((p) => p.name !== name);
+  }
+
+  /** 应用一条自定义预设 */
+  function applySavedViewByName(name: string) {
+    const preset = savedViews.value.find((p) => p.name === name);
+    if (!preset) return;
+    orthoView.value = preset.ortho;
+    activeView.value = `custom:${name}`;
+    viewer.value?.applySavedView(preset);
+  }
+
+  /** 导出当前视角为透明背景 PNG（单个文件）。
+   *
+   * 尺寸由导出面板确认后传入：面板里既能选预设，也能手填宽高。
+   * 不传时退回当前记住的尺寸，供「不改设置直接再导一次」这类调用使用。
+   */
+  async function exportPreview(size?: { w: number; h: number }) {
     const cur = s.selected.value;
     if (!cur || !scene.value) return;
-    const size = exportSize.value;
+    const px = size ?? exportPixels.value;
     const stem = cur.fileName.replace(/\.litematic$/i, "");
     // 同 pickDirectory：保存对话框失败时必须给出提示，
     // 放在 try 外会让这个 Promise 静默 reject，用户点了导出却没反应
@@ -130,7 +256,7 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
     try {
       target = await save({
         title: t("export.previewTitle"),
-        defaultPath: `${stem}_preview_${size}.png`,
+        defaultPath: `${stem}_preview_${px.w}x${px.h}.png`,
         filters: [{ name: t("export.pngFilter"), extensions: ["png"] }],
       });
     } catch (e) {
@@ -141,10 +267,10 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
 
     exporting.value = true;
     try {
-      const bytes = await viewer.value?.exportPng(size);
+      const bytes = await viewer.value?.exportPng(px.w, px.h);
       if (!bytes) throw new Error(t("export.notReady"));
       await writeFile(target, bytes);
-      Message.success(t("export.previewExported", { size }));
+      Message.success(t("export.previewExported", { w: px.w, h: px.h }));
     } catch (e) {
       Message.error(t("export.failed", { error: String(e) }));
     } finally {
@@ -169,6 +295,24 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
   }
 
   /**
+   * 批量导出该用哪个视角。
+   *
+   * `activeView` 有两种取值：内置预设的键，或 `custom:<名字>`。
+   * 后者要去 `savedViews` 里查出实际位姿——把 `custom:xxx` 当内置键传下去
+   * 会被查表兜底成正面透视，用户拿到一整批角度不对的图却没有任何提示。
+   *
+   * 查不到（预设被删、状态脏了）时返回 null，由调用方明确报错。
+   */
+  function currentExportView(): string | SavedViewPreset | null {
+    const name = activeView.value;
+    if (!name.startsWith("custom:")) {
+      return isBuiltinView(name) ? name : null;
+    }
+    const preset = savedViews.value.find((p) => `custom:${p.name}` === name);
+    return preset ?? null;
+  }
+
+  /**
    * 批量导出预览图。
    *
    * 用独立的离屏渲染器逐个渲染，而不是把界面切到每个文件再导出：
@@ -177,7 +321,7 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
    * 单个文件失败不中断整批——某个投影读不出来（被占用、格式异常）时
    * 其余文件仍应导出成功，最后把失败清单如实报出来。
    */
-  async function exportBatch() {
+  async function exportBatch(size?: { w: number; h: number }) {
     const list = s.checkedFiles.value.filter((f) => !f.error);
     if (list.length === 0) {
       Message.warning(t("export.noChecked"));
@@ -186,8 +330,14 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
     const dir = await pickExportDir();
     if (!dir) return;
 
-    const size = exportSize.value;
-    const view = activeView.value;
+    const px = size ?? exportPixels.value;
+    // 当前视角可能是一条自定义预设：那时 activeView 是 `custom:名字`，
+    // 不能当内置视角名传下去，否则会静默退回正面透视
+    const view = currentExportView();
+    if (view === null) {
+      Message.warning(t("export.viewUnavailable"));
+      return;
+    }
     exporting.value = true;
     exportingProgress.value = { done: 0, total: list.length };
     let renderer: OffscreenRenderer | null = null;
@@ -202,8 +352,8 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
       for (const f of list) {
         try {
           const data = await buildScene(f.path);
-          const bytes = await renderer.renderPng(data, size, view);
-          const name = names.take(previewStem(f.fileName, size), ".png");
+          const bytes = await renderer.renderPng(data, px.w, px.h, view);
+          const name = names.take(previewStem(f.fileName, px.w, px.h), ".png");
           await writeFile(joinPath(dir, name), bytes);
           ok += 1;
         } catch (e) {
@@ -222,7 +372,7 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
     }
 
     if (failures.length === 0) {
-      Message.success(t("export.batchDone", { count: ok, size, dir }));
+      Message.success(t("export.batchDone", { count: ok, w: px.w, h: px.h, dir }));
     } else {
       Message.warning({
         content: t("export.batchPartial", {
@@ -544,7 +694,21 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
     sceneError,
     brightness,
     activeView,
+    viewMenu,
+    orthoView,
+    savedViews,
+    viewPresetOpen,
+    saveCurrentView,
+    removeSavedView,
+    applySavedViewByName,
+    setOrthoView,
+    openViewMenu,
+    closeViewMenu,
     exportSize,
+    exportAspect,
+    exportPixels,
+    exportOpen,
+    exportBatchMode,
     exporting,
     exportingProgress,
     loadScene,

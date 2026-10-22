@@ -19,6 +19,7 @@ import type { TableData } from "@arco-design/web-vue";
 import { Message } from "@arco-design/web-vue";
 import { displayName, isFallbackName } from "../i18n";
 import { useAppStore } from "../store";
+import { useListKeyboard } from "../composables/useListKeyboard";
 import type { ConvertItem } from "../types";
 
 const { t } = useI18n();
@@ -82,6 +83,43 @@ interface TargetOption {
  * 与 running 配合：整批补库在跑时不允许重复点。
  */
 const preparingName = ref("");
+
+/** 左栏表格的当前页（从 1 起）。
+ *
+ * 由这里管而不是交给 Arco 内部：方向键导航要用翻页键切页，
+ * 就必须能读到当前页、也能主动改它。 */
+const convPage = ref(1);
+const CONV_PAGE_SIZE = 12;
+/** 当前页可见的行。键盘导航的「行数」与「下标」都按这一份算。 */
+const convPageRows = computed(() => {
+  const start = (convPage.value - 1) * CONV_PAGE_SIZE;
+  return convItems.value.slice(start, start + CONV_PAGE_SIZE);
+});
+/** 键盘导航的挂载点 */
+const convTableHost = ref<HTMLElement | null>(null);
+
+/** 当前选中项在本页里的下标 */
+function convActiveIndex(): number {
+  const cur = convActiveItem.value;
+  if (!cur) return -1;
+  return convPageRows.value.findIndex((r) => r.name === cur.name);
+}
+
+useListKeyboard({
+  host: convTableHost,
+  rowCount: () => convPageRows.value.length,
+  activeIndex: convActiveIndex,
+  onSelect: (i) => {
+    const target = convPageRows.value[i];
+    if (target) selectConvRow(target);
+  },
+  paged: () => true,
+  page: () => convPage.value,
+  pageCount: () => Math.max(1, Math.ceil(convItems.value.length / CONV_PAGE_SIZE)),
+  onPage: (p) => {
+    convPage.value = p;
+  },
+});
 
 const targetOptions = computed<TargetOption[]>(() => {
   const loaded: TargetOption[] = convTargets.value.map((t) => ({
@@ -269,14 +307,20 @@ function replName(rec: ConvertItem): string {
           <!-- 左栏：缺哪些方块。红=还没定下替代品，绿=已经有了（自动推荐或已指定） -->
           <div class="conv-split__pane conv-split__pane--main">
             <a-scrollbar type="embed" class="scroll-fill__inner" outer-class="scroll-fill">
+            <div ref="convTableHost" class="conv-table-host" tabindex="0">
             <a-table
               :columns="convColumns"
               :data="convItems"
-              :pagination="{ pageSize: 12 }"
+              :pagination="{
+                pageSize: CONV_PAGE_SIZE,
+                current: convPage,
+                total: convItems.length,
+              }"
               :row-class="convRowClass"
               row-key="name"
               size="small"
               @row-click="onConvRowClick"
+              @page-change="(p: number) => (convPage = p)"
             >
               <template #from="{ record }">
                 <div class="conv-block">
@@ -325,6 +369,7 @@ function replName(rec: ConvertItem): string {
                 <a-tag v-else size="small" color="red">{{ t("convert.stateTodo") }}</a-tag>
               </template>
             </a-table>
+            </div>
             </a-scrollbar>
           </div>
 

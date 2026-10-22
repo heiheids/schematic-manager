@@ -10,9 +10,10 @@
  * Scrollbar），轨道已在全局样式里去掉，不留原生滚动条。
  */
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { useAppStore } from "../store";
+import { useListKeyboard } from "../composables/useListKeyboard";
 import { formatDims } from "../utils/format";
 
 const { t } = useI18n();
@@ -21,6 +22,7 @@ const {
   sidebarWidth,
   files,
   filteredFiles,
+  selected,
   searchText,
   dupBusy,
   scanDuplicatesInline,
@@ -71,6 +73,34 @@ const SORT_FIELDS = [
 
 /** 下拉当前值：未排序时用空串表示「按路径」 */
 const sortFieldValue = computed(() => sortKey.value ?? "");
+
+/** 表格容器：键盘导航要绑在它上面，而不是 window——
+ *  绑 window 会让整个应用抢方向键，在搜索框里按方向键就动不了光标。 */
+const tableHost = ref<HTMLElement | null>(null);
+
+/** 当前选中行在列表里的下标。
+ *
+ * 这份表不分页，filteredFiles 就是屏幕上的全部行，因此下标可以直接由
+ * 选中项的路径在 filteredFiles 里查出来。按路径而不是按对象引用比：
+ * 列表重排或重新扫描后对象会被换掉，引用比较会失效。
+ */
+function activeRowIndex(): number {
+  const cur = selected.value;
+  if (!cur) return -1;
+  return filteredFiles.value.findIndex((f) => f.path === cur.path);
+}
+
+useListKeyboard({
+  host: tableHost,
+  rowCount: () => filteredFiles.value.length,
+  activeIndex: activeRowIndex,
+  onSelect: (i) => {
+    const target = filteredFiles.value[i];
+    if (target) void onRowClick(target as never);
+  },
+  // 这份表不分页，翻页键退回为「跳首/末行」
+  paged: () => false,
+});
 
 /** 选字段：选中即按该字段升序排；选「按路径」则取消排序。
  *
@@ -164,9 +194,13 @@ function onSortFieldChange(v: unknown) {
       </template>
     </a-alert>
 
-    <a-table
-      :key="tableKey"
-      :columns="tableColumns"
+    <!-- 键盘导航的挂载点：事件绑在这个 div 上而不是 a-table 组件上
+         （组件实例不是 DOM，拿不到 addEventListener）。tabindex 让它可以
+         获得焦点，用户点一下列表再按方向键就会在这里命中。 -->
+    <div ref="tableHost" class="sidebar__table-host" tabindex="0">
+      <a-table
+        :key="tableKey"
+        :columns="tableColumns"
       :data="filteredFiles"
       :pagination="false"
       row-key="path"
@@ -206,7 +240,8 @@ function onSortFieldChange(v: unknown) {
       <template #empty>
         <a-empty :description="t('files.empty')" />
       </template>
-    </a-table>
+      </a-table>
+    </div>
 
     <!-- 目录栏底部：多选与排序操作 -->
     <div class="sidebar__checks">
@@ -263,7 +298,7 @@ function onSortFieldChange(v: unknown) {
       </a-button>
     </div>
 
-    <!-- 行的右键菜单：只保留「打开文件夹」 -->
+    <!-- 行的右键菜单：只保留「打开所在目录」 -->
     <div
       v-if="ctxMenu.open"
       class="ctx-menu"

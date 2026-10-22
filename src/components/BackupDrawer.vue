@@ -8,9 +8,11 @@
  * 需要滚动的是内容区：运行日志可以很长，放在 Arco 的无轨道滚动条里。
  */
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
+import type { TableData } from "@arco-design/web-vue";
 import { useAppStore } from "../store";
+import { useListKeyboard } from "../composables/useListKeyboard";
 import RunLogList from "./RunLogList.vue";
 import { formatSize } from "../utils/format";
 
@@ -30,6 +32,54 @@ const {
   onRestore,
   onDelete,
 } = useAppStore();
+
+/** 当前选中的备份行下标；-1 表示未选中。
+ *
+ * 这张表原本没有「选中」概念（每行各自带两个操作链接），方向键也就无处落脚。
+ * 加上选中态既让键盘导航有反馈，也让「当前在看哪一行」在长列表里更清楚。
+ */
+const backupActive = ref(-1);
+const BACKUP_PAGE_SIZE = 12;
+const backupPage = ref(1);
+/** 键盘导航的挂载点 */
+const backupTableHost = ref<HTMLElement | null>(null);
+
+/** 当前页可见的行：导航的行数与下标都按这一份算 */
+const backupPageRows = computed(() => {
+  const start = (backupPage.value - 1) * BACKUP_PAGE_SIZE;
+  return backups.value.slice(start, start + BACKUP_PAGE_SIZE);
+});
+
+/** 翻页或刷新后下标可能越界，落到第一行才能继续用方向键 */
+function clampBackupActive() {
+  if (backupActive.value >= backupPageRows.value.length) {
+    backupActive.value = backupPageRows.value.length > 0 ? 0 : -1;
+  }
+}
+
+useListKeyboard({
+  host: backupTableHost,
+  rowCount: () => backupPageRows.value.length,
+  activeIndex: () => backupActive.value,
+  onSelect: (i) => {
+    backupActive.value = i;
+  },
+  paged: () => true,
+  page: () => backupPage.value,
+  pageCount: () => Math.max(1, Math.ceil(backups.value.length / BACKUP_PAGE_SIZE)),
+  onPage: (p) => {
+    backupPage.value = p;
+    clampBackupActive();
+  },
+});
+
+/** 选中行的底色，与投影列表的选中样式保持一致的做法 */
+function backupRowClass(raw: TableData): string {
+  const idx = backupPageRows.value.findIndex(
+    (b) => b.path === (raw as unknown as { path: string }).path,
+  );
+  return idx === backupActive.value ? "backup-row--active" : "";
+}
 
 /** 列定义随语言变化，写在这里而不是常量里 */
 const columns = computed(() => [
@@ -56,13 +106,20 @@ const columns = computed(() => [
             {{ t("backup.onlyFor", { name: selected.fileName }) }}
           </span>
         </a-space>
+        <div ref="backupTableHost" class="backup-table-host" tabindex="0">
         <a-table
           :columns="columns"
           :data="backups"
           :loading="backupLoading"
-          :pagination="{ pageSize: 12 }"
+          :pagination="{
+            pageSize: BACKUP_PAGE_SIZE,
+            current: backupPage,
+            total: backups.length,
+          }"
+          :row-class="backupRowClass"
           row-key="path"
           size="small"
+          @page-change="(p: number) => { backupPage = p; clampBackupActive(); }"
         >
           <template #time="{ record }">{{ formatTime(record.createdNs) }}</template>
           <template #size="{ record }">{{ formatSize(record.size) }}</template>
@@ -80,6 +137,7 @@ const columns = computed(() => [
             <a-empty :description="selected ? t('backup.noBackups') : t('backup.pickFile')" />
           </template>
         </a-table>
+        </div>
       </a-tab-pane>
 
       <a-tab-pane key="logs" :title="t('backup.tabLogs')">

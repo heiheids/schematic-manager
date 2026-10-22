@@ -9,9 +9,12 @@
  * 这里按当前界面语言取一套，缺那套就退另一套并标灰说明。
  */
 <script setup lang="ts">
+import { ref } from "vue";
 import { useI18n } from "vue-i18n";
+import type { TableData } from "@arco-design/web-vue";
 import { displayName, isFallbackName } from "../i18n";
 import { useAppStore } from "../store";
+import { useListKeyboard } from "../composables/useListKeyboard";
 import { formatStacks } from "../utils/format";
 
 const { t } = useI18n();
@@ -25,6 +28,8 @@ const {
   BLOCK_PAGE_SIZE,
   blockPage,
   blockRows,
+  blockPageRows,
+  activeBlock,
   blockStateText,
   iconOf,
   iconErrorOf,
@@ -34,6 +39,45 @@ const {
   onBlockColumnResize,
   onBlockRowClick,
 } = useAppStore();
+
+/** 键盘导航的挂载点，见 DirSidebar 里同样的用法 */
+const tableHost = ref<HTMLElement | null>(null);
+
+/** 当前选中方块在本页里的下标。
+ *
+ * 用方块名比对而不是行对象引用：分页切换后同一方块会重新生成行对象。
+ */
+function activeRowIndex(): number {
+  const cur = activeBlock.value;
+  if (!cur) return -1;
+  return blockPageRows.value.findIndex(
+    (r) => r.state === cur.name || r.state.startsWith(`${cur.name}[`) || r.name === cur.name,
+  );
+}
+
+/** 选中行的底色，与备份表 / 实体表同一套观感 */
+function rowClass(raw: TableData): string {
+  const rec = raw as unknown as { state: string; name: string };
+  const idx = blockPageRows.value.findIndex((r) => r.state === rec.state);
+  return idx === activeRowIndex() ? "block-row--active" : "";
+}
+
+useListKeyboard({
+  host: tableHost,
+  rowCount: () => blockPageRows.value.length,
+  activeIndex: activeRowIndex,
+  onSelect: (i) => {
+    const target = blockPageRows.value[i];
+    if (target) onBlockRowClick(target as never);
+  },
+  // 方块表分页：翻页键切页，不移动选中
+  paged: () => true,
+  page: () => blockPage.value,
+  pageCount: () => Math.max(1, Math.ceil(blockRows.value.length / BLOCK_PAGE_SIZE)),
+  onPage: (p) => {
+    blockPage.value = p;
+  },
+});
 </script>
 
 <template>
@@ -72,9 +116,11 @@ const {
         </a-button>
       </div>
       <div class="hint-dim" style="margin-bottom: 6px">{{ t("stats.hint") }}</div>
-      <a-table
-        :key="blockTableKey"
-        class="block-table scroll-table"
+      <div ref="tableHost" class="block-table-host" tabindex="0">
+        <a-table
+          :key="blockTableKey"
+          class="block-table scroll-table"
+          :row-class="rowClass"
         :columns="blockTableColumns"
         :data="blockRows"
         :pagination="{ pageSize: BLOCK_PAGE_SIZE, current: blockPage }"
@@ -116,7 +162,8 @@ const {
         <!-- 合并显示的行写明合并了多少种状态：那一行的数量是所有状态的总和，
               只写一个代表状态会让人以为「只有这么多是那个状态的」 -->
         <template #state="{ record }">{{ blockStateText(record) }}</template>
-      </a-table>
+        </a-table>
+      </div>
     </template>
     <a-empty v-else :description="t('stats.noBlocks')" />
   </a-spin>

@@ -2,13 +2,28 @@ import { describe, expect, it } from "vitest";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import {
+  adaptOrthoAspect,
   applyPreset,
+  applySavedPose,
   buildSceneGroup,
-  EXPORT_SIZES,
+  cameraUpFor,
+  exportPixelSize,
   fitCamera,
   fitDistance,
   frameBox,
   defaultViewDir,
+  dirFromAngles,
+  anglesFromPosition,
+  isBuiltinView,
+  orthoVisibleExtent,
+  perspectiveViewHalfHeight,
+  presetIsOrtho,
+  fitOrthoHalfExtents,
+  frameOrthoBox,
+  orthoZoomLimits,
+  setOrthoViewExtent,
+  GIZMO_AXES,
+  PRESET_MENU,
   presetDir,
   syncClipPlanes,
   VIEW_PRESETS,
@@ -241,6 +256,64 @@ describe("相机取景", () => {
     }
   });
 
+  it("未知视角名直接报错，不静默退回某个默认角度", () => {
+    // 批量导出把这些名字一路传下来：静默兜底会让用户拿到一整批
+    // 角度不对的图，却以为那就是自己选的视角
+    const { group, dispose } = buildSceneGroup(cubeScene());
+    try {
+      const cam = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
+      expect(() => applyPreset(cam, group, "custom:我的视角")).toThrow();
+      expect(() => applyPreset(cam, group, "constructor")).toThrow();
+      expect(() => applyPreset(cam, group, "")).toThrow();
+    } finally {
+      dispose();
+    }
+  });
+
+  it("原型链上的键不算内置视角", () => {
+    // `name in VIEW_PRESETS` 会认下 constructor / toString，
+    // 再一路算出 NaN 的相机朝向
+    for (const name of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      expect(isBuiltinView(name), `${name} 不该被当成视角`).toBe(false);
+      expect(presetIsOrtho(name), `${name} 不该是正射`).toBe(false);
+    }
+    expect(isBuiltinView("top"), "内置视角仍应认得").toBe(true);
+  });
+
+  it("自定义位姿按存下来的位置还原视角", () => {
+    const cam = new THREE.PerspectiveCamera(45, 1.6, 0.1, 10000);
+    const preset = {
+      name: "斜视",
+      ortho: false,
+      position: [30, 40, 50] as [number, number, number],
+      target: [0, 0, 0] as [number, number, number],
+      yaw: 45,
+      pitch: 30,
+    };
+    applySavedPose(cam, preset);
+    expect([cam.position.x, cam.position.y, cam.position.z], "位置应原样还原").toEqual([
+      30, 40, 50,
+    ]);
+    const dir = cam.getWorldDirection(new THREE.Vector3());
+    const toTarget = new THREE.Vector3(-30, -40, -50).normalize();
+    expect(dir.dot(toTarget), "相机应朝向存下来的注视点").toBeGreaterThan(0.999);
+  });
+
+  it("位置与注视点重合的预设明确报错", () => {
+    // 这种位姿算不出朝向：静默渲染只会得到一张角度随机的图
+    const cam = new THREE.PerspectiveCamera(45, 1.6, 0.1, 10000);
+    expect(() =>
+      applySavedPose(cam, {
+        name: "坏预设",
+        ortho: false,
+        position: [5, 5, 5],
+        target: [5, 5, 5],
+        yaw: 0,
+        pitch: 0,
+      }),
+    ).toThrow();
+  });
+
   it("四个预设互不相同，且 front 与 back 相对", () => {
     const { group, dispose } = buildSceneGroup(cubeScene());
     try {
@@ -275,9 +348,29 @@ describe("相机取景", () => {
   });
 });
 
-describe("导出尺寸", () => {
-  it("提供 512 / 1024 / 2048 / 3072 四档", () => {
-    expect([...EXPORT_SIZES]).toEqual([512, 1024, 2048, 3072]);
+describe("导出尺寸换算", () => {
+  it("横构图以高为短边，长边按比例放大", () => {
+    // 短边指宽高比里较小的那一边的像素数，不是把给定的数硬当成宽
+    expect(exportPixelSize("4x3", 1024)).toEqual({ w: 1365, h: 1024 });
+    expect(exportPixelSize("16x9", 1080)).toEqual({ w: 1920, h: 1080 });
+  });
+
+  it("竖构图以宽为短边", () => {
+    expect(exportPixelSize("3x4", 1024)).toEqual({ w: 1024, h: 1365 });
+    expect(exportPixelSize("9x16", 1080)).toEqual({ w: 1080, h: 1920 });
+  });
+
+  it("正方形两条边都等于给定像素数", () => {
+    expect(exportPixelSize("1x1", 2048)).toEqual({ w: 2048, h: 2048 });
+  });
+
+  it("任何比例都不会算出 0 宽或 0 高", () => {
+    // 零尺寸画布会让导出直接失败，极端取值下也必须守住下限
+    for (const aspect of ["1x1", "4x3", "3x4", "16x9", "9x16"] as const) {
+      const px = exportPixelSize(aspect, 1);
+      expect(px.w, `${aspect} 的宽应至少为 1`).toBeGreaterThanOrEqual(1);
+      expect(px.h, `${aspect} 的高应至少为 1`).toBeGreaterThanOrEqual(1);
+    }
   });
 });
 
@@ -511,14 +604,14 @@ describe("取景按投影包围盒拟合", () => {
       return cam.position.clone().normalize();
     }
 
-    const [fy, fp] = VIEW_PRESETS.front;
-    expect(offsetOf("front").dot(offsetDir(fy, fp)), "front 方位不符").toBeGreaterThan(0.999);
-    const [by, bp] = VIEW_PRESETS.back;
-    expect(offsetOf("back").dot(offsetDir(by, bp)), "back 方位不符").toBeGreaterThan(0.999);
-    const [ly, lp] = VIEW_PRESETS.left45;
-    expect(offsetOf("left45").dot(offsetDir(ly, lp)), "left45 方位不符").toBeGreaterThan(0.999);
-    const [ry, rp] = VIEW_PRESETS.right45;
-    expect(offsetOf("right45").dot(offsetDir(ry, rp)), "right45 方位不符").toBeGreaterThan(0.999);
+    const front = VIEW_PRESETS.front;
+    expect(offsetOf("front").dot(offsetDir(front.yaw, front.pitch)), "front 方位不符").toBeGreaterThan(0.999);
+    const back = VIEW_PRESETS.back;
+    expect(offsetOf("back").dot(offsetDir(back.yaw, back.pitch)), "back 方位不符").toBeGreaterThan(0.999);
+    const l45 = VIEW_PRESETS.left45;
+    expect(offsetOf("left45").dot(offsetDir(l45.yaw, l45.pitch)), "left45 方位不符").toBeGreaterThan(0.999);
+    const r45 = VIEW_PRESETS.right45;
+    expect(offsetOf("right45").dot(offsetDir(r45.yaw, r45.pitch)), "right45 方位不符").toBeGreaterThan(0.999);
 
     // 再钉一层语义：front 与 back 在 z 上相反，left45 与 right45 在 x 上相反。
     // 这两条即使角度表的数值被改也仍然成立，能挡住「整体取反」这类错误。
@@ -622,6 +715,59 @@ describe("滚轮缩放", () => {
     expect(zoomLimits(0).min).toBeGreaterThan(0);
   });
 
+  /** 正交相机下的滚轮缩放：改的是 camera.zoom，不是到轴心的距离。
+   *
+   * 这条专门钉住正交缩放真的生效。实测在真实 WebView2 里它一度完全不起作用
+   * （滚轮事件到了 canvas、OrbitControls 也 preventDefault 了，但 zoom 一动
+   * 不动），而透视侧同时是好的——两套限位分属不同字段，混了就会一边失效。
+   */
+  it("正交相机下滚轮能改变 camera.zoom", () => {
+    const el = document.createElement("div");
+    const cam = new THREE.OrthographicCamera(-10, 10, 10, -10, 0.1, 1000);
+    cam.position.set(0, 0, 50);
+    cam.zoom = 1;
+    const controls = new OrbitControls(cam, el);
+    controls.enableZoom = true;
+    const { min, max } = orthoZoomLimits();
+    controls.minZoom = min;
+    controls.maxZoom = max;
+    controls.target.set(0, 0, 0);
+    controls.update();
+
+    wheel(el, -240);
+    controls.update();
+    expect(cam.zoom, "向上滚应放大（zoom 变大）").toBeGreaterThan(1);
+
+    const zoomed = cam.zoom;
+    wheel(el, 600);
+    controls.update();
+    expect(cam.zoom, "向下滚应缩小").toBeLessThan(zoomed);
+  });
+
+  it("正交下使劲滚动也夹在 zoom 限位内", () => {
+    const el = document.createElement("div");
+    const cam = new THREE.OrthographicCamera(-10, 10, 10, -10, 0.1, 1000);
+    cam.position.set(0, 0, 50);
+    cam.zoom = 1;
+    const controls = new OrbitControls(cam, el);
+    controls.enableZoom = true;
+    const { min, max } = orthoZoomLimits();
+    controls.minZoom = min;
+    controls.maxZoom = max;
+    controls.target.set(0, 0, 0);
+    controls.update();
+    for (let i = 0; i < 80; i++) {
+      wheel(el, -400);
+      controls.update();
+    }
+    expect(cam.zoom, "放大到顶应停在 maxZoom").toBeCloseTo(max, 4);
+    for (let i = 0; i < 120; i++) {
+      wheel(el, 400);
+      controls.update();
+    }
+    expect(cam.zoom, "缩小到顶应停在 minZoom").toBeCloseTo(min, 4);
+  });
+
   /**
    * 裁剪面必须跟着距离走。
    *
@@ -653,3 +799,288 @@ describe("滚轮缩放", () => {
   });
 });
 
+
+describe("视角预设与方向换算", () => {
+  it("六个轴向指向各自的坐标轴正负方向", () => {
+    // axialDir 断言 presetDir 结果落在某个坐标轴上：
+    // 轴向视角是精确核对用的，不能有一点偏，因此非零的那个分量应为 ±1
+    function expectAxis(name: string, axis: "x" | "y" | "z", sign: 1 | -1) {
+      const d = presetDir(name);
+      const comp = { x: d.x, y: d.y, z: d.z };
+      expect(comp[axis] * sign, `${name} 的 ${axis} 分量`).toBeCloseTo(1, 5);
+      for (const other of ["x", "y", "z"] as const) {
+        if (other === axis) continue;
+        expect(comp[other], `${name} 的 ${other} 分量应为 0`).toBeCloseTo(0, 5);
+      }
+    }
+    // 顶视：相机在上方朝下看，「相机 → 目标」的 y 为负
+    expectAxis("top", "y", -1);
+    expectAxis("bottom", "y", 1);
+    expectAxis("south", "z", 1);
+    expectAxis("north", "z", -1);
+    expectAxis("east", "x", 1);
+    expectAxis("west", "x", -1);
+  });
+
+  it("所有预设都给单位方向向量，没有一个退化成零向量", () => {
+    // 零向量会让 frameBox 里的归一化得到 NaN，相机直接失效
+    for (const name of Object.keys(VIEW_PRESETS)) {
+      const d = presetDir(name);
+      expect(d.length(), `${name} 应是单位向量`).toBeCloseTo(1, 5);
+      expect(Number.isFinite(d.x + d.y + d.z), `${name} 不应含 NaN`).toBe(true);
+    }
+  });
+
+  it("角度与方向可以互相换算", () => {
+    // 保存自定义预设要用 anglesFromPosition 从相机位置反推角度，
+    // 存进去后再用 dirFromAngles 还原，两者必须一致
+    for (const [yaw, pitch] of [
+      [0, 12],
+      [45, 30],
+      [-45, 30],
+      [90, 0],
+      [180, -20],
+      [0, 89],
+    ]) {
+      // dirFromAngles 给「相机 → 目标」，相机因此站在它的反方向
+      const cameraPos = dirFromAngles(yaw, pitch).negate().multiplyScalar(10);
+      const back = anglesFromPosition(cameraPos, new THREE.Vector3(0, 0, 0));
+      expect(back.pitch, `pitch 应还原（${yaw},${pitch}）`).toBeCloseTo(pitch, 3);
+      // pitch 到 ±90 时水平分量消失，yaw 无意义
+      if (Math.abs(pitch) < 89) {
+        const yawDiff = ((back.yaw - yaw + 540) % 360) - 180;
+        expect(yawDiff, `yaw 应还原（${yaw},${pitch}）`).toBeCloseTo(0, 3);
+      }
+    }
+  });
+
+  it("只有真等距预设标记为正射", () => {
+    expect(presetIsOrtho("isoRight"), "真等距右应是正射").toBe(true);
+    expect(presetIsOrtho("isoLeft"), "真等距左应是正射").toBe(true);
+    expect(presetIsOrtho("right45"), "普通等距应是透视").toBe(false);
+    expect(presetIsOrtho("top"), "轴向视角默认透视").toBe(false);
+  });
+
+  it("右键菜单列全十个预设，且方向标覆盖六个轴向", () => {
+    expect(PRESET_MENU.length, "菜单应有十个预设").toBe(10);
+    for (const item of PRESET_MENU) {
+      expect(VIEW_PRESETS[item.key], `${item.key} 应存在于预设表`).toBeTruthy();
+    }
+    expect(GIZMO_AXES.length, "方向标应有六个轴向").toBe(6);
+    expect(GIZMO_AXES.map((a) => a.axis).sort()).toEqual([
+      "+x",
+      "+y",
+      "+z",
+      "-x",
+      "-y",
+      "-z",
+    ]);
+  });
+});
+describe("正交相机的取景", () => {
+  /** 造一个给定尺寸的包围盒，中心在原点 */
+  function boxOf(w: number, h: number, d: number): THREE.Box3 {
+    return new THREE.Box3(
+      new THREE.Vector3(-w / 2, -h / 2, -d / 2),
+      new THREE.Vector3(w / 2, h / 2, d / 2),
+    );
+  }
+
+  /** 把包围盒八个角点投到相机空间，返回最大 |x| 与 |y| */
+  function projectedExtent(cam: THREE.OrthographicCamera, box: THREE.Box3) {
+    const v = new THREE.Vector3();
+    let maxX = 0;
+    let maxY = 0;
+    for (let i = 0; i < 8; i++) {
+      v.set(
+        i & 1 ? box.max.x : box.min.x,
+        i & 2 ? box.max.y : box.min.y,
+        i & 4 ? box.max.z : box.min.z,
+      );
+      v.project(cam);
+      maxX = Math.max(maxX, Math.abs(v.x));
+      maxY = Math.max(maxY, Math.abs(v.y));
+    }
+    return { maxX, maxY };
+  }
+
+  it("细长模型按投影后尺寸取景，不按包围盒最长边", () => {
+    // 53×9×9 是实测里「画面空掉一大半」的那个形状：按最长边算会剩大片空白
+    const box = boxOf(53, 9, 9);
+    const dir = new THREE.Vector3(-1, -1, -1).normalize();
+    const probe = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10000);
+    probe.position.set(0, 0, 0);
+    probe.lookAt(dir);
+    const { halfW, halfH } = fitOrthoHalfExtents(probe, box, 1);
+    // 斜着看对角线会参与投影，因此可视范围必须能装下 53 那条边的一部分
+    expect(halfW, "水平可视范围应覆盖投影宽度").toBeGreaterThan(53 * 0.25);
+    expect(halfH, "垂直可视范围应为正").toBeGreaterThan(0);
+    // 不该大到把包围盒最长边整个当半径：那会留出成片空白
+    expect(halfW, "不应按最长边的一半以上给范围").toBeLessThan(53);
+  });
+
+  it("取景后整个模型都落在视锥内", () => {
+    // 这是取景的唯一实质要求：所有角点投影后 |x|、|y| 都不超过 1
+    for (const box of [boxOf(10, 10, 10), boxOf(53, 9, 9), boxOf(3, 40, 3)]) {
+      for (const dir of [
+        new THREE.Vector3(-1, -1, -1).normalize(),
+        new THREE.Vector3(0, -1, 0),
+        new THREE.Vector3(1, 0, 0),
+      ]) {
+        const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10000);
+        frameOrthoBox(cam, box, dir, 1.5);
+        const { maxX, maxY } = projectedExtent(cam, box);
+        expect(maxX, `宽 ${box.max.x * 2} 方向 ${dir.toArray()}: 横向不应超出`).toBeLessThanOrEqual(1.001);
+        expect(maxY, `宽 ${box.max.x * 2} 方向 ${dir.toArray()}: 纵向不应超出`).toBeLessThanOrEqual(1.001);
+      }
+    }
+  });
+
+  it("宽视口时补足宽度，竖视口时补足高度", () => {
+    const box = boxOf(10, 10, 10);
+    const probe = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10000);
+    probe.position.set(0, 0, 10);
+    probe.lookAt(0, 0, 0);
+    const wide = fitOrthoHalfExtents(probe, box, 2.0);
+    expect(wide.halfW / wide.halfH, "宽视口下宽高比应接近 2").toBeCloseTo(2.0, 1);
+    const tall = fitOrthoHalfExtents(probe, box, 0.5);
+    expect(tall.halfW / tall.halfH, "竖视口下宽高比应接近 0.5").toBeCloseTo(0.5, 1);
+  });
+
+  it("正交相机的缩放上下限是 zoom 区间", () => {
+    const { min, max } = orthoZoomLimits();
+    expect(min, "最小 zoom 应为正").toBeGreaterThan(0);
+    expect(max, "最大 zoom 应大于最小").toBeGreaterThan(min);
+  });
+
+  it("改宽高比只在基准上重算，反复 resize 不会越缩越小也不会越放越大", () => {
+    // 这条钉的是「拖几次分隔条正射视图就越缩越小」：视景体不能拿当前值
+    // 反复推导，必须始终以取景时记下的基准半高为准
+    const cam = new THREE.OrthographicCamera(-10, 10, 10, -10, 0.1, 1000);
+    setOrthoViewExtent(cam, 10, 1.6);
+    cam.zoom = 2.5;
+
+    // 同一宽高比来回切：可见范围必须回到同一个值
+    for (const aspect of [0.6, 3.2, 1.6, 0.9, 1.6]) {
+      adaptOrthoAspect(cam, aspect);
+    }
+    const back = orthoVisibleExtent(cam);
+    expect(back.halfH, "回到原宽高比时半高应复原").toBeCloseTo(10, 6);
+    expect(back.halfW, "回到原宽高比时半宽应复原").toBeCloseTo(16, 6);
+    expect(cam.zoom, "缩放值不该被 resize 改动").toBeCloseTo(2.5, 6);
+  });
+
+  it("窄画布下竖直取景保持不变，只由宽高比决定宽度", () => {
+    const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+    setOrthoViewExtent(cam, 10, 1.6);
+    adaptOrthoAspect(cam, 0.5);
+    const extent = orthoVisibleExtent(cam);
+    expect(extent.halfH, "竖直方向仍看这么多").toBeCloseTo(10, 6);
+    expect(extent.halfW, "水平方向按新宽高比收窄").toBeCloseTo(5, 6);
+  });
+
+  it("设视景体时保持用户缩放", () => {
+    const cam = new THREE.OrthographicCamera(-10, 10, 10, -10, 0.1, 1000);
+    cam.zoom = 3;
+    setOrthoViewExtent(cam, 40, 1.5);
+    expect(cam.zoom, "zoom 应原样保留").toBeCloseTo(3, 6);
+    const extent = orthoVisibleExtent(cam);
+    expect(extent.halfH, "可见半高应为给定值").toBeCloseTo(40, 6);
+    expect(extent.halfW / extent.halfH, "可见宽高比应为给定值").toBeCloseTo(1.5, 6);
+  });
+
+  it("透视与正交的可见范围可以互相换算", () => {
+    // 换投影时靠这层换算保住构图：透视距离 dist、FOV 45° 下看到的半高，
+    // 设成正交视景体后必须看到同样大的一块
+    const cam = new THREE.PerspectiveCamera(45, 1.6, 0.1, 1000);
+    const dist = 120;
+    const halfH = perspectiveViewHalfHeight(dist, cam.fov);
+    const ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+    setOrthoViewExtent(ortho, halfH, 1.6);
+    expect(orthoVisibleExtent(ortho).halfH, "正交可见半高应与透视一致").toBeCloseTo(
+      halfH,
+      6,
+    );
+    // 反算：正交的范围换回透视距离，应与原距离一致
+    const backDist = halfH / Math.tan((cam.fov * Math.PI) / 360);
+    expect(backDist, "换回透视时距离应复原").toBeCloseTo(dist, 6);
+  });
+});
+describe("轴向视角的相机 up 向量", () => {
+  /** 由相机的世界矩阵取「屏幕右方」 */
+  function screenRight(cam: THREE.Camera): THREE.Vector3 {
+    cam.updateMatrixWorld(true);
+    return new THREE.Vector3().setFromMatrixColumn(cam.matrixWorld, 0).normalize();
+  }
+
+  it("顶视角下 +X 朝屏幕右方，画面不镜像", () => {
+    // 这是实际踩到的 bug：up 取 (0,0,+1) 时屏幕右方成了 -X，
+    // 预览里的文字「TiPlus9100」被镜像成「-0019sulPiT」
+    const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+    cam.position.set(0, 100, 0);
+    cam.up.copy(cameraUpFor(new THREE.Vector3(0, -1, 0)));
+    cam.lookAt(0, 0, 0);
+    const right = screenRight(cam);
+    expect(right.x, "顶视时屏幕右方应是 +X").toBeGreaterThan(0.99);
+  });
+
+  it("顶视角下 +Z 朝屏幕下方", () => {
+    // 与俯视图的通行画法一致：从上方往下看，南（+Z）在画面下方
+    const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+    cam.position.set(0, 100, 0);
+    cam.up.copy(cameraUpFor(new THREE.Vector3(0, -1, 0)));
+    cam.lookAt(0, 0, 0);
+    cam.updateMatrixWorld(true);
+    const up = new THREE.Vector3().setFromMatrixColumn(cam.matrixWorld, 1).normalize();
+    // 屏幕上方对应世界 -Z，因此 up 的 z 应为负
+    expect(up.z, "顶视时屏幕上方应是 -Z").toBeLessThan(-0.99);
+  });
+
+  it("底视角同样保持 +X 朝右", () => {
+    const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+    cam.position.set(0, -100, 0);
+    cam.up.copy(cameraUpFor(new THREE.Vector3(0, 1, 0)));
+    cam.lookAt(0, 0, 0);
+    const right = screenRight(cam);
+    expect(right.x, "底视时屏幕右方也应是 +X").toBeGreaterThan(0.99);
+  });
+
+  it("非轴向视角沿用世界 +Y 作为 up", () => {
+    for (const dir of [
+      new THREE.Vector3(-1, -1, -1).normalize(),
+      new THREE.Vector3(0, -1, -1).normalize(),
+      new THREE.Vector3(1, 0, 0),
+    ]) {
+      const up = cameraUpFor(dir);
+      expect(up.x, `${dir.toArray()} 的 up 应为世界 +Y`).toBeCloseTo(0, 5);
+      expect(up.y).toBeCloseTo(1, 5);
+      expect(up.z).toBeCloseTo(0, 5);
+    }
+  });
+
+  it("透视取景在顶视角下也不镜像", () => {
+    // frameBox 原本没有设置 up，顶视角时 lookAt 与默认 up 平行，朝向由
+    // three 的内部兜底决定，结果不可预期。这里钉死它同样走 cameraUpFor
+    const cam = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
+    const box = new THREE.Box3(
+      new THREE.Vector3(-5, -1, -5),
+      new THREE.Vector3(5, 1, 5),
+    );
+    frameBox(cam, box, new THREE.Vector3(0, -1, 0));
+    const right = screenRight(cam);
+    expect(right.x, "顶视角经 frameBox 后屏幕右方仍是 +X").toBeGreaterThan(0.99);
+  });
+
+  it("斜视角的 up 由 cameraUpFor 给出，落地后屏幕右方保持水平", () => {
+    // 直接对斜方向调用 cameraUpFor 并 lookAt：屏幕右方不应有竖直分量，
+    // 有分量就说明画面被滚转了（模型看着是歪的）。
+    // 相机若停在顶视，up 会是 (0,0,-1)；此时不校正 up 直接 lookAt 就会滚。
+    const cam = new THREE.PerspectiveCamera(45, 1.6, 0.1, 10000);
+    const dir = new THREE.Vector3(-1, -1, -1).normalize(); // 相机 → 目标
+    cam.position.copy(dir.clone().multiplyScalar(-100));
+    cam.up.copy(cameraUpFor(dir));
+    cam.lookAt(0, 0, 0);
+    const right = screenRight(cam);
+    expect(Math.abs(right.y), "斜视角下屏幕右方应为水平向量").toBeLessThan(1e-6);
+  });
+});

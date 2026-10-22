@@ -1,6 +1,6 @@
 [package]
 name = "schematic-manager"
-version = "0.1.1"
+version = "0.1.2"
 description = "跨平台 Minecraft 投影(.litematic)文件管理与预览工具"
 authors = ["heiheids"]
 edition = "2021"

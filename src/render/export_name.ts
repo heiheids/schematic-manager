@@ -40,11 +40,14 @@ export class NamePool {
   }
 }
 
-/** 由投影文件名与尺寸生成导出文件的「主干」部分（不含扩展名） */
-export function previewStem(fileName: string, size: number): string {
+/** 由投影文件名与实际像素宽高生成导出文件的「主干」部分（不含扩展名） */
+export function previewStem(fileName: string, w: number, h: number): string {
   // 去掉 .litematic 后缀（大小写不敏感）：投影文件名是用户可见的，
-  // 保留后缀会得到 `A.litematic_preview_512.png`
-  return `${fileName.replace(/\.litematic$/i, "")}_preview_${size}`;
+  // 保留后缀会得到 `A.litematic_preview_1024x768.png`
+  //
+  // 用宽×高而不是短边单个数：矩形导出的两种比例可能有相同的短边，
+  // 只写短边的话 1024×768 与 1024×1024 会得到同名文件。
+  return `${fileName.replace(/\.litematic$/i, "")}_preview_${w}x${h}`;
 }
 
 /**

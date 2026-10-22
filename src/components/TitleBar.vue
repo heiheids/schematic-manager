@@ -17,13 +17,25 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useI18n } from "vue-i18n";
 import appIcon from "../assets/app-icon.png";
 import { LOCALES, currentLocale, setLocale } from "../i18n";
+import { useAppStore } from "../store";
 
 const { t } = useI18n();
+
+const { confirmDiscard } = useAppStore();
 
 const appWindow = getCurrentWindow();
 const minimize = () => appWindow.minimize();
 const toggleMaximize = () => appWindow.toggleMaximize();
-const close = () => appWindow.close();
+
+/** 关窗前先问一句：有未保存的改动时直接关掉，用户会以为已经存过了。
+ *
+ * 应用的关窗入口就是这一个按钮（标题栏自绘，decorations 为 false），
+ * 因此拦在这里即可覆盖「关窗口」与「退出应用」两种情形——它们走的是同一个动作。
+ */
+async function close() {
+  if (!(await confirmDiscard("files.unsavedClose"))) return;
+  await appWindow.close();
+}
 
 /** 当前语言的按钮文字：认不出来的语言取清单里第一项，与 i18n 的回落一致 */
 function currentLabelKey(): string {

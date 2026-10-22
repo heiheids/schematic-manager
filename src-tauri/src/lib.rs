@@ -150,6 +150,7 @@ pub fn run() {
             commands::analyze_conversion,
             commands::apply_conversion,
             commands::save_metadata,
+            commands::save_schematic_as,
             commands::delete_files,
             commands::copy_files_to_clipboard,
             commands::copy_files_to_dir,
