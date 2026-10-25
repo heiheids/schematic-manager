@@ -31,6 +31,9 @@ mod png;
 mod pool;
 mod pack_build;
 mod replace;
+mod logger;
+
+
 // 针对任意真实投影集合的端到端核对，按需运行（标了 #[ignore]）
 #[cfg(test)]
 mod real_project;
@@ -42,6 +45,7 @@ mod transform;
 mod update;
 mod visibility;
 mod zip;
+
 
 /// 运行日志所在目录：应用数据目录下的 `logs`。
 ///
@@ -71,6 +75,8 @@ pub fn run() {
     let identifier = context.config().identifier.clone();
     startup::install_panic_hook(identifier.clone());
 
+    
+
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -86,6 +92,9 @@ pub fn run() {
             match log_dir(app.handle()) {
                 Some(dir) => match run_log::open(&dir) {
                     Ok(()) => {
+                        logger::init_log_object(&dir);
+                        logger_info!("SYSTEM", "The system is activated at system time {} .", &std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos().to_string());
+
                         // 等级先按界面上次存下的取值，debug 用户才能从第一行起
                         // 就有完整日志，而不是等界面把等级推过来才开始记
                         run_log::set_level(commands::saved_log_level(app.handle()));
