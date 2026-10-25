@@ -8,6 +8,8 @@ use rfd::MessageDialog;
 #[cfg(target_os = "windows")]
 use std::os::windows::fs::OpenOptionsExt;
 
+use crate::commands::clear_run_log;
+
 
 
 const LOG_FILE_NAME: &str = "latest.log";
@@ -15,6 +17,7 @@ const LOG_DEBUG_FILE_NAME: &str = "debug.log";
 
 /// 单条日志最长字符长度
 const LOG_ITEM_MAX_CHAR_LENGTH: u16 = 0xFFFF;
+const LOG_ARCHIVES_MAX_ITEM: usize = 100;
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum LEVEL {
@@ -71,11 +74,57 @@ impl LogFileObject {
     pub fn init(run_path: &PathBuf) -> Self {
         fn show_error(text: &str, title: &str) {
             println!("[{}][ERROR][::logger] {} - {}", get_now_time(), title, text);
-            let _ = MessageDialog::new()
+            if cfg!(target_os = "windows") {
+                use windows::core::{HSTRING, PCWSTR};
+                use windows::Win32::Foundation::{BOOL, HWND};
+                use windows::Win32::UI::Controls::{
+                    TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
+                    TASKDIALOG_BUTTON, TDCBF_OK_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TD_INFORMATION_ICON,
+                };
+
+                let title       = HSTRING::from(title);
+                let instruction = HSTRING::from("Error when the log system initialization: The log output file cannot be initialized.");
+                let content     = HSTRING::from(text);
+                // let ok_text     = HSTRING::from("确定(&O)");
+                let cancel_text = HSTRING::from("终止(&A)");
+                let buttons = [
+                    // TASKDIALOG_BUTTON { nButtonID: 100, pszButtonText: PCWSTR(ok_text.as_ptr()) },
+                    TASKDIALOG_BUTTON { nButtonID: 100, pszButtonText: PCWSTR(cancel_text.as_ptr()) },
+                ];
+
+                let config = TASKDIALOGCONFIG {
+                    cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+                    hwndParent: HWND::default(),
+                    dwFlags: TDF_ALLOW_DIALOG_CANCELLATION,
+                    dwCommonButtons: TDCBF_OK_BUTTON,
+                    pszWindowTitle:     PCWSTR(title.as_ptr()),
+                    pszMainInstruction: PCWSTR(instruction.as_ptr()),
+                    pszContent:         PCWSTR(content.as_ptr()),
+                    cButtons: buttons.len() as u32,
+                    pButtons: buttons.as_ptr(),
+                    Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: TD_INFORMATION_ICON }, // ✅ 字段名修正
+                    Anonymous2: TASKDIALOGCONFIG_1::default(),
+                    ..Default::default()
+                };
+
+                let mut button_pressed = 0i32;
+                let mut radio_pressed = 0i32;
+                let mut verification_checked = BOOL(0);
+                unsafe {
+                    let _ = TaskDialogIndirect(
+                        &config,
+                        Some(&mut button_pressed),        // ✅
+                        Some(&mut radio_pressed),         // ✅ 或 None
+                        Some(&mut verification_checked),  // ✅ 或 None
+                    );
+                }
+            } else {
+                let _ = MessageDialog::new()
                 .set_title(title)
                 .set_description(text)
                 .set_level(rfd::MessageLevel::Error)
                 .show();
+            }
         }
 
         let latest_dir = run_path.clone();
@@ -99,6 +148,9 @@ impl LogFileObject {
                     .show();
             },
         };
+
+        LogFileObject::clean_old_archives(&latest_dir, "latest", LOG_ARCHIVES_MAX_ITEM.into());
+        LogFileObject::clean_old_archives(&latest_dir, "debug", LOG_ARCHIVES_MAX_ITEM.into());
 
         let mut file_opts = OpenOptions::new();
         file_opts.create(true).append(true);
@@ -186,8 +238,46 @@ impl LogFileObject {
         }
         roll_file( LOG_FILE_NAME, "latest", dir)?;
         roll_file( LOG_DEBUG_FILE_NAME, "debug", dir)?;
+        
 
         Ok(())
+    }
+
+    /// 清理旧的归档日志，保留最新的 `keep_count` 个
+    /// AIGC
+    fn clean_old_archives(dir: &PathBuf, base_name: &str, keep_count: usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+
+        // 1. 收集所有匹配的归档文件路径
+        let mut archives: Vec<PathBuf> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // 只匹配类似 "-latest.log.gz" 或 "-debug.log.gz" 的文件
+                if name.ends_with(&format!("-{}.log.gz", base_name)) {
+                    Some(entry.path())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // 2. 按文件名排序（因为你的格式是 YYYY-MM-DD-N-xxx，字典序就是时间序）
+        archives.sort();
+
+        // 3. 如果数量超过上限，删除最老的
+        if archives.len() > keep_count {
+            let to_delete = archives.len() - keep_count;
+            for path in archives.iter().take(to_delete) {
+                if let Err(e) = std::fs::remove_file(path) {
+                    println!("[WARN] 无法删除旧日志归档 {:?}: {}", path, e);
+                } else {
+                    println!("Cleaned up old archive: {:?}", path);
+                }
+            }
+        }
     }
 
     
