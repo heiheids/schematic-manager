@@ -8,8 +8,6 @@ use rfd::MessageDialog;
 #[cfg(target_os = "windows")]
 use std::os::windows::fs::OpenOptionsExt;
 
-use crate::commands::clear_run_log;
-
 
 
 const LOG_FILE_NAME: &str = "latest.log";
