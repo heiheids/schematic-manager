@@ -54,12 +54,20 @@ export interface BlockCount {
  * 物品的不同方块形态（火把与墙上的火把、炼药锅的内容物、铁砧的破损程度），
  * 因为用户想知道的是「这种物品一共要备多少个」。
  *
- * `name` 是代表形态的方块名：该行里出现了基础形态（例如同时有火把与墙上的
- * 火把）时取基础形态的，否则取数量最多的那一个。`state` 与它同属一行，
- * 供渲染图使用。注意替换是按方块名精确匹配的，而这一行可能跨多个方块名，
- * 因此 `forms` 必须保留下来（见 blockReplace.ts 的 onBlockRowClick）。
+ * `name` 是**物品名**（水折成水桶、耕地折成泥土），不是方块名；代表方块的
+ * 名字在 `state` 的方括号之前那一段里。`state` 还供渲染图使用。注意替换是按
+ * 方块名精确匹配的，而这一行可能跨多个方块名，因此 `forms` 必须保留下来
+ * （见 blockReplace.ts 的 sourceOf）。
  */
 export interface BlockRow extends BlockCount {
+  /**
+   * 行的唯一键，供表格的 row-key 与「当前行」判定使用。
+   *
+   * 不能借用 `state`：按物品合计时同一个状态可能出现在两行里（带花的花盆会
+   * 同时贡献「花盆」与「植物」两件物品），两张行共用同一个 state 会让表格
+   * 认错行，也会让行内按钮作用到另一行上。
+   */
+  key: string;
   /** 这一行合计进来的方块状态条目数；1 表示只有一条 */
   stateCount: number;
   /** 这一行跨了哪几个方块名（火把与墙上的火把是两个），按首次出现顺序 */
@@ -104,7 +112,21 @@ export interface EntityTexture {
 }
 
 /** 目录扫描结果 */
-export interface ScanResult {  items: SchematicSummary[];
+export interface DirectoryNode {
+  path: string;
+  name: string;
+  relativePath: string;
+  /** 只包含当前目录的直接文件，不包含后代目录 */
+  filePaths: string[];
+  children: DirectoryNode[];
+  /** 达到扫描深度，尚未读取该目录的子项 */
+  truncated: boolean;
+}
+
+export interface ScanResult {
+  items: SchematicSummary[];
+  /** 目录树根，包含没有投影文件的目录 */
+  root: DirectoryNode;
   /** 因权限或 IO 错误被跳过的目录数 */
   skippedDirs: number;
   /** 被跳过的目录路径（最多前若干条） */
@@ -275,7 +297,15 @@ export interface SaveOutcome {
   backupPath: string;
 }
 
+export interface RegionSummary {
+  name: string;
+  position: [number, number, number];
+  size: [number, number, number];
+}
+
 export interface AnalysisResult {
+  /** 按文件中的实际 Regions 返回，供子区列表与预览选择 */
+  regions: RegionSummary[];
   blocks: BlockCount[];
   entities: EntityCount[];
   tileEntities: EntityCount[];

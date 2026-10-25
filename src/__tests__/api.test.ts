@@ -107,6 +107,13 @@ describe("方块库", () => {
     await expectCall(() => api.searchBlocks("x"), "search_blocks", { limit: 200 });
   });
 
+  it("listBlocks 只发命令名、不带参数", async () => {
+    await expectCall(() => api.listBlocks(), "list_blocks");
+    // 无参命令应当只发一个参数（命令名），不发空的参数对象：
+    // Tauri 对两者都能处理，但只发命令名更贴合后端的无参签名
+    expect(mockInvoke.mock.calls.at(-1)?.length, "只应传命令名").toBe(1);
+  });
+
   it("listBlockVersions 只发命令名、不带参数", async () => {
     await expectCall(() => api.listBlockVersions(), "list_block_versions");
     // 无参命令应当只发一个参数（命令名），不发空的参数对象：
@@ -253,6 +260,7 @@ describe("契约整体性", () => {
       () => api.saveMetadata("a", {}),
       () => api.buildScene("a"),
       () => api.searchBlocks("q"),
+      () => api.listBlocks(),
       () => api.listBlockVersions(),
       () => api.previewReplace("a", {
         fromName: "x", fromProps: [], toName: "y", toProps: [], inheritProps: true,

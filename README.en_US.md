@@ -21,8 +21,8 @@ English | [简体中文](README.md)
 |---|---|
 | Schematic list | After you pick a directory it recursively scans it for `.litematic` files and shows a summary of each one's size, block count and the version it was made with |
 | 3D preview | Renders the schematic with real block models and textures, supports switching viewpoints and exporting a transparent-background PNG; files with more than 30,000 blocks are not rendered by default — press 「开始渲染」 (Start rendering) in the preview area (you have to confirm again after leaving that file) |
-| Block counts | Counts by **the items needed to build it**, using the same accounting as the Litematica mod's material list: block states are first folded into items (torches and wall torches count as one, water and lava count only the single source bucket, doors and beds count once, double slabs count as two, snow layers / turtle eggs / sea pickles / candles use the count stored in the state, glow lichen counts by faces, a flower pot with a flower counts as pot plus plant), then summed per item; the status bar states how many states and shapes were aggregated, and clicking a row to set it as the replacement source explains which block names that row covers |
-| Block replacement | Replaces one block with another by rule; the window has two columns — the left holds the rules (source block, property constraints, target block, property overrides), the right is a searchable block list you can click to fill the current field; source and target both show Chinese names, and required fields that are still empty are outlined in red; every replacement is backed up first, and the result can be restored from the backup |
+| Block counts | Counts by **the items needed to build it**, using the same accounting as the Litematica mod's material list: block states are first folded into items (torches and wall torches count as one, water and lava count only the single source bucket, doors and beds count once, double slabs count as two, snow layers / turtle eggs / sea pickles / candles use the count stored in the state, glow lichen counts by faces, a flower pot with a flower counts as pot plus plant), then summed per item; the「区分属性」(Split states) switch in the table header lists every block state on its own row — counts then become the number of blocks in that state and the state column is shown — while turning it off folds rows back by item and hides the state column; a row that spans several block shapes says so after its block name, with the exact names in the tooltip; a fixed action column on the far right carries one「替换」(Replace) entry per row |
+| Block replacement | Replaces one block with another by rule, reached from the「替换」(Replace) entry at the right of each row in the block counts table; the window has two columns — the left holds the rules (the source block and its property constraints come from the row you clicked and cannot be edited, while the target block and target property overrides are yours to fill), the right lists every block in the library by block ID and can be narrowed with a keyword search, a click fills the target block; both panes show the display name in the current UI language, and the target field is outlined in red while empty; every replacement is backed up first, and the result can be restored from the backup |
 | Version conversion | Converts a schematic to another game version: it analyses the differences first, then you assign substitutes for the missing blocks; the window has two columns — the left lists the gaps (red border = still to assign, green border = automatically recognised suggestion, no highlight = you picked it yourself), the right is a searchable block list you can click to fill in (blocks absent from the target version are marked and cannot be picked); the result is saved as a new file |
 | Duplicate detection | Screens the loaded directory in place (subdirectories included): files that are byte-for-byte identical are listed as **duplicates**, moved to the top of the list, colour-coded per group, and the extra copies are checked by default; files with the same name, size and block count but different content are listed as **suspected duplicates** and only flagged, never checked |
 | Backups and logs | Lists the backup taken before each modification, each of which can be restored or deleted; also carries a run log tab (with an entry to the 「日志管理」 (Log Management) window) |
@@ -95,7 +95,14 @@ The environment variable `SCHEMATIC_MANAGER_NO_ERROR_DIALOG=1` makes startup fai
     (subdirectories included; anything found is imported) or downloading client jars
     from the official or BMCL API endpoints, and builds the base library in the app
     data directory
-  - `src-tauri/tests/data/` — real `.litematic` samples used by tests
+  - `src-tauri/src/` is split into domain packages: `block/` (block library),
+    `pack/` (resource packs and base-library building), `format/` (NBT/PNG/ZIP),
+    `schematic/` (schematics and block states), `render/` (scene and meshes),
+    `app/` (application infrastructure), `mc/` (versions and client downloads) and
+    `commands/` (frontend command entry points, DTOs included)
+  - `src-tauri/src/tests/` — unit-test package mirroring the same package layout; each
+    file is mounted with `#[path]` and runs with `cargo test --lib`
+  - `src-tauri/src/tests/data/` — real `.litematic` samples used by tests
 - `legacy-cpp/` — the original Windows-only C++ implementation, **kept for reference
   only**. Its semantics for `.litematic` parsing, NBT bit packing, ZIP/PNG decoding and
   multi-version block-library baking have been verified in practice, and served as the
@@ -114,7 +121,7 @@ The installer name, install directory, executable name and bundle identifier all
 - macOS Finder name and menu-bar name: `src-tauri/Info.plist`,
   `bundle.macOS.bundleName`
 - Linux desktop entry name: `src-tauri/linux/main.desktop`
-- Startup failure dialog: `src-tauri/src/startup.rs`
+- Startup failure dialog: `src-tauri/src/app/startup.rs`
 
 Windows gets no override: the installer takes the Start Menu and desktop shortcut names as well as the "Apps & features" entry from `productName`, and Tauri has no option that separates them, so those places show `schematic-manager`; the window title and the text inside the UI remain Chinese.
 
@@ -173,7 +180,14 @@ Backend unit tests:
 cargo test --manifest-path src-tauri/Cargo.toml --lib
 ```
 
-Only a small sample ships with the source (see `src-tauri/tests/data/README.md`).
+Unit tests live under `src-tauri/src/tests/`, mirroring the source package layout. Each
+test file is the body of a module's `mod tests`, mounted by the
+`#[cfg(test)] #[path = "../tests/…"] mod tests;` declaration at the end of that module,
+so private items stay reachable and everything runs with `cargo test --lib`.
+`support.rs` holds shared helpers (in-memory zip/PNG builders, per-test temp dirs) and
+`real_project.rs` is the opt-in end-to-end check.
+
+Only a small sample ships with the source (see `src-tauri/src/tests/data/README.md`).
 To check feature coverage against your own real schematics, use these opt-in tests:
 
 ```bash

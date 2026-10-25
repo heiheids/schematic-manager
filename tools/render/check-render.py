@@ -237,6 +237,11 @@ SHIM = r"""
   // 地址栏里已勾选的目录，不再弹窗。留在列表里会让脚本一直等一个
   // 永远不出现的对话框。
   var DIALOG_BUTTONS = ["方块替换", "版本转换", "备份与日志", "更新"];
+  // 入口不是工具栏按钮的那些对话框：给选择器，按文本找按钮会落空
+  // （方块替换的入口现在是方块表每一行右侧的「替换」）
+  var DIALOG_ENTRY_SELECTORS = {
+    "方块替换": ".block-table tbody .block-act",
+  };
   var DIALOG_TITLES = {
     "方块替换": "方块替换",
     "版本转换": "转换游戏版本",
@@ -304,6 +309,14 @@ SHIM = r"""
       case "list_block_versions": return Promise.resolve([
         { index: 0, name: "1.20.1", dataVersion: 3465, blockCount: 1234, isOverlay: false }
       ]);
+      // 替换窗口打开时取全量方块填右侧列表：给真实命中形状
+      // （name/zh/en/versions），空数组会让弹窗显示「方块库为空」
+      case "list_blocks": return Promise.resolve(BLOCK_ROWS.map(function (r) {
+        return { name: r.name, zh: r.zhName, en: r.enName, versions: [] };
+      }));
+      case "search_blocks": return Promise.resolve(BLOCK_ROWS.map(function (r) {
+        return { name: r.name, zh: r.zhName, en: r.enName, versions: [] };
+      }));
       case "list_backups": return Promise.resolve([]);
       // 日志行按后端真实格式：纳秒时间戳（19 位）+ 制表符 + 大写等级 + 制表符
       // + 说明。给空数组时「运行日志」页签永远显示空状态，日志的排版（含等级
@@ -642,11 +655,13 @@ SHIM = r"""
       ? document.querySelector(".preview__form").textContent.indexOf("（备注）") >= 0 : false;
 
     // ---- 预览控制条是否被挤压 ----
-    // 控制条内容合计约 840px，不换行时 flex 会把单选按钮压到 47px 宽，
-    // 导致「正面」竖排成两行（高度 44px）。这里用按钮宽高判断。
-    var barBtn = document.querySelector(".preview__bar .arco-radio-button");
+    // 控制条一行要放下滑杆、百分比与两个按钮。被挤时 flex 会把按钮压窄、
+    // 文字折行，行高随之变大，因此用「按钮高度」与「整条高度」一起判断。
+    var barBtn = document.querySelector(".preview__bar .arco-btn");
     var barBox = barBtn ? barBtn.getBoundingClientRect() : null;
-    var barOk = barBox ? Math.round(barBox.height) <= 30 : false;
+    var barEl0 = document.querySelector(".preview__bar");
+    var barBarH = barEl0 ? Math.round(barEl0.getBoundingClientRect().height) : -1;
+    var barOk = !!(barBox && Math.round(barBox.height) <= 32 && barBarH > 0 && barBarH <= 44);
     // 控制条应紧贴预览行下沿。
     //
     // 原先断言的是「距舞台底部 ≤40px」——那是舞台自适应放大、高度等于整行
@@ -819,6 +834,7 @@ SHIM = r"""
       + ",labelOk=" + labelOk
       + ",barBtnH=" + (barBox ? Math.round(barBox.height) : -1)
       + ",barBtnW=" + (barBox ? Math.round(barBox.width) : -1)
+      + ",barH=" + barBarH
       + ",pixOpaque=" + pix.opaque
       + ",pixTotal=" + pix.total
       + ",pixRatio=" + pix.ratio
@@ -1123,10 +1139,16 @@ SHIM = r"""
         return;
       }
       dialogTried.push(pending);
-      var dlg = Array.prototype.slice.call(document.querySelectorAll("button"))
-        .filter(function (b) { return (b.textContent || "").indexOf(pending) >= 0; })[0];
+      var dlg = null;
+      var entrySelector = DIALOG_ENTRY_SELECTORS[pending];
+      if (entrySelector) {
+        dlg = document.querySelector(entrySelector);
+      } else {
+        dlg = Array.prototype.slice.call(document.querySelectorAll("button"))
+          .filter(function (b) { return (b.textContent || "").indexOf(pending) >= 0; })[0];
+      }
       if (!dlg) {
-        DIALOGS.push(pending + "=未找到按钮");
+        DIALOGS.push(pending + "=未找到入口");
         status();
         return;
       }
@@ -1329,7 +1351,7 @@ def main():
             results.append(hit)
             print(f"  {(label or kw):<24} {'是' if hit else '否'}")
 
-        for kw in ["添加目录", "方块替换", "版本转换", "重复文件筛查", "备份与日志", "版本库"]:
+        for kw in ["添加目录", "区分属性", "版本转换", "重复文件筛查", "备份与日志", "版本库"]:
             need(kw)
         # 自动交互之后，这些必须真的出现
         need("28速单区块简单熔炉", "列表里的文件名")
@@ -1544,7 +1566,7 @@ def main():
             # 最后一列是 1px 占位列、不应有边框，因此断言「除了最后一列都有」
             claim("方块栏表头每列都有竖向分割线",
                   b_th > 0 and b_border >= b_th - 1,
-                  f"  {b_border}/{b_th} 列有边框（末列为占位列，应为 {b_th - 1}）")
+                  f"  {b_border}/{b_th} 列有边框（末列为操作列，应为 {b_th - 1}）")
             claim("方块栏可拖动调整列宽",
                   int(fields.get("bHandles", "0")) >= 2,
                   f"  拖动手柄 {fields.get('bHandles')} 个")
@@ -1594,7 +1616,7 @@ def main():
             claim("保存按钮无需滚动即可点到", fields.get("saveOk") == "true",
                   f"  按钮底边相对面板底边 {fields.get('saveGap')}px（>0 表示被挤出可视范围）")
             claim("预览控制条未被挤压（按钮不竖排）", fields.get("barOk") == "true",
-                  f"  视角按钮 {fields.get('barBtnW')}×{bar_h}px；高度超过 30 说明文字折行了")
+                  f"  控制条高 {fields.get('barH')}px、按钮 {fields.get('barBtnW')}×{bar_h}px；高度超限说明被挤折行了")
             # 与「加宽名称以显示更多内容」的目的相反。
             decl_sum = int(fields.get("declSum", "0"))
             box_w = int(fields.get("boxW", "0"))

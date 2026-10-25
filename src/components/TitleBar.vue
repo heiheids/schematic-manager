@@ -21,7 +21,7 @@ import { useAppStore } from "../store";
 
 const { t } = useI18n();
 
-const { confirmDiscard } = useAppStore();
+const { confirmDiscardAll } = useAppStore();
 
 const appWindow = getCurrentWindow();
 const minimize = () => appWindow.minimize();
@@ -33,7 +33,7 @@ const toggleMaximize = () => appWindow.toggleMaximize();
  * 因此拦在这里即可覆盖「关窗口」与「退出应用」两种情形——它们走的是同一个动作。
  */
 async function close() {
-  if (!(await confirmDiscard("files.unsavedClose"))) return;
+  if (!(await confirmDiscardAll())) return;
   await appWindow.close();
 }
 

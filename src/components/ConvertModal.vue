@@ -48,6 +48,7 @@ const {
   pickConvBlock,
   scheduleConvNameLookup,
   reloadConvTargets,
+  selectConvTarget,
   runConvertAnalyze,
   doConvert,
   // 版本库域：已支持但尚未加载的版本也要列出来，点一下现场补齐
@@ -83,6 +84,7 @@ interface TargetOption {
  * 与 running 配合：整批补库在跑时不允许重复点。
  */
 const preparingName = ref("");
+let prepareSequence = 0;
 
 /** 左栏表格的当前页（从 1 起）。
  *
@@ -180,30 +182,34 @@ function onTargetChange(v: unknown) {
     if (opt) void onPrepareVersion(opt);
     return;
   }
-  convTargetIdx.value = typeof v === "number" ? v : undefined;
+  selectConvTarget(typeof v === "number" ? v : undefined);
 }
 
 /** 点未加载的版本：现场下载/构建它，补完自动选中 */
 async function onPrepareVersion(opt: TargetOption) {
   if (running.value || opt.loaded) return;
+  const sourcePath = selected.value?.path;
+  const sequence = ++prepareSequence;
   preparingName.value = opt.name;
   try {
     const ok = await prepareVersion(opt.name);
+    if (!convOpen.value || selected.value?.path !== sourcePath) return;
     if (!ok) {
       Message.error(t("convert.readyFailed", { name: opt.name }));
       return;
     }
     // 重新取一次列表：新版本在方块库里的下标只有后端知道
-    await reloadConvTargets();
+    if (!(await reloadConvTargets())) return;
+    if (!convOpen.value || selected.value?.path !== sourcePath) return;
     const hit = convTargets.value.find((t) => t.name === opt.name);
     if (hit) {
-      convTargetIdx.value = hit.index;
+      selectConvTarget(hit.index);
       Message.success(t("convert.readySelected", { name: opt.name }));
     } else {
       Message.success(t("convert.readyOther", { name: opt.name }));
     }
   } finally {
-    preparingName.value = "";
+    if (sequence === prepareSequence) preparingName.value = "";
   }
 }
 

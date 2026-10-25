@@ -10,10 +10,11 @@
 import { onBeforeUnmount, onMounted, watch } from "vue";
 import type { ComputedRef, Ref } from "vue";
 import { Message } from "@arco-design/web-vue";
-import { loadUiState, saveUiState, scanLitematics } from "../api";
+import { loadUiState, saveUiState } from "../api";
 import { currentLocale, isLocale, locale, setLocale, t } from "../i18n";
 import type { ExportAspect, SavedViewPreset } from "../render/scene3d";
 import type { SortKey, SortOrder, StatusText } from "./fileList";
+import type { WorkspaceTab, WorkspaceTabKind } from "./workspace";
 import {
   EXPORT_ASPECTS,
   EXPORT_SHORT_EDGES,
@@ -59,6 +60,12 @@ interface UiState {
   /** 列表排序字段与方向；都没选时按路径排序（原行为） */
   sortKey?: string;
   sortOrder?: string;
+  /** 文件管理目录树的界面状态 */
+  selectedDirKey?: string;
+  expandedDirKeys?: string[];
+  showDescendants?: boolean;
+  /** 固定标签的开启状态；编辑会话不写入磁盘 */
+  fixedTabs?: string[];
 }
 
 const UI_STATE_VERSION = 1;
@@ -103,6 +110,10 @@ export interface UiStateDeps {
   loadedDirs: ComputedRef<string[]>;
   /** 勾选显示的目录集合（fileList） */
   enabledDirs: Ref<Set<string>>;
+  /** 按根目录扫描，提交时忽略已失效的响应 */
+  scanDirectories: (
+    dirs: string[],
+  ) => Promise<{ scanned: string[]; missing: string[] }>;
   /** 文件表列宽（fileList） */
   colWidths: Ref<Record<string, number>>;
   /** 预览视角（scenePreview） */
@@ -123,6 +134,14 @@ export interface UiStateDeps {
   sortOrder: Ref<SortOrder | null>;
   /** 状态栏内容（fileList）；恢复完成后汇报目录数 */
   status: Ref<StatusText>;
+  /** 文件管理当前目录与展开状态 */
+  selectedDirKey: Ref<string>;
+  selectDirectory: (key: string) => void;
+  expandedDirKeys: Ref<Set<string>>;
+  showDescendants: Ref<boolean>;
+  /** 固定标签的开启状态 */
+  tabs: Ref<WorkspaceTab[]>;
+  restoreFixedTabs: (kinds: WorkspaceTabKind[]) => void;
   /** 运行日志等级（backups）；本身也是要记住的界面形态 */
   logLevel: Ref<LogLevel>;
   /** 把当前等级与本地日期推给后端（backups）；恢复完成后必须调用 */
@@ -150,6 +169,10 @@ export function createUiStateSlice(s: UiStateDeps) {
       logLevel: s.logLevel.value,
       sortKey: s.sortKey.value ?? undefined,
       sortOrder: s.sortOrder.value ?? undefined,
+      selectedDirKey: s.selectedDirKey.value || undefined,
+      expandedDirKeys: Array.from(s.expandedDirKeys.value),
+      showDescendants: s.showDescendants.value,
+      fixedTabs: s.tabs.value.filter((tab) => tab.kind !== "editor").map((tab) => tab.kind),
     };
   }
 
@@ -267,6 +290,16 @@ export function createUiStateSlice(s: UiStateDeps) {
       s.sortKey.value = st.sortKey;
       s.sortOrder.value = st.sortOrder;
     }
+    const savedDirKey = typeof st.selectedDirKey === "string" ? st.selectedDirKey : "";
+    const savedExpandedDirKeys = Array.isArray(st.expandedDirKeys)
+      ? st.expandedDirKeys.filter((key): key is string => typeof key === "string")
+      : null;
+    if (typeof st.showDescendants === "boolean") {
+      s.showDescendants.value = st.showDescendants;
+    }
+    if (Array.isArray(st.fixedTabs)) {
+      s.restoreFixedTabs(st.fixedTabs as WorkspaceTabKind[]);
+    }
     // 语言先恢复：后面那些提示文案要用它来出
     if (isLocale(st.locale)) {
       setLocale(st.locale);
@@ -289,26 +322,18 @@ export function createUiStateSlice(s: UiStateDeps) {
     const dirs = Array.isArray(st.dirs) ? st.dirs.filter((d) => typeof d === "string") : [];
     if (dirs.length === 0) return;
 
-    const next: Record<string, SchematicSummary[]> = {};
-    const missing: string[] = [];
-    for (const dir of dirs) {
-      try {
-        const r = await scanLitematics(dir);
-        next[dir] = r.items;
-      } catch {
-        // 目录不存在或不可读：这是常见情况（用户移动/删除了目录），
-        // 不必报错刷屏，但要把它从记忆里去掉，否则每次启动都会重试
-        missing.push(dir);
-      }
-    }
-    s.dirItems.value = next;
-    // 勾选状态跟随恢复；记录里没有的目录（新增的）默认勾选
+    const { scanned, missing } = await s.scanDirectories(dirs);
     const keep = new Set(
       Array.isArray(st.enabledDirs) ? st.enabledDirs.filter((d) => typeof d === "string") : [],
     );
-    s.enabledDirs.value = new Set(
-      Object.keys(next).filter((d) => !Array.isArray(st.enabledDirs) || keep.has(d)),
-    );
+    const enabled = new Set(s.enabledDirs.value);
+    for (const dir of scanned) {
+      if (!Array.isArray(st.enabledDirs) || keep.has(dir)) enabled.add(dir);
+      else enabled.delete(dir);
+    }
+    s.enabledDirs.value = enabled;
+    if (savedDirKey) s.selectDirectory(savedDirKey);
+    if (savedExpandedDirKeys) s.expandedDirKeys.value = new Set(savedExpandedDirKeys);
     if (missing.length > 0) {
       Message.warning(t("ui.dirsMissing", { dirs: missing.join("\n") }));
       // 把失效目录从记忆里清掉
@@ -316,7 +341,7 @@ export function createUiStateSlice(s: UiStateDeps) {
     }
     s.status.value = {
       key: "ui.dirsRestored",
-      params: { count: Object.keys(next).length },
+      params: { count: scanned.length },
     };
   }
 
@@ -341,6 +366,10 @@ export function createUiStateSlice(s: UiStateDeps) {
   // 目录集合变化（添加/移除/勾选）同样要记住
   watch(s.dirItems, persistUiState, { deep: false });
   watch(s.enabledDirs, persistUiState, { deep: false });
+  watch(s.selectedDirKey, persistUiState);
+  watch(s.expandedDirKeys, persistUiState, { deep: false });
+  watch(s.showDescendants, persistUiState);
+  watch(s.tabs, persistUiState, { deep: false });
 
   onMounted(async () => {
     // 恢复上次的界面状态与已添加目录。放在最后：先把界面建起来，

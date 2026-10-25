@@ -17,6 +17,8 @@ import {
   isBuiltinView,
   orthoVisibleExtent,
   perspectiveViewHalfHeight,
+  prepareRenderCamera,
+  restoreOrthoExtent,
   presetIsOrtho,
   fitOrthoHalfExtents,
   frameOrthoBox,
@@ -854,6 +856,14 @@ describe("视角预设与方向换算", () => {
     }
   });
 
+  it("真等距预设的三个视线分量等幅", () => {
+    for (const name of ["isoLeft", "isoRight"]) {
+      const dir = presetDir(name);
+      expect(Math.abs(dir.x), `${name} 的 x/y 分量应等幅`).toBeCloseTo(Math.abs(dir.y), 12);
+      expect(Math.abs(dir.z), `${name} 的 z/y 分量应等幅`).toBeCloseTo(Math.abs(dir.y), 12);
+    }
+  });
+
   it("只有真等距预设标记为正射", () => {
     expect(presetIsOrtho("isoRight"), "真等距右应是正射").toBe(true);
     expect(presetIsOrtho("isoLeft"), "真等距左应是正射").toBe(true);
@@ -886,11 +896,12 @@ describe("正交相机的取景", () => {
     );
   }
 
-  /** 把包围盒八个角点投到相机空间，返回最大 |x| 与 |y| */
+  /** 把包围盒八个角点投到相机空间，返回三个归一化坐标的最大绝对值 */
   function projectedExtent(cam: THREE.OrthographicCamera, box: THREE.Box3) {
     const v = new THREE.Vector3();
     let maxX = 0;
     let maxY = 0;
+    let maxZ = 0;
     for (let i = 0; i < 8; i++) {
       v.set(
         i & 1 ? box.max.x : box.min.x,
@@ -900,8 +911,9 @@ describe("正交相机的取景", () => {
       v.project(cam);
       maxX = Math.max(maxX, Math.abs(v.x));
       maxY = Math.max(maxY, Math.abs(v.y));
+      maxZ = Math.max(maxZ, Math.abs(v.z));
     }
-    return { maxX, maxY };
+    return { maxX, maxY, maxZ };
   }
 
   it("细长模型按投影后尺寸取景，不按包围盒最长边", () => {
@@ -970,6 +982,17 @@ describe("正交相机的取景", () => {
     expect(cam.zoom, "缩放值不该被 resize 改动").toBeCloseTo(2.5, 6);
   });
 
+  it("恢复正交快照后再次 resize 仍保持快照可见半高与缩放", () => {
+    const cam = new THREE.OrthographicCamera(-10, 10, 10, -10, 0.1, 1000);
+    cam.userData.orthoBaseHalfHeight = 40;
+    restoreOrthoExtent(cam, { left: -16, right: 16, top: 12, bottom: -12 }, 2, 2);
+    adaptOrthoAspect(cam, 0.75);
+    const restored = orthoVisibleExtent(cam);
+    expect(restored.halfH, "可见半高应来自快照而不是旧基准").toBeCloseTo(6, 6);
+    expect(cam.zoom, "恢复与 resize 不应改变快照缩放").toBeCloseTo(2, 6);
+    expect(cam.userData.orthoBaseHalfHeight, "后续 resize 应使用新基准").toBeCloseTo(6, 6);
+  });
+
   it("窄画布下竖直取景保持不变，只由宽高比决定宽度", () => {
     const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
     setOrthoViewExtent(cam, 10, 1.6);
@@ -1004,6 +1027,90 @@ describe("正交相机的取景", () => {
     // 反算：正交的范围换回透视距离，应与原距离一致
     const backDist = halfH / Math.tan((cam.fov * Math.PI) / 360);
     expect(backDist, "换回透视时距离应复原").toBeCloseTo(dist, 6);
+  });
+
+  it("离屏内置真等距选择正交相机并完整取景", () => {
+    const { group, dispose } = buildSceneGroup(cubeScene());
+    try {
+      const perspective = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
+      const orthographic = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10000);
+      const aspect = 1.5;
+      const selected = prepareRenderCamera(perspective, orthographic, group, "isoRight", aspect);
+
+      expect(selected).toBe(orthographic);
+      const box = new THREE.Box3().setFromObject(group);
+      const { maxX, maxY, maxZ } = projectedExtent(orthographic, box);
+      expect(maxX, "正交取景应覆盖模型横向投影").toBeLessThanOrEqual(1.001);
+      expect(maxY, "正交取景应覆盖模型纵向投影").toBeLessThanOrEqual(1.001);
+      expect(maxZ, "正交取景不应裁掉模型前后部分").toBeLessThanOrEqual(1.001);
+      expect(Math.max(maxX, maxY), "模型不应只占据视口中央一小块").toBeGreaterThan(0.8);
+      const extent = orthoVisibleExtent(orthographic);
+      expect(extent.halfW / extent.halfH).toBeCloseTo(aspect, 6);
+      const dir = orthographic.getWorldDirection(new THREE.Vector3());
+      expect(dir.dot(presetDir("isoRight")), "相机应采用所选预设的视线").toBeCloseTo(1, 6);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("离屏普通预设仍选择透视相机", () => {
+    const { group, dispose } = buildSceneGroup(cubeScene());
+    try {
+      const perspective = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
+      const orthographic = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10000);
+      const selected = prepareRenderCamera(perspective, orthographic, group, "right45", 1.5);
+
+      expect(selected).toBe(perspective);
+      expect(perspective.aspect).toBeCloseTo(1.5, 6);
+      const center = new THREE.Box3().setFromObject(group).getCenter(new THREE.Vector3());
+      const toCenter = center.sub(perspective.position).normalize();
+      const dir = perspective.getWorldDirection(new THREE.Vector3());
+      expect(dir.dot(toCenter), "透视路径仍应朝向模型中心").toBeGreaterThan(0.999);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("离屏自定义正交预设保留位姿并按该朝向取景", () => {
+    const { group, dispose } = buildSceneGroup(cubeScene());
+    try {
+      const perspective = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
+      const orthographic = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10000);
+      const preset = {
+        name: "自定义正交",
+        ortho: true,
+        position: [4, 6, 8] as [number, number, number],
+        target: [0.5, 0.5, 0.5] as [number, number, number],
+        yaw: 0,
+        pitch: 0,
+      };
+      const aspect = 1.5;
+      orthographic.up.set(0, 0, -1);
+      const selected = prepareRenderCamera(perspective, orthographic, group, preset, aspect);
+
+      expect(selected).toBe(orthographic);
+      expect(orthographic.position.toArray(), "位置应按存档恢复").toEqual(preset.position);
+      const expectedDir = new THREE.Vector3(...preset.target)
+        .sub(new THREE.Vector3(...preset.position))
+        .normalize();
+      expect(
+        orthographic.up.distanceTo(cameraUpFor(expectedDir)),
+        "up 应按存档朝向恢复",
+      ).toBeCloseTo(0, 12);
+      const dir = orthographic.getWorldDirection(new THREE.Vector3());
+      expect(dir.dot(expectedDir), "相机应注视存档目标").toBeCloseTo(1, 6);
+
+      orthographic.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(group);
+      const { maxX, maxY, maxZ } = projectedExtent(orthographic, box);
+      expect(maxX, "恢复位姿后横向仍应装下模型").toBeLessThanOrEqual(1.001);
+      expect(maxY, "恢复位姿后纵向仍应装下模型").toBeLessThanOrEqual(1.001);
+      expect(maxZ, "恢复位姿后不应裁掉模型前后部分").toBeLessThanOrEqual(1.001);
+      const extent = orthoVisibleExtent(orthographic);
+      expect(extent.halfW / extent.halfH).toBeCloseTo(aspect, 6);
+    } finally {
+      dispose();
+    }
   });
 });
 describe("轴向视角的相机 up 向量", () => {

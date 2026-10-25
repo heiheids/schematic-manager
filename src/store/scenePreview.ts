@@ -10,7 +10,7 @@
  * 批量导出读取文件列表域的勾选项。依赖只声明本域用到的成员，
  * 而不是整棵 store，避免类型上的循环引用（见 store/fileList.ts）。
  */
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import * as THREE from "three";
 import type { ComputedRef, Ref } from "vue";
 import { Message } from "@arco-design/web-vue";
@@ -31,7 +31,7 @@ import {
 } from "../render/scene3d";
 import type { ExportAspect, SavedViewPreset } from "../render/scene3d";
 import { NamePool, joinPath, previewStem } from "../render/export_name";
-import type { AnalysisResult, BlockRow, SceneData, SchematicSummary } from "../types";
+import type { AnalysisResult, BlockCount, BlockRow, SceneData, SchematicSummary } from "../types";
 import { itemsForState } from "../utils/material_items";
 import { formatStacks } from "../utils/format";
 
@@ -43,6 +43,27 @@ export interface ScenePreviewDeps {
   analysis: Ref<AnalysisResult | null>;
   /** 文件列表域已勾选且无解析错误的文件；批量导出的对象 */
   checkedFiles: ComputedRef<SchematicSummary[]>;
+  /** 新文件选中时清除上一个文件的子区选择 */
+  resetRegion: () => void;
+}
+
+export interface SceneCameraSnapshot {
+  position: [number, number, number];
+  target: [number, number, number];
+  up?: [number, number, number];
+  ortho?: boolean;
+  zoom?: number;
+  frustum?: { left: number; right: number; top: number; bottom: number };
+}
+
+export interface SceneEditorSnapshot {
+  scene: SceneData | null;
+  sceneError: string;
+  activeRegion: string | null;
+  activeView: string;
+  orthoView: boolean;
+  brightness: number;
+  camera: SceneCameraSnapshot | null;
 }
 
 /**
@@ -54,7 +75,16 @@ export interface ScenePreviewDeps {
  * 口径是「统计表里的那一行」——即「方块」页签数量列看到的数：按物品合计、
  * 忽略朝向一类的状态差异。用户看到的数字与这里的判断因此是同一个。
  */
-const SCENE_BLOCK_LIMIT = 30000;
+export const SCENE_BLOCK_LIMIT = 30000;
+
+/** 按名称比较，结果与运行环境的语言数据无关。
+ *
+ * 不用 localeCompare：它随环境语言数据变化，同一份数据在不同机器上会排出
+ * 不同顺序，用户换个系统就发现名次变了。
+ */
+function compareNames(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
 
 export function createScenePreviewSlice(s: ScenePreviewDeps) {
   const viewer = ref<InstanceType<typeof SceneViewer> | null>(null);
@@ -63,6 +93,9 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
   const sceneError = ref("");
   const brightness = ref(1.45);
   const activeView = ref("left45");
+  const activeRegion = ref<string | null>(null);
+  let sceneGeneration = 0;
+  let cameraToRestore: SceneCameraSnapshot | null = null;
   /** 预览区右键菜单的位置；open 为 false 时不显示。
    *
    * 与投影列表的行右键菜单分开存放：那个作用于文件行，这个作用于 3D 画布，
@@ -100,22 +133,105 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
    */
   const manualRenderPath = ref("");
 
+  function resetRegion() {
+    activeRegion.value = null;
+  }
+
+  /** 恢复活动视角；场景和组件都就绪后再调用，避免画布尚未挂载。 */
+  async function restoreView() {
+    await nextTick();
+    if (cameraToRestore && viewer.value?.restoreCameraPose) {
+      viewer.value.restoreCameraPose(cameraToRestore);
+      cameraToRestore = null;
+    } else if (activeView.value.startsWith("custom:")) {
+      applySavedViewByName(activeView.value.slice(7));
+      viewer.value?.setOrtho(orthoView.value);
+    } else {
+      viewer.value?.applyViewPreset(activeView.value);
+      viewer.value?.setOrtho(orthoView.value);
+    }
+  }
+
   // 场景加载失败不弹消息：错误长期展示在预览区里（sceneError），
   // 与「点一下、弹一条就消失」的瞬时操作不同
   async function loadScene(record: SchematicSummary) {
+    const regionName = activeRegion.value;
+    const generation = ++sceneGeneration;
     scene.value = null;
     sceneError.value = "";
     // 方块数过大且用户还没点过「开始渲染」：不生成几何，预览区给出按钮。
-    // 这里直接返回，连构建命令都不发——省下的正是卡顿的那一段。
-    if (sceneGate.value) return;
+    if (sceneGate.value) {
+      sceneLoading.value = false;
+      return;
+    }
     sceneLoading.value = true;
     try {
-      scene.value = await buildScene(record.path);
+      const data = await buildScene(record.path, regionName ?? undefined);
+      if (
+        generation !== sceneGeneration ||
+        s.selected.value?.path !== record.path ||
+        activeRegion.value !== regionName
+      ) {
+        return;
+      }
+      scene.value = data;
+      await restoreView();
     } catch (e) {
-      sceneError.value = String(e);
+      if (generation === sceneGeneration && s.selected.value?.path === record.path) {
+        sceneError.value = String(e);
+      }
     } finally {
-      sceneLoading.value = false;
+      if (generation === sceneGeneration) sceneLoading.value = false;
     }
+  }
+
+  function setActiveRegion(name: string | null) {
+    if (activeRegion.value === name) return;
+    activeRegion.value = name;
+    const cur = s.selected.value;
+    if (cur) void loadScene(cur);
+  }
+
+  function captureSceneEditor(): SceneEditorSnapshot {
+    sceneGeneration++;
+    sceneLoading.value = false;
+    return {
+      scene: scene.value,
+      sceneError: sceneError.value,
+      activeRegion: activeRegion.value,
+      activeView: activeView.value,
+      orthoView: orthoView.value,
+      brightness: brightness.value,
+      camera: viewer.value?.cameraPose() ?? null,
+    };
+  }
+
+  function restoreSceneEditor(snapshot: SceneEditorSnapshot) {
+    sceneGeneration++;
+    scene.value = snapshot.scene;
+    sceneError.value = snapshot.sceneError;
+    activeRegion.value = snapshot.activeRegion;
+    activeView.value = snapshot.activeView;
+    orthoView.value = snapshot.orthoView;
+    brightness.value = snapshot.brightness;
+    sceneLoading.value = false;
+    manualRenderPath.value = "";
+    cameraToRestore = snapshot.camera;
+    void restoreView();
+  }
+
+  function invalidateScene() {
+    sceneGeneration++;
+    scene.value = null;
+    sceneError.value = "";
+    sceneLoading.value = false;
+  }
+
+  function clearSceneEditor() {
+    invalidateScene();
+    activeRegion.value = null;
+    manualRenderPath.value = "";
+    cameraToRestore = null;
   }
 
   /** 用户明确要求渲染当前文件（方块数超过阈值时用） */
@@ -393,28 +509,59 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
    * 但出问题时仍需要看到 ID，因此两者都保留。
    * 中文名查不到时由 slot 回退显示 ID（见模板里的 zh 插槽）。
    *
-   * 最后一列是「堆叠」，需要可拖动就必须让**它之后**还有一列：
-   * Arco 判定 resizable 要求 `index2 < row.length - 1`（table.js:1247），
-   * 否则最后一列永远没有拖动手柄。这里同样补一个 1px 占位列。
+   * 状态列只在「区分属性」开启时出现：按物品合计的那些行里，一个状态只是
+   * 该行的代表状态，数量却是这一行所有状态的总和，写出来反而误导。
+   *
+   * 最后一列是固定的操作列，每行一个「替换」按钮（入口跟着它作用的那一行，
+   * 不必先选中再去找表头按钮）。固定的列没有拖动手柄——它的宽度不参与
+   * 布局计算，固定值是列定义里的常量。
    */
   /** 列定义随界面语言变化，用 computed 包住，切语言后表头跟着变。
    *  名字列走展示插槽：显示哪一套名字由界面语言决定，后端两套都给了。 */
-  const blockColumns = computed<TableColumnData[]>(() => [
-    { title: t("stats.icon"), slotName: "icon", width: 60 },
-    { title: t("displayName.column"), slotName: "display", width: 150, ellipsis: true, tooltip: true },
-    { title: t("stats.block"), dataIndex: "name", ellipsis: true, tooltip: true },
-    // 状态走插槽：合并显示的行要写「含 N 种状态」而不是某一个代表状态
-    { title: t("stats.state"), dataIndex: "state", slotName: "state", ellipsis: true, tooltip: true },
-    { title: t("stats.count"), dataIndex: "count", width: 90 },
-    { title: t("stats.stacks"), slotName: "stacks", width: 110 },
-    {
-      title: "",
-      dataIndex: "__block_filler",
-      width: 1,
-      headerCellClass: "block__filler-col",
-      bodyCellClass: "block__filler-col",
-    },
-  ]);
+  const blockColumns = computed<TableColumnData[]>(() => {
+    const cols: TableColumnData[] = [
+      { title: t("stats.icon"), slotName: "icon", width: 60 },
+      {
+        title: t("displayName.column"),
+        slotName: "display",
+        width: 150,
+        ellipsis: true,
+        tooltip: true,
+      },
+      // 方块名走插槽：按物品合计时一个物品可能跨了几种方块形态（火把与墙上的
+      // 火把），而状态列在合计视图下不显示，跨形态这件事只能标在这一列上
+      {
+        title: t("stats.block"),
+        dataIndex: "name",
+        slotName: "name",
+        ellipsis: true,
+        // 这一列自己给 title（跨形态时列出具体是哪几个方块名），
+        // Arco 的 tooltip 会把整段文字再套一层，两个提示会叠在一起
+        tooltip: false,
+      },
+    ];
+    if (blockSplitStates.value) {
+      cols.push({
+        title: t("stats.state"),
+        dataIndex: "state",
+        ellipsis: true,
+        tooltip: true,
+      });
+    }
+    cols.push(
+      { title: t("stats.count"), dataIndex: "count", width: 90 },
+      { title: t("stats.stacks"), slotName: "stacks", width: 110 },
+      {
+        title: t("stats.action"),
+        slotName: "act",
+        // 英文界面要放得下 "Action" 与 "Replace"：单元格左右各有 16px 内边距，
+        // 太窄会折行（中文字少，窄一点反而好看）
+        width: 96,
+        fixed: "right",
+      },
+    );
+    return cols;
+  });
 
   /** 方块栏列宽：由用户拖动表头调整，与侧栏同一套做法。
    *
@@ -426,11 +573,11 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
   const blockTableKey = ref(0);
 
   function onBlockColumnResize(dataIndex: string, width: number) {
-    if (!dataIndex || dataIndex === "__block_filler") return;
+    if (!dataIndex) return;
     blockColWidths.value = { ...blockColWidths.value, [dataIndex]: width };
   }
 
-  /** 实际渲染用的方块栏列：把用户调整过的宽度套回去，并让最后一列可拖 */
+  /** 实际渲染用的方块栏列：把用户调整过的宽度套回去 */
   const blockTableColumns = computed<TableColumnData[]>(() =>
     blockColumns.value.map((c) => {
       const key = String(c.dataIndex ?? "");
@@ -450,20 +597,11 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
   const ICON_BATCH = 128;
   const blockPage = ref(1);
 
-  /** 方块统计表的行：按**物品**合计，照投影模组 Litematica 的材料清单口径。
-   *
-   * 后端给的是「每个方块状态用了多少个」（红石粉的强度、铁轨的朝向与通电、
-   * 楼梯的朝向……一个方块可以占几十行）。这里先把状态折算成「建造它所需的
-   * 物品与个数」（见 utils/material_items.ts），再按物品累加：同一个物品的
-   * 不同状态与不同摆法自然合成一行，数量是要备的物品数。
-   *
-   * 代表状态取该物品下最先出现（后端按数量降序）的那一行，渲染图用它；
-   * 跨了多个方块名时，若其中有基础形态（火把与墙上的火把）就优先用基础形态
-   * 的名字、中文名与渲染图。跨了哪几个方块名记在 forms 里，替换时据此说明
-   * 只覆盖了其中一个名字。
-   */
-  const blockRows = computed<BlockRow[]>(() => {
-    const all = s.analysis.value?.blocks ?? [];
+  /** 是否「区分属性」：开启后每种方块状态单独一行，关闭则按物品合计。 */
+  const blockSplitStates = ref(false);
+
+  /** 按物品合计的行：「建造这个东西一共要备多少」。 */
+  function mergedBlockRows(all: BlockCount[]): BlockRow[] {
     const out: BlockRow[] = [];
     const at = new Map<string, number>();
     // 该物品当前的代表行是否已经是「基础形态」（方块名就等于物品名）。
@@ -476,7 +614,14 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
         const i = at.get(item.name);
         if (i === undefined) {
           at.set(item.name, out.length);
-          out.push({ ...b, name: item.name, count: add, stateCount: 1, forms: [b.name] });
+          out.push({
+            ...b,
+            key: item.name,
+            name: item.name,
+            count: add,
+            stateCount: 1,
+            forms: [b.name],
+          });
           if (b.name === item.name) baseForm.add(item.name);
           continue;
         }
@@ -497,8 +642,43 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
     // 合计后的数量与后端给出的单状态数量不同，名次要重排：否则「用了 8000 个
     // 的红石粉」会排在「用了 12 个的石头」后面。数量相同按名字排，结果稳定
     //（不用 localeCompare：它随环境语言数据变化，同一份数据在不同机器上会排出不同顺序）。
-    out.sort((a, b) => b.count - a.count || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    out.sort((a, b) => b.count - a.count || compareNames(a.name, b.name));
     return out;
+  }
+
+  /** 按状态分行的行：一行就是一个方块状态，数量是处于该状态的方块数。 */
+  function splitStateRows(all: BlockCount[]): BlockRow[] {
+    const out = all.map<BlockRow>((b) => ({
+      ...b,
+      key: b.state,
+      stateCount: 1,
+      forms: [b.name],
+    }));
+    // 不依赖后端返回顺序：切换开关时行要按同一套规则重排，否则同一个方块在
+    // 两种视图里的名次会不同，用户会以为数量变了
+    out.sort((a, b) => b.count - a.count || compareNames(a.state, b.state));
+    return out;
+  }
+
+  /** 方块统计表的行。
+   *
+   * 默认按**物品**合计，照投影模组 Litematica 的材料清单口径：后端给的是
+   * 「每个方块状态用了多少个」（红石粉的强度、铁轨的朝向与通电、楼梯的朝向……
+   * 一个方块可以占几十行），先把状态折算成「建造它所需的物品与个数」
+   * （见 utils/material_items.ts），再按物品累加，数量是要备的物品数。
+   *
+   * 打开「区分属性」后改为每种状态一行，数量是该状态的方块数——这是替换规则
+   * 的实际命中口径（替换按方块名与属性精确匹配），与材料口径并列存在。
+   * 两种视图的差别不只在分组：数量本身含义不同，因此界面上要分别说明。
+   */
+  const blockRows = computed<BlockRow[]>(() => {
+    const all = s.analysis.value?.blocks ?? [];
+    return blockSplitStates.value ? splitStateRows(all) : mergedBlockRows(all);
+  });
+
+  // 行集合整个换了，停在旧页码会落到一个不知从何而来的位置
+  watch(blockSplitStates, () => {
+    blockPage.value = 1;
   });
 
   /** 数量最多的那一行方块（与统计表同一口径，也就是用户看到的那个数） */
@@ -521,21 +701,6 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
     const start = (blockPage.value - 1) * BLOCK_PAGE_SIZE;
     return blockRows.value.slice(start, start + BLOCK_PAGE_SIZE);
   });
-
-  /** 状态一栏显示什么。
-   *
-   * 合计了多条记录的行不能只写它那一个代表状态：那一行的数量是所有这些记录的
-   * 总和，写一个具体状态会让人以为「只有这么多是那个状态的」。跨了多个方块名
-   * 时还要点明这一点——用户以为「这一行就是火把」，实际上墙上的火把也在里面。
-   */
-  function blockStateText(row: BlockRow): string {
-    if (row.forms.length > 1) {
-      return t("stats.mergedForms", { forms: row.forms.length, states: row.stateCount });
-    }
-    return row.stateCount > 1
-      ? t("stats.mergedStates", { states: row.stateCount })
-      : row.state;
-  }
 
   /** 状态键 → data URL。用普通 Map 而不是 reactive：
    * 这里会有几百上千项，逐项做响应式代理得不偿失，
@@ -618,21 +783,20 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
    */
   function blockTableText(): string {
     const rows: string[] = [];
-    rows.push(
-      [
-        t("export.tableName"),
-        t("export.tableId"),
-        t("export.tableState"),
-        t("export.tableCount"),
-        t("export.tableStacks"),
-      ].join("\t"),
-    );
+    const head = [t("export.tableName"), t("export.tableId")];
+    // 状态列与界面同步：界面上没有状态列时不导出它，否则拿到文件的人会以为
+    // 界面上也按状态分了行、数量口径与界面不同
+    if (blockSplitStates.value) head.push(t("export.tableState"));
+    head.push(t("export.tableCount"), t("export.tableStacks"));
+    rows.push(head.join("\t"));
     for (const b of blockRows.value) {
       // 导出的是当前界面语言看得懂的表格，但截断/落盘后语言不会再变，
       // 所以按导出时的语言取名字
       const name = displayName(b).replace(/[\t\r\n]/g, " ");
-      const state = blockStateText(b).replace(/[\t\r\n]/g, " ");
-      rows.push([name, b.name, state, String(b.count), formatStacks(b.count)].join("\t"));
+      const cells = [name, b.name];
+      if (blockSplitStates.value) cells.push(b.state.replace(/[\t\r\n]/g, " "));
+      cells.push(String(b.count), formatStacks(b.count));
+      rows.push(cells.join("\t"));
     }
     return rows.join("\r\n");
   }
@@ -694,6 +858,14 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
     sceneError,
     brightness,
     activeView,
+    activeRegion,
+    setActiveRegion,
+    resetRegion,
+    captureSceneEditor,
+    restoreSceneEditor,
+    invalidateScene,
+    clearSceneEditor,
+    restoreView,
     viewMenu,
     orthoView,
     savedViews,
@@ -728,9 +900,9 @@ export function createScenePreviewSlice(s: ScenePreviewDeps) {
     resetBlockColumnWidths,
     BLOCK_PAGE_SIZE,
     blockPage,
+    blockSplitStates,
     blockRows,
     blockPageRows,
-    blockStateText,
     iconOf,
     iconErrorOf,
     resetBlockIcons,

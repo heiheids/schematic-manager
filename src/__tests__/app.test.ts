@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
-import ArcoVue, { Message } from "@arco-design/web-vue";
+import ArcoVue, { Message, Modal } from "@arco-design/web-vue";
 import ArcoVueIcon from "@arco-design/web-vue/es/icon";
 
 // Tauri 的全部出口都换掉：测试跑在 jsdom 里，没有 Tauri 运行时。
@@ -87,13 +87,15 @@ const mockOpen = vi.mocked(open);
 const messageSuccess = vi.spyOn(Message, "success");
 const messageWarning = vi.spyOn(Message, "warning");
 const messageError = vi.spyOn(Message, "error");
+const messageInfo = vi.spyOn(Message, "info");
 
-/** 本用例内出现过的全部提示文案 */
+/** 本用例内出现过的全部提示文案（含普通提示） */
 function shownMessages(): string[] {
   return [
     ...messageSuccess.mock.calls,
     ...messageWarning.mock.calls,
     ...messageError.mock.calls,
+    ...messageInfo.mock.calls,
   ].map((c) => String(c[0]));
 }
 
@@ -141,6 +143,74 @@ function mountApp() {
  *  （identifier 改过一次，拼出来的位置会指向不存在的地方）。 */
 const LOG_DIR = "C:\\Users\\tester\\AppData\\Roaming\\io.github.heiheids.schematic-manager\\logs";
 
+async function activateFiles(w: ReturnType<typeof mountApp>) {
+  const tab = w.findAll(".workspace-tab__label").find((item) => item.text().includes("文件管理"));
+  if (tab) {
+    await tab.trigger("click");
+    await flushPromises();
+  }
+}
+
+async function selectRoot(w: ReturnType<typeof mountApp>, path: string) {
+  const node = w.findAll(".directory-node__select").find((item) => item.find(".directory-node__name").attributes("title") === path);
+  expect(node, `应能找到根目录 ${path}`).toBeTruthy();
+  await node!.trigger("click");
+  await flushPromises();
+}
+
+async function activateEditor(w: ReturnType<typeof mountApp>, name: string) {
+  const tab = w.findAll(".workspace-tab__label").find((item) => item.attributes("title")?.includes(name));
+  expect(tab, `应能找到编辑标签 ${name}`).toBeTruthy();
+  await tab!.trigger("click");
+  await flushPromises();
+}
+
+async function openFileCard(w: ReturnType<typeof mountApp>, name: string) {
+  await activateFiles(w);
+  const card = w.findAll(".schematic-card").find((item) => item.text().includes(name));
+  expect(card, `应能找到文件卡片 ${name}`).toBeTruthy();
+  await card!.trigger("dblclick");
+  await flushPromises();
+}
+
+/** 挂载并选中一个带给定方块行的投影，「方块」页签的表因此有内容。 */
+async function mountWithBlocks(
+  blocks: BlockCount[],
+  overrides: Record<string, unknown> = {},
+) {
+  stubInvoke({
+    analyze_schematic: {
+      blocks,
+      entities: [],
+      tileEntities: [],
+      entityInstances: [],
+      nonAirTotal: blocks.reduce((a, b) => a + b.count, 0),
+      airTotal: 0,
+      distinctBlockTypes: new Set(blocks.map((b) => b.name)).size,
+      distinctStates: blocks.length,
+    },
+    ...overrides,
+  });
+  mockOpen.mockResolvedValue("/p");
+  const w = mountApp();
+  await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+  await flushPromises();
+  await openFileCard(w, "测试.litematic");
+  await flushPromises();
+  return w;
+}
+
+/** 点方块表第 index 行的行内「替换」，打开替换窗口。
+ *
+ * 替换入口不再挂在表头（#53）：规则作用于用户点的那一行，入口就该在那一行上。
+ */
+async function clickReplaceOnRow(w: ReturnType<typeof mountApp>, index = 0) {
+  const links = w.findAll(".block-table .block-act");
+  expect(links.length, "方块表每行应有替换入口").toBeGreaterThan(index);
+  await links[index].trigger("click");
+  await flushPromises();
+}
+
 /** 一个可用的场景数据，字段与后端 SceneData 对齐 */
 const scene: SceneData = {
   batches: [],
@@ -152,6 +222,32 @@ const scene: SceneData = {
   dataVersion: 3465,
   unresolvedBlocks: 0,
 };
+
+function normalizeMockResult(cmd: string, value: unknown, args: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  if (cmd === "scan_litematics") {
+    const result = value as { items?: SchematicSummary[]; root?: unknown };
+    if (!result.root) {
+      const items = result.items ?? [];
+      const dir = (args as { dir?: string } | undefined)?.dir ?? "/p";
+      return {
+        ...result,
+        root: {
+          path: dir,
+          name: dir.split(/[\\/]/).filter(Boolean).pop() ?? dir,
+          relativePath: "",
+          filePaths: items.map((item) => item.path),
+          children: [],
+          truncated: false,
+        },
+      };
+    }
+  }
+  if (cmd === "analyze_schematic" && !("regions" in value)) {
+    return { ...value, regions: [] };
+  }
+  return value;
+}
 
 /** 让 invoke 按命令名返回**结构正确**的结果。
  *
@@ -167,7 +263,8 @@ function stubInvoke(overrides: Record<string, unknown> = {}) {
       // 若不支持函数，测「命令失败」就只能整体替换实现，那样别的命令会落到
       // 兜底分支拿到错误类型的结果（例如 base_db_status 拿到数组），
       // 进而产生与被测行为无关的未处理异常。
-      return typeof v === "function" ? (v as (a: unknown) => unknown)(args) : v;
+      const result = typeof v === "function" ? await (v as (a: unknown) => unknown)(args) : v;
+      return normalizeMockResult(cmd, result, args);
     }
     switch (cmd) {
       case "load_ui_state":
@@ -178,11 +275,12 @@ function stubInvoke(overrides: Record<string, unknown> = {}) {
       case "save_ui_state":
         return undefined;
       case "scan_litematics":
-        return { items: [summary], skippedDirs: 0, skippedPaths: [] };
+        return normalizeMockResult(cmd, { items: [summary], skippedDirs: 0, skippedPaths: [] }, args);
       case "build_scene":
         return scene;
       case "analyze_schematic":
         return {
+          regions: [],
           blocks: [],
           entities: [],
           tileEntities: [],
@@ -193,6 +291,9 @@ function stubInvoke(overrides: Record<string, unknown> = {}) {
           distinctStates: 0,
         };
       case "list_block_versions":
+        return [];
+      case "list_blocks":
+        // 替换窗口打开时会取全量方块填右侧列表；默认给空，需要的用例自己覆盖
         return [];
       case "base_db_status":
         // 库里为空会触发版本库弹窗自动打开，污染所有不相关用例；
@@ -247,10 +348,12 @@ beforeEach(() => {
   // 那个「读不到主题」的替身会泄漏到后面的用例里（实测泄漏了 5 条告警）
   mockGetCurrentWindow.mockReset();
   mockGetCurrentWindow.mockImplementation(() => fakeWindow());
+  stubInvoke();
   // 提示的调用记录逐个用例清空，避免上一条用例的提示被本条读到
   messageSuccess.mockClear();
   messageWarning.mockClear();
   messageError.mockClear();
+  messageInfo.mockClear();
   document.body.innerHTML = "";
   document.body.removeAttribute("arco-theme");
 });
@@ -272,7 +375,7 @@ describe("界面外壳", () => {
 
     const labels = (sel: string) =>
       w.findAll(`${sel} button`).map((b) => b.text().trim());
-    expect(labels(".sidebar__ops").join(" "), "投影列表区应有重复文件筛查").toContain(
+    expect(labels(".file-manager__ops").join(" "), "投影列表区应有重复文件筛查").toContain(
       "重复文件筛查",
     );
 
@@ -289,11 +392,11 @@ describe("界面外壳", () => {
     await flushPromises();
     const buttons = w.findAll("button");
     const find = (label: string) => buttons.find((b) => b.text().includes(label));
-    // 方块替换与版本转换都以「选中的投影文件」为前提。它们现在分别放在
-    // 方块列表与投影信息区，而那两块在无选中时整块不渲染，入口自然不可达
-    // ——比「可见但禁用」更彻底，用户不会去点一个点了报错的按钮。
-    expect(find("方块替换"), "无选中时不应出现方块替换").toBeUndefined();
+    // 版本转换与方块列表都以「选中的投影文件」为前提，而那两块在无选中时
+    // 整块不渲染，入口自然不可达——比「可见但禁用」更彻底，用户不会去点
+    // 一个点了报错的按钮。方块替换的入口在方块表的每一行里，表不在就没有入口。
     expect(find("版本转换"), "无选中时不应出现版本转换").toBeUndefined();
+    expect(w.find(".block-table").exists(), "无选中时不应渲染方块表").toBe(false);
     // 与选中项无关的入口应始终可用
     expect(find("添加目录")?.attributes("disabled")).toBeUndefined();
     expect(find("备份与日志")?.attributes("disabled")).toBeUndefined();
@@ -304,7 +407,7 @@ describe("界面外壳", () => {
     const w = mountApp();
     // 页签只在选中文件后渲染；未选中时必须有明确的引导文案，
     // 否则用户面对的是一个不知从何下手的界面
-    expect(w.text()).toContain("选择一个投影文件以查看详情");
+    expect(w.text()).toContain("点击「添加目录」选择投影所在目录");
     w.unmount();
   });
 
@@ -340,7 +443,7 @@ describe("主要操作流程", () => {
     // ---- 选中并真的编辑、保存 ----
     // 之前这条测试只验证到「列表显示了文件」，与标题里承诺的
     // 「可编辑元数据」并不相符：编辑框、保存按钮、写回的参数都没被检查。
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
 
     // 元数据输入框应带出文件里的现有值
@@ -401,7 +504,7 @@ describe("主要操作流程", () => {
     const w = mountApp();
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
 
     const order: string[] = [];
@@ -468,7 +571,7 @@ describe("主要操作流程", () => {
     const w = mountApp();
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
 
     // 第一次写元数据失败；改名成功
@@ -540,7 +643,7 @@ describe("主要操作流程", () => {
     const w = mountApp();
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
 
     mockInvoke.mockImplementation((async (cmd: string) => {
@@ -591,7 +694,7 @@ describe("主要操作流程", () => {
     const w = mountApp();
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
 
     const nameInput = w.findAll("input").find(
@@ -616,9 +719,9 @@ describe("主要操作流程", () => {
     await flushPromises();
 
     // 点列表里的文件行使其成为选中项
-    const row = w.findAll("tr").find((r) => r.text().includes("测试.litematic"));
+    const row = w.findAll(".schematic-card").find((r) => r.text().includes("测试.litematic"));
     expect(row, "应能找到该文件所在的行").toBeTruthy();
-    await row!.trigger("click");
+    await row!.trigger("dblclick");
     await flushPromises();
 
     const text = w.text();
@@ -628,87 +731,90 @@ describe("主要操作流程", () => {
     w.unmount();
   });
 
-  it("扫描到文件后「方块替换」「版本转换」变为可用", async () => {
-    stubInvoke();
-    mockOpen.mockResolvedValue("/p");
-    const w = mountApp();
-    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
-    await flushPromises();
-
-    const row = w.findAll("tr").find((r) => r.text().includes("测试.litematic"));
-    await row!.trigger("click");
-    await flushPromises();
-
-    const btn = (label: string) => w.findAll("button").find((b) => b.text().includes(label));
-    expect(btn("方块替换")?.attributes("disabled"), "选中后应可用").toBeUndefined();
-    expect(btn("版本转换")?.attributes("disabled"), "选中后应可用").toBeUndefined();
+  it("选中文件后，方块表的每一行都有替换入口，版本转换变为可用", async () => {
+    // 替换的入口跟着它作用的那一行走：表里的每一行各带一个「替换」，
+    // 不必先选中某一行再去别处找按钮。
+    const w = await mountWithBlocks([
+      { name: "minecraft:stone", state: "minecraft:stone", count: 3, zhName: "石头", enName: "Stone" },
+      { name: "minecraft:dirt", state: "minecraft:dirt", count: 2, zhName: "泥土", enName: "Dirt" },
+    ]);
+    expect(
+      w.findAll(".block-table tbody tr .block-act").length,
+      "每一行都应有替换入口",
+    ).toBe(2);
+    const convert = w.findAll("button").find((b) => b.text().includes("版本转换"));
+    expect(convert?.attributes("disabled"), "选中后应可用").toBeUndefined();
     w.unmount();
   });
 
   it("方块替换里源方块也显示中文名", async () => {
-    // 从「方块」页签点行填入的是方块 ID，只有 ID 时用户无法确认自己点中的
-    // 到底是哪一个方块，因此源方块要与目标方块一样显示中文名。
-    stubInvoke();
-    mockOpen.mockResolvedValue("/p");
-    const w = mountApp();
-    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
-    await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
-    await flushPromises();
+    // 源方块来自「方块」页签点的那一行。那一行的名字当场就有，
+    // 不必再查一次库；改名或换库后仍要能查到，因此也接受来自检索的结果。
+    const w = await mountWithBlocks([
+      {
+        name: "minecraft:oak_stairs",
+        state: "minecraft:oak_stairs[facing=east]",
+        count: 4,
+        zhName: "橡木楼梯",
+        enName: "Oak Stairs",
+      },
+    ]);
+    await clickReplaceOnRow(w);
 
-    mockInvoke.mockImplementation((async (cmd: string) => {
-      if (cmd === "search_blocks") {
-        // 近邻放在**第一个**：这样「取第一条命中」的错误实现会显示错的中文名，
-        // 断言才真的在检验「按名字精确匹配」而不是碰巧对上
-        return [
-          { name: "minecraft:oak_planks", zh: "橡木木板", en: "Oak Planks", versions: [] },
-          { name: "minecraft:oak_stairs", zh: "橡木楼梯", en: "Oak Stairs", versions: [] },
-        ];
-      }
-      return [];
-    }) as never);
-
-    await w.findAll("button").find((b) => b.text().includes("方块替换"))!.trigger("click");
-    await flushPromises();
-
-    // 弹窗内容被 Teleport 到 body，不在组件的渲染树里，因此直接查 document
-    const fromInput = document.querySelector<HTMLInputElement>(
-      'input[placeholder="例如 minecraft:oak_stairs"]',
-    );
-    expect(fromInput, "应能定位到源方块输入框").toBeTruthy();
-    fromInput!.value = "minecraft:oak_stairs";
-    fromInput!.dispatchEvent(new Event("input", { bubbles: true }));
-    await flushPromises();
-
-    // 中文名是防抖查出来的，等一个真实的时间片让它落地
-    await new Promise((r) => setTimeout(r, 300));
-    await flushPromises();
-
-    const text = document.body.textContent ?? "";
-    expect(text, "应显示源方块的中文名").toContain("橡木楼梯");
-    expect(text, "不能把模糊匹配到的近邻当成源方块").not.toContain("橡木木板");
+    expect(document.body.textContent, "应显示源方块的中文名").toContain("橡木楼梯");
+    // 名字只应显示一次，且不该多打一条检索命令去查它已经知道的名字
+    expect(
+      mockInvoke.mock.calls.filter((c) => c[0] === "search_blocks").length,
+      "点的那一行已经带名字，不应再查一次库",
+    ).toBe(0);
     w.unmount();
   });
 
-  it("源方块 ID 在方块库里查不到时明确说明，而不是显示空白", async () => {
-    stubInvoke();
-    mockOpen.mockResolvedValue("/p");
-    const w = mountApp();
-    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
-    await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
-    await flushPromises();
-
-    mockInvoke.mockImplementation((async () => []) as never);
-    await w.findAll("button").find((b) => b.text().includes("方块替换"))!.trigger("click");
-    await flushPromises();
-
-    const fromInput = document.querySelector<HTMLInputElement>(
-      'input[placeholder="例如 minecraft:oak_stairs"]',
+  it("源方块在行上没有名字时，仍会按 ID 去库里查一次", async () => {
+    // 该版本语言表里没有这个方块时，行上带来的名字是空的。
+    // 这时不能把「空」记成「已查过」，否则界面直接显示未找到，
+    // 而库里其实有名字（例如叠加包的补丁只补了名字）
+    const w = await mountWithBlocks(
+      [
+        {
+          name: "minecraft:oak_log",
+          state: "minecraft:oak_log[axis=y]",
+          count: 1,
+          zhName: "",
+          enName: "",
+        },
+      ],
+      {
+        search_blocks: [
+          { name: "minecraft:oak_log", zh: "橡木原木", en: "Oak Log", versions: [] },
+        ],
+        list_blocks: [],
+      },
     );
-    fromInput!.value = "minecraft:not_a_real_block";
-    fromInput!.dispatchEvent(new Event("input", { bubbles: true }));
+    await clickReplaceOnRow(w);
+    await new Promise((r) => setTimeout(r, 300));
     await flushPromises();
+
+    expect(document.body.textContent, "应显示从库里查到的名字").toContain("橡木原木");
+    expect(
+      mockInvoke.mock.calls.some((c) => c[0] === "search_blocks"),
+      "名字为空时应真的发起一次查询",
+    ).toBe(true);
+    w.unmount();
+  });
+
+  it("源方块在方块库里查不到名字时明确说明，而不是显示空白", async () => {
+    // 行上带来的名字为空（该版本语言表里没有这个方块），随后按 ID 补查也查不到
+    const w = await mountWithBlocks([
+      {
+        name: "minecraft:not_a_real_block",
+        state: "minecraft:not_a_real_block",
+        count: 1,
+        zhName: "",
+        enName: "",
+      },
+    ]);
+    await clickReplaceOnRow(w);
     await new Promise((r) => setTimeout(r, 300));
     await flushPromises();
 
@@ -723,6 +829,9 @@ describe("主要操作流程", () => {
  *
  * 与版本转换窗口同一套做法——左栏填规则、右栏搜索并点选方块，凡是出现
  * 方块 ID 的地方都一并给出中文名。
+ *
+ * 源方块不可改（#53）：替换的入口是「方块」页签里某一行的替换按钮，
+ * 规则作用于哪一行在点按钮那一刻就定了。允许改会让人以为改的是那一行。
  */
 describe("方块替换窗口（方块列表与中文名）", () => {
   const HITS = [
@@ -730,31 +839,40 @@ describe("方块替换窗口（方块列表与中文名）", () => {
     { name: "minecraft:cobblestone", zh: "圆石", en: "Cobblestone", versions: [] },
   ];
 
-  function byPlaceholder(ph: string): HTMLInputElement | null {
-    return document.querySelector<HTMLInputElement>(`input[placeholder="${ph}"]`);
+  /** 方块表里的一行：石头。用它当作替换源。 */
+  const ROWS: BlockCount[] = [
+    { name: "minecraft:stone", state: "minecraft:stone", count: 10, zhName: "石头", enName: "Stone" },
+  ];
+
+  /** 左栏四个输入框：按稳定的类名定位。
+   *
+   * 不用 placeholder：两个只读框都没有 placeholder，而目标方块的 placeholder
+   * 是文案、会随语言变化；类名不会因为文案改动而失效。
+   */
+  function field(cls: string): HTMLInputElement {
+    const el = document.querySelector<HTMLInputElement>(`.repl-window ${cls} input`);
+    if (!el) throw new Error(`找不到输入框 .${cls}`);
+    return el;
   }
+
+  const fromName = () => field(".repl-from-name");
+  const fromProps = () => field(".repl-from-props");
+  const toName = () => field(".repl-to-name");
+  const toProps = () => field(".repl-to-props");
 
   function pickItems(): HTMLElement[] {
     return [...document.querySelectorAll(".repl-pick__item")] as HTMLElement[];
   }
 
-  /** 打开替换窗口，并让方块检索返回固定的两条结果 */
+  /** 打开替换窗口（点方块表第一行的替换按钮），并让方块检索返回固定的两条结果 */
   async function openReplaceWindow() {
-    stubInvoke();
-    mockOpen.mockResolvedValue("/p");
-    const w = mountApp();
-    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
-    await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
-    await flushPromises();
-
+    const w = await mountWithBlocks(ROWS);
     mockInvoke.mockImplementation((async (cmd: string) => {
       if (cmd === "search_blocks") return HITS;
+      if (cmd === "list_blocks") return HITS;
       return [];
     }) as never);
-
-    await w.findAll("button").find((b) => b.text().includes("方块替换"))!.trigger("click");
-    await flushPromises();
+    await clickReplaceOnRow(w);
     return w;
   }
 
@@ -774,100 +892,69 @@ describe("方块替换窗口（方块列表与中文名）", () => {
     expect(items[0].textContent, "列表项应显示中文名").toContain("石头");
     expect(items[0].textContent, "列表项应显示方块 ID").toContain("minecraft:stone");
 
-    // 默认填「目标方块」：替换时更常选的是「换成什么」
     items[0].click();
     await flushPromises();
 
-    expect(byPlaceholder("例如 minecraft:stone")!.value, "应填入目标方块").toBe(
-      "minecraft:stone",
-    );
+    expect(toName().value, "应填入目标方块").toBe("minecraft:stone");
     expect(document.body.textContent, "目标方块应给出显示名称").toContain("显示名称：石头");
     w.unmount();
   });
 
-  it("点过源方块输入框后，点选填的是源方块，并清掉属性限定", async () => {
-    // 属性限定是上一个方块特有的，换源方块时留着它会让规则一个都匹配不上，
-    // 而界面看上去「明明填好了」
+  it("源方块与源属性限定是只读的，点选方块只填目标", async () => {
+    // 源方块由「方块」页签里点的那一行决定。若它可改，用户会以为改的是那一行，
+    // 实际却按另一条规则执行。
     const w = await openReplaceWindow();
 
-    const fromInput = byPlaceholder("例如 minecraft:oak_stairs")!;
-    fromInput.value = "minecraft:oak_stairs";
-    fromInput.dispatchEvent(new Event("input", { bubbles: true }));
-    const propsInput = byPlaceholder("例如 facing=east,half=top")!;
-    propsInput.value = "facing=east";
-    propsInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flushPromises();
-
-    // 点一下源方块输入框：右侧列表接下来就该填这一栏
-    fromInput.dispatchEvent(new Event("focus", { bubbles: true }));
-    await flushPromises();
-    expect(
-      document.querySelector(".repl-split__pane--pick .hint-dim")!.textContent,
-      "右侧应说明接下来填的是源方块",
-    ).toContain("源方块");
+    const fromInput = fromName();
+    const propsInput = fromProps();
+    expect(fromInput.value, "源方块应已按点的那一行填好").toBe("minecraft:stone");
+    expect(fromInput.readOnly, "源方块输入框应只读").toBe(true);
+    expect(propsInput.readOnly, "源属性限定输入框应只读").toBe(true);
 
     await searchBlocks("cobble");
-    // 检索是模糊的，两条结果都会返回；要的圆石在第二条
     const cobble = pickItems().find((i) => (i.textContent ?? "").includes("cobblestone"))!;
     cobble.click();
     await flushPromises();
 
-    expect(fromInput.value, "应填入源方块").toBe("minecraft:cobblestone");
-    expect(propsInput.value, "属性限定应被清空").toBe("");
-    expect(byPlaceholder("例如 minecraft:stone")!.value, "目标方块不该被改").toBe("");
+    expect(toName().value, "点选应填入目标方块").toBe("minecraft:cobblestone");
+    expect(fromInput.value, "点选不应改动源方块").toBe("minecraft:stone");
     w.unmount();
   });
 
-  it("还没填的必填输入框标红，填上后不再标红", async () => {
+  it("还没填目标方块时它标红，填上后不再标红", async () => {
     const w = await openReplaceWindow();
 
+    // 源方块一定已经有值（来自点的那一行），因此只有目标方块该标红
     expect(
       document.querySelectorAll(".repl-block--empty").length,
-      "源方块与目标方块都还没填，两栏都应标红",
-    ).toBe(2);
+      "只有还没填的目标方块标红",
+    ).toBe(1);
 
     await searchBlocks("stone");
     pickItems()[0].click();
     await flushPromises();
 
-    const boxes = [...document.querySelectorAll(".repl-block")] as HTMLElement[];
-    const empty = boxes.filter((b) => b.classList.contains("repl-block--empty"));
-    expect(empty.length, "填好一栏后应只剩另一栏标红").toBe(1);
-    // 剩下标红的那一栏必须是没填的那个，而不是随便剩一个
     expect(
-      (empty[0].querySelector("input") as HTMLInputElement).value,
-      "仍标红的应是还没填的那一栏",
-    ).toBe("");
+      document.querySelectorAll(".repl-block--empty").length,
+      "填上后不应再有标红的输入框",
+    ).toBe(0);
     w.unmount();
   });
 
   it("粘贴带属性的状态串会被拆开，不会把属性当方块名送出去", async () => {
     // 后端契约要求方块名不含属性：带属性的名字会被原样写进投影的调色板，
-    // 游戏读不出来。旧界面用下拉框选方块，取值域天然挡住了这条路；
-    // 现在是自由文本，必须自己拆，且拆法要与「方块」页签点行填入一致。
+    // 游戏读不出来。目标方块仍是自由文本，必须自己拆。
     const w = await openReplaceWindow();
 
-    const toInput = byPlaceholder("例如 minecraft:stone")!;
+    const toInput = toName();
     toInput.value = "minecraft:oak_stairs[facing=east,half=top]";
     toInput.dispatchEvent(new Event("input", { bubbles: true }));
     await flushPromises();
 
     expect(toInput.value, "方块名里不该留方括号").toBe("minecraft:oak_stairs");
-    expect(
-      byPlaceholder("例如 facing=west")!.value,
-      "方括号里的属性应落进「目标属性覆盖」",
-    ).toBe("facing=east,half=top");
-
-    // 源方块同理
-    const fromInput = byPlaceholder("例如 minecraft:oak_stairs")!;
-    fromInput.value = "minecraft:chest[facing=north]";
-    fromInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flushPromises();
-    expect(fromInput.value, "源方块的方块名也不该带属性").toBe("minecraft:chest");
-    expect(
-      byPlaceholder("例如 facing=east,half=top")!.value,
-      "源属性限定应被填入",
-    ).toBe("facing=north");
+    expect(toProps().value, "方括号里的属性应落进「目标属性覆盖」").toBe(
+      "facing=east,half=top",
+    );
     w.unmount();
   });
 
@@ -876,19 +963,17 @@ describe("方块替换窗口（方块列表与中文名）", () => {
     // 那个属性，正是为源方块解决过的「看着填好了、规则却不对」
     const w = await openReplaceWindow();
 
-    const toProps = byPlaceholder("例如 facing=west")!;
-    toProps.value = "facing=west";
-    toProps.dispatchEvent(new Event("input", { bubbles: true }));
+    const propsOverride = toProps();
+    propsOverride.value = "facing=west";
+    propsOverride.dispatchEvent(new Event("input", { bubbles: true }));
     await flushPromises();
 
     await searchBlocks("stone");
     pickItems()[0].click();
     await flushPromises();
 
-    expect(byPlaceholder("例如 minecraft:stone")!.value, "应填入目标方块").toBe(
-      "minecraft:stone",
-    );
-    expect(toProps.value, "目标属性覆盖应被清空").toBe("");
+    expect(toName().value, "应填入目标方块").toBe("minecraft:stone");
+    expect(propsOverride.value, "目标属性覆盖应被清空").toBe("");
     w.unmount();
   });
 
@@ -897,15 +982,12 @@ describe("方块替换窗口（方块列表与中文名）", () => {
     // 留着会让用户以为「按现在填的规则只有这么多个」
     const w = await openReplaceWindow();
     mockInvoke.mockImplementation((async (cmd: string) => {
-      if (cmd === "search_blocks") return HITS;
+      if (cmd === "search_blocks" || cmd === "list_blocks") return HITS;
       if (cmd === "preview_replace") return { replaced: 42 };
       return [];
     }) as never);
 
-    const fromInput = byPlaceholder("例如 minecraft:oak_stairs")!;
-    fromInput.value = "minecraft:oak_stairs";
-    fromInput.dispatchEvent(new Event("input", { bubbles: true }));
-    const toInput = byPlaceholder("例如 minecraft:stone")!;
+    const toInput = toName();
     toInput.value = "minecraft:stone";
     toInput.dispatchEvent(new Event("input", { bubbles: true }));
     await flushPromises();
@@ -927,8 +1009,84 @@ describe("方块替换窗口（方块列表与中文名）", () => {
     );
     w.unmount();
   });
-});
 
+  it("打开窗口即列出方块库的全部方块，无需先输入关键字", async () => {
+    // 替换的目标方块需要一个默认可选范围：只给空列表等于要求用户先知道名字
+    const ALL = [
+      { name: "minecraft:andesite", zh: "安山岩", en: "Andesite", versions: [] },
+      { name: "minecraft:cobblestone", zh: "圆石", en: "Cobblestone", versions: [] },
+      { name: "minecraft:stone", zh: "石头", en: "Stone", versions: [] },
+    ];
+    const w = await mountWithBlocks(ROWS, {
+      list_blocks: ALL,
+      search_blocks: [HITS[0]],
+    });
+    await clickReplaceOnRow(w);
+
+    const calls = mockInvoke.mock.calls.filter((c) => c[0] === "list_blocks");
+    expect(calls.length, "打开窗口应取一次全部方块").toBe(1);
+    expect(pickItems().length, "右侧列表应直接有内容").toBe(3);
+    // 后端按方块 ID 升序给出，前端原样渲染、不重排
+    expect(pickItems().map((i) => i.querySelector(".repl-block__id")?.textContent?.trim().split(" ")[0])).toEqual([
+      "minecraft:andesite",
+      "minecraft:cobblestone",
+      "minecraft:stone",
+    ]);
+
+    // 输入关键字改走检索
+    await searchBlocks("stone");
+    const searchCalls = mockInvoke.mock.calls.filter((c) => c[0] === "search_blocks");
+    expect(searchCalls.length, "输入关键字应走检索").toBeGreaterThan(0);
+    expect(pickItems().length, "列表改为检索结果").toBe(1);
+
+    // 清空关键字回到全量列表，且不必再请求一次
+    await searchBlocks("");
+    expect(pickItems().length, "清空后应回到全量列表").toBe(3);
+    expect(
+      mockInvoke.mock.calls.filter((c) => c[0] === "list_blocks").length,
+      "回填用的是已取到的全量结果，不该重复请求",
+    ).toBe(1);
+    w.unmount();
+  });
+
+  it("全量列表尚未返回时先搜索、再清空，仍能拿回全量列表", async () => {
+    // 打开窗口的全量请求比用户输入慢时，晚到的结果不能把界面搞成空列表：
+    // 清空关键字时若缓存还没就绪，必须重新取一次，而不是显示「库里没有方块」
+    const ALL = [
+      { name: "minecraft:andesite", zh: "安山岩", en: "Andesite", versions: [] },
+      { name: "minecraft:stone", zh: "石头", en: "Stone", versions: [] },
+    ];
+    // 用一个对象装「放行函数」：闭包里赋值，外部读到的类型不会退化
+    const gate: { release?: () => void } = {};
+    let firstCall = true;
+    const w = await mountWithBlocks(ROWS, {
+      // 第一次全量请求挂起，模拟慢响应
+      list_blocks: () => {
+        if (firstCall) {
+          firstCall = false;
+          return new Promise((resolve) => {
+            gate.release = () => resolve(ALL);
+          });
+        }
+        return Promise.resolve(ALL);
+      },
+      search_blocks: [HITS[0]],
+    });
+    await clickReplaceOnRow(w);
+
+    // 用户在全量还没回来时输入关键字并清空
+    await searchBlocks("stone");
+    expect(pickItems().length, "应看到检索结果").toBe(1);
+    await searchBlocks("");
+    // 清空发现缓存未就绪，重新发起全量请求并拿到结果
+    gate.release?.();
+    await flushPromises();
+    await new Promise((r) => setTimeout(r, 50));
+    await flushPromises();
+    expect(pickItems().length, "清空后应补回全量列表，而不是空列表").toBe(2);
+    w.unmount();
+  });
+});
 describe("跟随系统深浅色", () => {
   // Arco 的深色取值挂在 body[arco-theme="dark"] 上。样式表里两套都写好了，
   // 但没人设置这个属性的话深色永远不会生效——系统开了深色，界面仍是白的。
@@ -1011,6 +1169,7 @@ describe("重新扫描后的选中项", () => {
    * 「只处理了返回值的第一种形态」这类缺陷。
    */
   async function addDir(w: ReturnType<typeof mountApp>, ...dirs: string[]) {
+    await activateFiles(w);
     mockOpen.mockResolvedValue(dirs);
     const btn = w.findAll("button").find((b) => b.text().includes("添加目录"));
     expect(btn, "应能定位到「添加目录」按钮").toBeTruthy();
@@ -1018,10 +1177,7 @@ describe("重新扫描后的选中项", () => {
     await flushPromises();
   }
 
-  it("移除目录后，不再显示该目录的选中项", async () => {
-    // 这条防的是一个真实缺陷：移除目录时只改列表而不处理选中项，
-    // 于是详情面板继续显示**已不在列表中**的文件，「保存元数据」会把改动
-    // 写到那个路径上，而用户在列表里选中不了它，看不出改动写到了哪里。
+  it("移除目录只移除卡片，保留独立的编辑标签", async () => {
     const other: SchematicSummary = {
       ...summary,
       path: "/q/另一个.litematic",
@@ -1034,9 +1190,9 @@ describe("重新扫描后的选中项", () => {
     const w = mountApp();
     await addDir(w, "/p");
     // 选中第一个目录里的文件
-    const row = w.findAll("tr").find((r) => r.text().includes("测试.litematic"));
+    const row = w.findAll(".schematic-card").find((r) => r.text().includes("测试.litematic"));
     expect(row, "应能找到该文件所在的行").toBeTruthy();
-    await row!.trigger("click");
+    await row!.trigger("dblclick");
     await flushPromises();
     expect(w.text(), "选中后应出现详情页签").toContain("信息");
 
@@ -1045,8 +1201,9 @@ describe("重新扫描后的选中项", () => {
       scan_litematics: { items: [other], skippedDirs: 0, skippedPaths: [] },
     });
     await addDir(w, "/q");
-    // 加载多个目录时两边的文件都要在：不是「換目录」而是「追加目录」
+    // 目录树保留两个根目录，选择新根目录后显示其中的卡片
     expect(w.text(), "先前加载的目录应保留").toContain("测试.litematic");
+    await selectRoot(w, "/q");
     expect(w.text(), "新加载的目录也应显示").toContain("另一个.litematic");
 
     // 通过真实界面移除：点开「已加载目录」下拉，点第一项的「移除」按钮。
@@ -1065,18 +1222,14 @@ describe("重新扫描后的选中项", () => {
     removeBtn!.click();
     await flushPromises();
 
-    expect(w.text(), "被移除目录的文件不应还留在列表里").not.toContain("测试.litematic");
-    expect(w.text(), "另一个目录的文件应保留").toContain("另一个.litematic");
     expect(
-      w.text(),
-      "选中项已不在列表中，应回到空状态而不是继续显示旧文件的详情",
-    ).toContain("选择一个投影文件以查看详情");
-
-    // 依赖选中项的入口必须同步消失，否则点下去会作用到旧路径。
-    // 它们分别放在方块列表与投影信息区，选中项没了这两块就不渲染。
-    const btn = (label: string) => w.findAll("button").find((b) => b.text().includes(label));
-    expect(btn("方块替换"), "移除后不应再有方块替换入口").toBeUndefined();
-    expect(btn("版本转换"), "移除后不应再有版本转换入口").toBeUndefined();
+      w.findAll(".schematic-card").some((card) => card.text().includes("测试.litematic")),
+      "被移除目录的卡片不应还留在列表里",
+    ).toBe(false);
+    expect(w.text(), "另一个目录的文件应保留").toContain("另一个.litematic");
+    await activateEditor(w, "测试.litematic");
+    expect(w.find(".editor-detail").exists(), "已打开文件的编辑器应保留").toBe(true);
+    expect(w.findAll("button").some((b) => b.text().includes("版本转换")), "编辑功能仍应可用").toBe(true);
     w.unmount();
   });
 
@@ -1086,16 +1239,17 @@ describe("重新扫描后的选中项", () => {
     stubInvoke();
     const w = mountApp();
     await addDir(w, "/p");
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
     expect(w.text()).toContain("信息");
 
     await addDir(w, "/p");
+    await activateEditor(w, "测试.litematic");
 
     expect(w.text(), "同一目录重扫后应仍显示该文件").toContain("测试.litematic");
     expect(w.text(), "选中项应保留").toContain("信息");
     const btn = (label: string) => w.findAll("button").find((b) => b.text().includes(label));
-    expect(btn("方块替换")?.attributes("disabled"), "选中项保留，按钮应可用").toBeUndefined();
+    expect(btn("版本转换")?.attributes("disabled"), "选中项保留，按钮应可用").toBeUndefined();
     w.unmount();
   });
 });
@@ -1241,7 +1395,7 @@ describe("重复文件筛查（内联在主界面）", () => {
     const w = await mountWithDir();
     await runScan(w);
 
-    const rows = Array.from(document.querySelectorAll("tbody tr"));
+    const rows = Array.from(document.querySelectorAll(".schematic-card"));
     const dupRows = rows.filter((r) =>
       Array.from(r.classList).some((c) => c.startsWith("row-dup-")),
     );
@@ -1260,7 +1414,7 @@ describe("重复文件筛查（内联在主界面）", () => {
     const w = await mountWithDir();
     await runScan(w);
 
-    const chips = Array.from(document.querySelectorAll("tbody tr .dup-chip"));
+    const chips = Array.from(document.querySelectorAll(".schematic-card .dup-chip"));
     expect(chips.length, "三条重复都应带组号").toBe(3);
     expect(chips.map((c) => c.textContent), "组号应从 1 起").toEqual(["1", "1", "1"]);
     expect(
@@ -1277,7 +1431,7 @@ describe("重复文件筛查（内联在主界面）", () => {
     const w = await mountWithDir();
     await runScan(w);
 
-    const texts = Array.from(document.querySelectorAll("tbody tr"))
+    const texts = Array.from(document.querySelectorAll(".schematic-card"))
       .map((r) => r.textContent ?? "")
       .filter((t) => t.includes(".litematic"));
     expect(texts.length, "四条记录都应在列表里").toBe(4);
@@ -1294,17 +1448,17 @@ describe("重复文件筛查（内联在主界面）", () => {
     const w = await mountWithDir();
     await runScan(w);
 
-    const marked = Array.from(document.querySelectorAll("tbody tr")).filter((r) =>
+    const marked = Array.from(document.querySelectorAll(".schematic-card")).filter((r) =>
       r.classList.contains("row-dup-suspect"),
     );
     expect(marked.length, "两条疑似都应被标出").toBe(2);
     expect(
-      document.querySelectorAll("tbody tr .dup-chip--suspect").length,
+      document.querySelectorAll(".schematic-card .dup-chip--suspect").length,
       "疑似行应有「疑似」标记",
     ).toBe(2);
     // 关键：疑似只是提示，不能替用户勾上待删
     expect(document.body.textContent, "疑似重复不应被默认勾选").toContain("已选 0");
-    const bar = w.find(".sidebar__dups");
+    const bar = w.find(".file-manager__dups");
     expect(bar.text(), "汇总条应说明有疑似重复").toContain("疑似");
     w.unmount();
   });
@@ -1326,7 +1480,7 @@ describe("重复文件筛查（内联在主界面）", () => {
     await runScan(w);
 
     expect(
-      document.querySelectorAll("tbody tr .dup-chip--suspect").length,
+      document.querySelectorAll(".schematic-card .dup-chip--suspect").length,
       "同一个文件不该被标成疑似重复",
     ).toBe(0);
     expect(document.body.textContent ?? "", "不应报告疑似重复组").not.toContain("疑似重复");
@@ -1355,7 +1509,7 @@ describe("重复文件筛查（内联在主界面）", () => {
     const w = await mountWithDir();
     await runScan(w);
 
-    const suspect = Array.from(document.querySelectorAll("tbody tr")).filter((r) =>
+    const suspect = Array.from(document.querySelectorAll(".schematic-card")).filter((r) =>
       r.classList.contains("row-dup-suspect"),
     );
     expect(suspect.length, "c 应被标为疑似重复").toBe(1);
@@ -1396,7 +1550,7 @@ describe("重复文件筛查（内联在主界面）", () => {
     const w = await mountWithDir();
     await runScan(w);
 
-    const bar = w.find(".sidebar__dups");
+    const bar = w.find(".file-manager__dups");
     expect(bar.exists(), "应显示内联汇总条（不是弹窗）").toBe(true);
     expect(bar.text(), "应说明发现几组").toContain("1");
     expect(bar.text(), "应说明涉及几个文件").toContain("3");
@@ -1410,7 +1564,7 @@ describe("重复文件筛查（内联在主界面）", () => {
     await clear!.trigger("click");
     await flushPromises();
 
-    const stillDup = Array.from(document.querySelectorAll("tbody tr")).filter((r) =>
+    const stillDup = Array.from(document.querySelectorAll(".schematic-card")).filter((r) =>
       Array.from(r.classList).some((c) => c.startsWith("row-dup-")),
     );
     expect(stillDup.length, "清除后不应再有重复标记").toBe(0);
@@ -1425,7 +1579,7 @@ describe("重复文件筛查（内联在主界面）", () => {
     expect(toggle, "应有目录下拉").toBeTruthy();
     await runScan(w);
     // 至少不应崩溃；有目录时会出汇总条，无目录时提示
-    expect(w.find(".sidebar").exists()).toBe(true);
+    expect(w.find(".file-manager").exists()).toBe(true);
     w.unmount();
   });
 });
@@ -1487,7 +1641,7 @@ describe("版本转换", () => {
     mockOpen.mockResolvedValue("/p");
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
 
     await w.findAll("button").find((b) => b.text().includes("版本转换"))!.trigger("click");
@@ -1640,7 +1794,7 @@ describe("版本转换窗口（中文名与替代品点选）", () => {
     mockOpen.mockResolvedValue("/p");
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
 
     await w.findAll("button").find((b) => b.text().includes("版本转换"))!.trigger("click");
@@ -1763,6 +1917,7 @@ describe("版本转换窗口（中文名与替代品点选）", () => {
     ) as HTMLElement | undefined;
     expect(nowReady!.textContent, "补完后不再显示「点击下载」").not.toContain("点击下载");
     // 版本库那边也要能看到它
+    await activateFiles(w);
     await w.findAll("button").find((b) => b.text().includes("版本库"))!.trigger("click");
     await flushPromises();
     expect(document.body.textContent, "版本库里应出现 1.21.11").toContain("1.21.11");
@@ -1977,138 +2132,6 @@ describe("版本转换窗口（中文名与替代品点选）", () => {
  * 这类「看得见的布局」问题（宽度不可调、拖动没反应、窄窗口下右侧被挤没）
  * 都不会让构建失败，也不会让别的测试失败，因此单独覆盖。
  */
-describe("目录栏宽度调整", () => {
-  /** 取拖动条的当前宽度（由组件内联样式设置） */
-  function sidebarWidth(w: ReturnType<typeof mountApp>): number {
-    const el = w.find(".sidebar").element as HTMLElement;
-    return parseFloat(el.style.width || "0");
-  }
-
-  it("默认宽度容得下各列，且不把右侧挤没", async () => {
-    const w = mountApp();
-    await flushPromises();
-    const def = sidebarWidth(w);
-    expect(def, "默认宽度应够放下全部列").toBeGreaterThanOrEqual(320);
-    expect(def, "默认宽度不应把右侧挤没").toBeLessThanOrEqual(1200);
-
-    // 关键：各列默认宽度之和不能超过目录栏默认宽度，
-    // 否则最后一列会被挤出可视区——文件名加宽本意是「显示更多」，
-    // 挤出末列就与目的相反。这里按 colgroup 的实际宽度求和核对。
-    const cols = w.findAll(".sidebar colgroup col");
-    const sum = cols.reduce((acc, c) => {
-      const m = /width:\s*([\d.]+)px/.exec(c.attributes("style") ?? "");
-      return acc + (m ? Number(m[1]) : 0);
-    }, 0);
-    expect(sum, `各列合计 ${sum}px 应不超过目录栏默认宽度 ${def}px`).toBeLessThanOrEqual(def);
-
-    const splitter = w.find(".splitter");
-    expect(splitter.exists(), "应有拖动条").toBe(true);
-    // 可聚焦与 role 是键盘可用的前提
-    expect(splitter.attributes("role")).toBe("separator");
-    expect(splitter.attributes("tabindex")).toBe("0");
-    w.unmount();
-  });
-
-  it("拖动会改变宽度，且 pointerup 之后不再跟随", async () => {
-    const w = mountApp();
-    await flushPromises();
-    const before = sidebarWidth(w);
-
-    const splitter = w.find(".splitter").element as HTMLElement;
-    // 真实触发 pointerdown，再由 window 收 pointermove：
-    // 实现把监听挂在 window 上，正是为了让指针移出窄条后仍能继续拖动
-    splitter.dispatchEvent(
-      new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: before }),
-    );
-    window.dispatchEvent(new PointerEvent("pointermove", { clientX: before + 120 }));
-    await flushPromises();
-    const during = sidebarWidth(w);
-    expect(during, "拖动应加宽目录栏").toBeGreaterThan(before);
-
-    window.dispatchEvent(new PointerEvent("pointerup", { clientX: before + 120 }));
-    await flushPromises();
-    const settled = sidebarWidth(w);
-
-    // 松开之后再移动不应继续改宽度——否则拖动条会「粘住」
-    window.dispatchEvent(new PointerEvent("pointermove", { clientX: before + 400 }));
-    await flushPromises();
-    expect(sidebarWidth(w), "pointerup 之后不能再跟随指针").toBe(settled);
-    w.unmount();
-  });
-
-  it("宽度被夹在上下限内，不会拖到不可用", async () => {
-    const w = mountApp();
-    await flushPromises();
-    const splitter = w.find(".splitter").element as HTMLElement;
-
-    const dragTo = async (clientX: number) => {
-      splitter.dispatchEvent(
-        new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: 0 }),
-      );
-      window.dispatchEvent(new PointerEvent("pointermove", { clientX }));
-      window.dispatchEvent(new PointerEvent("pointerup", { clientX }));
-      await flushPromises();
-    };
-
-    // 往左拖到负数：不能出现 0 或负宽度
-    await dragTo(-500);
-    expect(sidebarWidth(w), "向左拖到底应停在下限").toBeGreaterThanOrEqual(320);
-
-    // 往右拖到很远：不能把右侧详情区挤没
-    await dragTo(99999);
-    expect(sidebarWidth(w), "向右拖到底应停在上限之内").toBeLessThanOrEqual(1200);
-    w.unmount();
-  });
-
-  it("键盘左右方向键可调整宽度", async () => {
-    const w = mountApp();
-    await flushPromises();
-    const splitter = w.find(".splitter");
-    const before = sidebarWidth(w);
-
-    await splitter.trigger("keydown", { key: "ArrowRight" });
-    await flushPromises();
-    expect(sidebarWidth(w), "右方向键应加宽").toBeGreaterThan(before);
-
-    const widened = sidebarWidth(w);
-    await splitter.trigger("keydown", { key: "ArrowLeft" });
-    await flushPromises();
-    expect(sidebarWidth(w), "左方向键应收窄").toBeLessThan(widened);
-
-    await splitter.trigger("keydown", { key: "Home" });
-    await flushPromises();
-    expect(sidebarWidth(w), "Home 应回到最窄").toBe(320);
-    w.unmount();
-  });
-
-  it("双击拖动条在默认宽度与最窄宽度之间切换", async () => {
-    const w = mountApp();
-    await flushPromises();
-    const splitter = w.find(".splitter");
-    // 默认宽度由列宽合计决定，因此从当前值取而不是写死数字：
-    // 写死会在调整列宽后立刻失效，而那并不代表行为出错。
-    const def = sidebarWidth(w);
-    expect(def, "默认宽度应是合理值").toBeGreaterThanOrEqual(320);
-
-    await splitter.trigger("dblclick");
-    await flushPromises();
-    expect(sidebarWidth(w), "双击应收起到最窄").toBe(320);
-
-    await splitter.trigger("dblclick");
-    await flushPromises();
-    expect(sidebarWidth(w), "再次双击应回到默认宽度").toBe(def);
-    w.unmount();
-  });
-});
-
-
-
-/** 目录栏的多选与文件操作按钮。
- *
- * 这些按钮都只在「有勾选」时才可用，且必须把勾选的路径正确传给后端。
- * 传错路径（例如传成空数组、或传了未勾选的行）会造成误删/误复制，
- * 属于不能靠肉眼发现的错误，因此逐项核对发给后端的参数。
- */
 describe("目录栏多选与文件操作", () => {
   /** 挂载并让列表出现若干行 */
   async function mountWithRows(n = 3) {
@@ -2128,7 +2151,7 @@ describe("目录栏多选与文件操作", () => {
 
   /** 取某一行左侧的勾选框 */
   function rowCheckbox(w: ReturnType<typeof mountApp>, i: number) {
-    return w.findAll(".arco-table-body tbody tr")[i].find("input[type=checkbox]");
+    return w.findAll(".schematic-card")[i].find("input[type=checkbox]");
   }
 
   function btn(w: ReturnType<typeof mountApp>, label: string) {
@@ -2155,26 +2178,27 @@ describe("目录栏多选与文件操作", () => {
 
   it("全选选中当前列表全部，反选翻转，清除清空", async () => {
     const w = await mountWithRows(3);
-    expect(w.find(".sidebar__checks").text()).toContain("已选 0 / 3");
+    expect(w.find(".file-manager__checks").text()).toContain("已选 0 / 3");
 
     await btn(w, "全选")!.trigger("click");
     await flushPromises();
-    expect(w.find(".sidebar__checks").text()).toContain("已选 3 / 3");
+    expect(w.find(".file-manager__checks").text()).toContain("已选 3 / 3");
 
     await btn(w, "反选")!.trigger("click");
     await flushPromises();
-    expect(w.find(".sidebar__checks").text(), "全部选中后反选应变成全不选").toContain("已选 0 / 3");
+    expect(w.find(".file-manager__checks").text(), "全部选中后反选应变成全不选").toContain("已选 0 / 3");
 
     // 再全选后清除
     await btn(w, "全选")!.trigger("click");
     await flushPromises();
     await btn(w, "清除")!.trigger("click");
     await flushPromises();
-    expect(w.find(".sidebar__checks").text()).toContain("已选 0 / 3");
+    expect(w.find(".file-manager__checks").text()).toContain("已选 0 / 3");
     w.unmount();
   });
 
   it("删除只把勾选的路径发给后端", async () => {
+    const confirm = vi.spyOn(Modal, "confirm").mockResolvedValue({} as never);
     const w = await mountWithRows(3);
     await rowCheckbox(w, 1).setValue(true);
     await flushPromises();
@@ -2190,6 +2214,7 @@ describe("目录栏多选与文件操作", () => {
     expect((call![1] as { paths: string[] }).paths, "只应传勾选的那一个路径").toEqual([
       "/p/f1.litematic",
     ]);
+    confirm.mockRestore();
     w.unmount();
   });
 
@@ -2216,7 +2241,7 @@ describe("目录栏多选与文件操作", () => {
     // 若 pointerdown 就把菜单摘掉，click 永远落不到菜单项上。
     // 只 trigger("click") 的写法测不出这个缺陷——那正是它一直漏掉的原因。
     const w = await mountWithRows(2);
-    const row = w.findAll(".arco-table-body tbody tr")[0];
+    const row = w.findAll(".schematic-card")[0];
     await row.trigger("contextmenu", { clientX: 120, clientY: 200 });
     await flushPromises();
 
@@ -2250,7 +2275,7 @@ describe("目录栏多选与文件操作", () => {
   it("点右键菜单以外的地方仍会关闭菜单", async () => {
     // 上一条要求菜单内点击不关闭；这条保证「点别处关闭」没有被一起改坏
     const w = await mountWithRows(2);
-    const row = w.findAll(".arco-table-body tbody tr")[0];
+    const row = w.findAll(".schematic-card")[0];
     await row.trigger("contextmenu", { clientX: 120, clientY: 200 });
     await flushPromises();
     expect(w.find(".ctx-menu__item").exists()).toBe(true);
@@ -2284,17 +2309,17 @@ describe("目录栏多选与文件操作", () => {
     // 搜索只留下 f1
     await w.find("input[type=search], .arco-input-search input").setValue("f1");
     await flushPromises();
-    expect(w.find(".sidebar__checks").text(), "过滤后总数应变为 1").toContain("/ 1");
+    expect(w.find(".file-manager__checks").text(), "过滤后总数应变为 1").toContain("/ 1");
 
     await btn(w, "全选")!.trigger("click");
     await flushPromises();
-    expect(w.find(".sidebar__checks").text()).toContain("已选 1 / 1");
+    expect(w.find(".file-manager__checks").text()).toContain("已选 1 / 1");
 
     // 清空搜索后，f0/f2 不应被顺带选中
     await w.find("input[type=search], .arco-input-search input").setValue("");
     await flushPromises();
     expect(
-      w.find(".sidebar__checks").text(),
+      w.find(".file-manager__checks").text(),
       "全选只应选中当时的可见项，清空搜索后不应把之前不可见的一起算上",
     ).toContain("已选 1 / 3");
     w.unmount();
@@ -2309,10 +2334,20 @@ describe("目录栏多选与文件操作", () => {
  */
 describe("多目录与列宽复位", () => {
   async function addDirs(w: ReturnType<typeof mountApp>, ...dirs: string[]) {
+    await activateFiles(w);
     mockOpen.mockResolvedValue(dirs);
     const btn = w.findAll("button").find((b) => b.text().includes("添加目录"));
     await btn!.trigger("click");
     await flushPromises();
+  }
+
+  async function openDirMenu(w: ReturnType<typeof mountApp>) {
+    await activateFiles(w);
+    const trigger = w.findAll("button").find((b) => b.text().includes("已加载目录"));
+    expect(trigger, "应有已加载目录下拉").toBeTruthy();
+    await trigger!.trigger("click");
+    await flushPromises();
+    return Array.from(document.querySelectorAll(".dir-item input[type=checkbox]")) as HTMLInputElement[];
   }
 
   it("一次选多个目录时全部加载，文件合并显示", async () => {
@@ -2332,6 +2367,7 @@ describe("多目录与列宽复位", () => {
 
     expect(call, "两个目录都应被扫描").toBe(2);
     expect(w.text(), "第一个目录的文件应在列表里").toContain("a.litematic");
+    await selectRoot(w, "/b");
     expect(w.text(), "第二个目录的文件应在列表里").toContain("b.litematic");
     expect(w.text(), "计数应为两个目录之和").toContain("共 2 个投影");
     w.unmount();
@@ -2383,43 +2419,6 @@ describe("多目录与列宽复位", () => {
     w.unmount();
   });
 
-  it("文件名列明显宽于其余各列", async () => {
-    const w = mountApp();
-    // 断言 colgroup 上的宽度而不是 getBoundingClientRect：
-    // jsdom 不做布局，所有元素尺寸都是 0，量出来只会得到 0 比 0。
-    // colgroup 的 <col> 带的是 Arco 实际使用的列宽，也就是渲染依据本身。
-    const cols = w.findAll(".sidebar colgroup col");
-    // 选择列 + 4 个数据列 + 1 个 1px 占位列（让最后一列也能拖动）
-    expect(cols.length, "应有 6 列（含选择列与占位列）").toBe(6);
-    const widthOf = (i: number) => {
-      const style = cols[i].attributes("style") ?? "";
-      const m = /width:\s*([\d.]+)px/.exec(style);
-      expect(m, `第 ${i} 列应带宽度：${style}`).toBeTruthy();
-      return Number(m![1]);
-    };
-    // 顺序：选择列、文件名、制作版本、尺寸、方块总数、占位列
-    const name = widthOf(1);
-    const others = [widthOf(2), widthOf(3), widthOf(4)];
-    // 用关系而不是绝对值：绝对值会随后续样式微调而失效，
-    // 这里要保证的是「文件名确实是被加宽的那一列」。
-    expect(
-      name,
-      `文件名列(${name}) 应比其余各列(${others.join("/")})都宽出一倍以上`,
-    ).toBeGreaterThan(Math.max(...others) * 2);
-    w.unmount();
-  });
-
-  /** 取「已加载目录」下拉里的勾选框 */
-  async function openDirMenu(w: ReturnType<typeof mountApp>) {
-    const trig = w.findAll("button").find((b) => b.text().includes("已加载目录"));
-    expect(trig, "应有「已加载目录」按钮").toBeTruthy();
-    await trig!.trigger("click");
-    await flushPromises();
-    return Array.from(
-      document.querySelectorAll<HTMLInputElement>(".dir-item input[type=checkbox]"),
-    );
-  }
-
   it("新加载的目录默认勾选，文件立即显示", async () => {
     const a: SchematicSummary = { ...summary, path: "/a/a.litematic", fileName: "a.litematic", dirName: "/a" };
     mockInvoke.mockImplementation((async (cmd: string) => {
@@ -2452,6 +2451,7 @@ describe("多目录与列宽复位", () => {
     const w = mountApp();
     await addDirs(w, "/a", "/b");
     expect(w.text()).toContain("a.litematic");
+    await selectRoot(w, "/b");
     expect(w.text()).toContain("b.litematic");
 
     // 取消第一个目录（下拉顺序即加载顺序）
@@ -2471,6 +2471,7 @@ describe("多目录与列宽复位", () => {
     );
     boxes[0].click();
     await flushPromises();
+    await selectRoot(w, "/a");
     expect(w.text(), "重新勾选后文件应再次出现").toContain("a.litematic");
     w.unmount();
   });
@@ -2486,7 +2487,7 @@ describe("多目录与列宽复位", () => {
 
     const w = mountApp();
     await addDirs(w, "/a");
-    await w.findAll("tr").find((r) => r.text().includes("a.litematic"))!.trigger("click");
+    await openFileCard(w, "a.litematic");
     await flushPromises();
     expect(w.text(), "选中后应出现详情").toContain("信息");
 
@@ -2494,10 +2495,11 @@ describe("多目录与列宽复位", () => {
     boxes[0].click();
     await flushPromises();
 
-    expect(w.text(), "文件已不显示，应回到空状态").toContain("选择一个投影文件以查看详情");
+    expect(w.find(".editor-detail").exists(), "禁用当前文件所在目录后应关闭编辑器").toBe(false);
     const btn = (label: string) => w.findAll("button").find((x) => x.text().includes(label));
     // 入口随信息区 / 方块列表一起消失，用户不会点到作用在旧路径上的按钮
-    expect(btn("方块替换"), "依赖选中项的入口应消失").toBeUndefined();
+    expect(btn("版本转换"), "依赖选中项的入口应消失").toBeUndefined();
+    expect(w.find(".block-table").exists(), "方块表应随选中项消失").toBe(false);
     w.unmount();
   });
 });
@@ -2519,37 +2521,6 @@ describe("界面状态记忆", () => {
     return JSON.parse(arg.json) as Record<string, unknown>;
   }
 
-  it("改变目录栏宽度后会保存，且能被读回", async () => {
-    vi.useFakeTimers();
-    try {
-      const w = mountApp();
-      await flushPromises();
-      const before = saveCount();
-
-      // 拖动分隔条改宽度
-      const splitter = w.find(".splitter").element as HTMLElement;
-      splitter.dispatchEvent(
-        new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: 0 }),
-      );
-      window.dispatchEvent(new PointerEvent("pointermove", { clientX: 900 }));
-      window.dispatchEvent(new PointerEvent("pointerup", { clientX: 900 }));
-      await flushPromises();
-      // 防抖：要推进定时器才会真正写盘
-      vi.advanceTimersByTime(500);
-      await flushPromises();
-
-      expect(saveCount(), "改宽度后应触发保存").toBeGreaterThan(before);
-      const saved = lastSaved();
-      expect(saved, "应能解析出保存内容").toBeTruthy();
-      expect(saved!.version, "应带版本号").toBe(1);
-      expect(typeof saved!.sidebarWidth, "应记住侧栏宽度").toBe("number");
-      expect(saved!.sidebarWidth, "记住的应是拖动后的宽度").toBeGreaterThan(666);
-      w.unmount();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
   it("卸载时把防抖中的改动立刻写出，之后不再有遗留写盘", async () => {
     // 界面状态的写盘是防抖的（400ms）。若定时器活过组件卸载，它会在此后
     // 任意时刻触发，写入这个已销毁实例那份过期状态——实测在整包并行跑
@@ -2561,12 +2532,7 @@ describe("界面状态记忆", () => {
       await flushPromises();
       const before = saveCount();
 
-      const splitter = w.find(".splitter").element as HTMLElement;
-      splitter.dispatchEvent(
-        new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: 0 }),
-      );
-      window.dispatchEvent(new PointerEvent("pointermove", { clientX: 800 }));
-      window.dispatchEvent(new PointerEvent("pointerup", { clientX: 800 }));
+      await w.find(".file-manager__descendants span").trigger("click");
       await flushPromises();
       expect(saveCount(), "防抖期间不应立刻写盘").toBe(before);
 
@@ -2574,7 +2540,7 @@ describe("界面状态记忆", () => {
       await flushPromises();
       expect(saveCount(), "卸载时应写出待保存的改动").toBeGreaterThan(before);
       const saved = lastSaved();
-      expect(saved!.sidebarWidth, "写出的应是改动后的宽度").toBeGreaterThan(666);
+      expect(saved!.showDescendants, "写出的应是改动后的子目录开关").toBe(true);
 
       // 定时器必须已被清掉：卸载后再推进时间不应产生第二次写盘
       const afterUnmount = saveCount();
@@ -2618,74 +2584,11 @@ describe("界面状态记忆", () => {
     await flushPromises();
 
     expect(scanned, "应重新扫描上次记住的两个目录").toEqual(["/p", "/q"]);
-    expect(w.find(".sidebar").element.getAttribute("style"), "应恢复侧栏宽度").toContain("700");
+    expect(w.find(".file-manager").exists(), "文件管理界面应恢复").toBe(true);
     expect(w.text(), "应显示恢复出来的文件").toContain("p.litematic");
     // enabledDirs 只勾了 /p：/q 的文件不应出现，计数也只算勾选的那一个
     expect(w.text(), "未勾选的目录不应显示其文件").not.toContain("q.litematic");
     expect(w.text(), "计数应只算勾选的目录").toContain("共 1 个投影");
-    w.unmount();
-  });
-
-  it("记住用户调整过的列宽，并能在重启后恢复", async () => {
-    // 用户要求「记忆玩家对程序界面的修改」，列宽属于其中一项
-    const state = {
-      version: 1,
-      sidebarWidth: 666,
-      dirs: [],
-      columnWidths: { fileName: 420, mcVersionName: 120 },
-      activeView: "left45",
-      brightness: 1.45,
-      exportSize: 1024,
-      searchText: "",
-    };
-    mockInvoke.mockImplementation((async (cmd: string) => {
-      if (cmd === "load_ui_state") return JSON.stringify(state);
-      if (cmd === "save_ui_state") return undefined;
-      if (cmd === "scan_litematics") return { items: [summary], skippedDirs: 0, skippedPaths: [] };
-      return undefined;
-    }) as never);
-
-    const w = mountApp();
-    await flushPromises();
-    await flushPromises();
-
-    // jsdom 没有布局，量不到像素；改读 colgroup 里的内联宽度（Arco 会写进去）
-    const cols = w.findAll(".sidebar colgroup col");
-    const widths = cols.map((c) => (c.element as HTMLElement).style.width);
-    expect(widths, "文件名列应恢复为用户拖过的 420px").toContain("420px");
-    expect(widths, "制作版本列应恢复为用户拖过的 120px").toContain("120px");
-    w.unmount();
-  });
-
-  it("列宽里的非法值不应让界面变形", async () => {
-    // 损坏的列宽（0、负数、非数字）必须被丢弃，否则列会消失或撑破布局
-    const state = {
-      version: 1,
-      sidebarWidth: 666,
-      dirs: [],
-      columnWidths: { fileName: 0, mcVersionName: -50, dims: "宽", totalBlocks: 900 },
-      activeView: "left45",
-      brightness: 1.45,
-      exportSize: 1024,
-      searchText: "",
-    };
-    mockInvoke.mockImplementation((async (cmd: string) => {
-      if (cmd === "load_ui_state") return JSON.stringify(state);
-      if (cmd === "save_ui_state") return undefined;
-      if (cmd === "scan_litematics") return { items: [summary], skippedDirs: 0, skippedPaths: [] };
-      return undefined;
-    }) as never);
-
-    const w = mountApp();
-    await flushPromises();
-    await flushPromises();
-
-    const widths = w.findAll(".sidebar colgroup col").map((c) => (c.element as HTMLElement).style.width);
-    expect(widths, "0 应被丢弃，用回默认宽度").not.toContain("0px");
-    expect(widths, "负数应被丢弃").not.toContain("-50px");
-    expect(widths, "非数字应被丢弃").not.toContain("宽");
-    // 合法的 900 应保留
-    expect(widths, "合法宽度应保留").toContain("900px");
     w.unmount();
   });
 
@@ -2703,7 +2606,7 @@ describe("界面状态记忆", () => {
       const w = mountApp();
       await flushPromises();
       // 不应抛错、界面仍可用，且明确告知
-      expect(w.find(".sidebar").exists(), "界面应仍然正常").toBe(true);
+      expect(w.find(".file-manager").exists(), "界面应仍然正常").toBe(true);
       expect(
         warnSpy.mock.calls.some((c) => String(c[0]).includes("界面设置")),
         "应提示设置无法读取，而不是静默按默认界面启动",
@@ -2726,10 +2629,7 @@ describe("界面状态记忆", () => {
 
     const w = mountApp();
     await flushPromises();
-    expect(
-      w.find(".sidebar").element.getAttribute("style"),
-      "不认识的版本不应被套用".replace("不应被套用", "不应被采用"),
-    ).not.toContain("111");
+    expect(w.find(".directory-node").exists(), "不认识的版本不应恢复目录树").toBe(false);
     w.unmount();
   });
 
@@ -2746,12 +2646,7 @@ describe("界面状态记忆", () => {
     await flushPromises();
 
     // 改一下界面状态，卸载时防抖中的写盘会立刻执行，必然撞上失败的替身
-    const splitter = w.find(".splitter").element as HTMLElement;
-    splitter.dispatchEvent(
-      new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: 0 }),
-    );
-    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 800 }));
-    window.dispatchEvent(new PointerEvent("pointerup", { clientX: 800 }));
+    await w.find(".file-manager__descendants span").trigger("click");
     await flushPromises();
     w.unmount();
     await flushPromises();
@@ -2805,19 +2700,38 @@ describe("方块栏渲染图", () => {
     const w = mountApp();
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
     return w;
   }
 
-  /** 取一行的各单元格文本：0 渲染图、1 中文名、2 方块、3 状态、4 数量、5 堆叠 */
+  /** 取一行的各单元格文本。
+   *
+   * 折叠视图：0 渲染图、1 中文名、2 方块、3 数量、4 堆叠、5 操作；
+   * 分状态视图在方块与数量之间多一列状态。按需取下标即可。
+   */
   function cells(row: { element: Element }): string[] {
     return Array.from(row.element.querySelectorAll("td")).map((td) =>
       (td.textContent ?? "").trim(),
     );
   }
 
-  it("同一方块的各状态合计成一行", async () => {
+  /** 表头的列标题 */
+  function headerTitles(w: ReturnType<typeof mountApp>): string[] {
+    return w
+      .findAll(".block-table thead th")
+      .map((th) => (th.text() ?? "").trim());
+  }
+
+  /** 切换「区分属性」开关 */
+  async function toggleSplit(w: ReturnType<typeof mountApp>) {
+    const sw = w.find('.block-split button[role="switch"]');
+    expect(sw.exists(), "表头应有「区分属性」开关").toBe(true);
+    await sw.trigger("click");
+    await flushPromises();
+  }
+
+  it("默认按物品合计，且不显示状态列", async () => {
     // 统计口径：一个方块的所有状态累加成一行（红石强度、铁轨朝向与通电、
     // 楼梯朝向都是摆放形态，对「这种物品一共要用多少个」没有意义）。
     const rows: BlockCount[] = [
@@ -2837,22 +2751,60 @@ describe("方块栏渲染图", () => {
     expect(tableRows.length, "8 条状态记录应并成 4 行").toBe(4);
     const rowOf = (name: string) => tableRows.find((r) => cells(r)[2] === name)!;
 
+    // 折叠视图没有状态列：这一行的数量是所有状态的总和，写一个代表状态会误导
+    expect(headerTitles(w), "折叠视图不应有状态列").not.toContain("状态");
+
     // 铁轨：9+8=17
-    expect(cells(rowOf("minecraft:powered_rail"))[4], "数量应是各状态之和").toBe("17");
-    expect(cells(rowOf("minecraft:powered_rail"))[3], "应写明合计了几种状态").toBe(
-      "（含 2 种状态）",
-    );
+    expect(cells(rowOf("minecraft:powered_rail"))[3], "数量应是各状态之和").toBe("17");
     // 红石粉：7+5+4=16
-    expect(cells(rowOf("minecraft:redstone_wire"))[4], "红石粉数量应是各状态之和").toBe("16");
-    expect(cells(rowOf("minecraft:redstone_wire"))[3]).toBe("（含 3 种状态）");
+    expect(cells(rowOf("minecraft:redstone_wire"))[3], "红石粉数量应是各状态之和").toBe("16");
     // 楼梯同样合计：3+2=5，不按朝向分行
-    expect(cells(rowOf("minecraft:oak_stairs"))[4], "楼梯数量应是各朝向之和").toBe("5");
-    // 只有一种状态的方块直接写出状态，不写「含 1 种状态」
-    expect(cells(rowOf("minecraft:stone"))[3], "单状态方块应直接写出状态").toBe(
-      "minecraft:stone",
-    );
+    expect(cells(rowOf("minecraft:oak_stairs"))[3], "楼梯数量应是各朝向之和").toBe("5");
     // 合计后数量最大的排在最前
     expect(cells(tableRows[0])[2], "数量最大的行应排在最前").toBe("minecraft:powered_rail");
+    w.unmount();
+  });
+
+  it("打开区分属性后每种状态一行，状态列显示完整状态键", async () => {
+    // 替换规则按「方块名 + 属性」精确匹配，需要按状态核对时把开关打开：
+    // 此时的数量是处于该状态的方块数，也就是这条规则会命中的数量。
+    const rows: BlockCount[] = [
+      { name: "minecraft:oak_stairs", state: "minecraft:oak_stairs[facing=east]", count: 3, zhName: "橡木楼梯", enName: "Oak Stairs" },
+      { name: "minecraft:oak_stairs", state: "minecraft:oak_stairs[facing=west]", count: 2, zhName: "橡木楼梯", enName: "Oak Stairs" },
+      { name: "minecraft:stone", state: "minecraft:stone", count: 10, zhName: "石头", enName: "Stone" },
+    ];
+    const w = await selectWithBlocks(rows);
+
+    expect(w.findAll(".block-table tbody tr").length, "关闭时按物品合计成 2 行").toBe(2);
+
+    await toggleSplit(w);
+    const tableRows = w.findAll(".block-table tbody tr");
+    expect(tableRows.length, "开启后每种状态一行").toBe(3);
+    expect(headerTitles(w), "开启后应出现状态列").toContain("状态");
+
+    // 每行数量是自己的方块数，而不是合计
+    const stairsEast = tableRows.find((r) =>
+      cells(r)[3] === "minecraft:oak_stairs[facing=east]",
+    );
+    expect(stairsEast, "状态列应写出完整状态键").toBeTruthy();
+    expect(cells(stairsEast!)[4], "数量是该状态的方块数").toBe("3");
+    const stairsWest = tableRows.find((r) =>
+      cells(r)[3] === "minecraft:oak_stairs[facing=west]",
+    );
+    expect(cells(stairsWest!)[4], "另一状态单独一行").toBe("2");
+
+    // 两个方向的状态框都应是可区分的行键：点其中一行后只有它高亮
+    await stairsEast!.trigger("click");
+    await flushPromises();
+    expect(
+      w.findAll(".block-table tbody tr.block-row--active").length,
+      "同一方块的两个状态各自独立，只应有一行高亮",
+    ).toBe(1);
+
+    // 再关掉回到折叠
+    await toggleSplit(w);
+    expect(w.findAll(".block-table tbody tr").length, "关闭后回到合计视图").toBe(2);
+    expect(headerTitles(w), "关闭后状态列应消失").not.toContain("状态");
     w.unmount();
   });
 
@@ -2871,31 +2823,40 @@ describe("方块栏渲染图", () => {
 
     const tableRows = w.findAll(".block-table tbody tr");
     expect(tableRows.length, "6 条记录应并成 4 行").toBe(4);
-    const rowOf = (name: string) => tableRows.find((r) => cells(r)[2] === name)!;
+    // 方块名那一列可能带「（N 种形态）」后缀，因此按前缀匹配
+    const rowOf = (name: string) =>
+      tableRows.find((r) => (cells(r)[2] ?? "").startsWith(name))!;
 
     // 火把：103+82=185，代表形态取基础形态（火把），中文名与渲染图也用它
     const torch = cells(rowOf("minecraft:torch"));
     expect(torch[1], "应显示基础形态的中文名").toBe("火把");
-    expect(torch[4], "数量应是两种形态之和").toBe("185");
-    expect(torch[3], "应注明跨了几种形态").toBe("（含 2 种形态、共 2 种状态）");
+    expect(torch[3], "数量应是两种形态之和").toBe("185");
+    // 状态列不显示时，跨了哪几种形态必须在名字那一列注明
+    expect(torch[2], "应注明跨了几种形态").toContain("（2 种形态）");
+    // 悬停时列出具体是哪几种，用户才知道替换会漏掉哪些
+    const torchNameSpan = rowOf("minecraft:torch")
+      .findAll("td:nth-child(3) span")
+      .find((s) => s.attributes("title") !== undefined);
+    expect(torchNameSpan, "方块名那一列应有说明覆盖范围的提示").toBeTruthy();
+    expect(torchNameSpan!.attributes("title"), "应列出这一行合计了哪些方块名").toContain(
+      "minecraft:wall_torch",
+    );
     // 告示牌同理：基础形态数量更少（1 个）也要当代表
     const sign = cells(rowOf("minecraft:oak_sign"));
     expect(sign[1], "代表形态取基础形态，中文名也取它的").toBe("橡木告示牌");
-    expect(sign[4], "数量应是两种形态之和").toBe("196");
+    expect(sign[3], "数量应是两种形态之和").toBe("196");
     // 只有墙挂形态时，行的名字是物品名（告示牌），因为要备的就是告示牌物品；
-    // 中文名与状态仍取自投影里真实存在的那一行
+    // 中文名仍取自投影里真实存在的那一行
     const paleOak = cells(rowOf("minecraft:pale_oak_sign"));
-    expect(paleOak[4], "数量应如实显示").toBe("14");
+    expect(paleOak[3], "数量应如实显示").toBe("14");
     expect(paleOak[1], "中文名取自投影里存在的墙挂形态").toBe("淡橡木墙上的告示牌");
-    expect(paleOak[3], "单形态单状态直接写出状态").toBe(
-      "minecraft:pale_oak_wall_sign[facing=north]",
-    );
+    expect(paleOak[2], "只有一种形态时不该标注跨形态").not.toContain("种形态");
     // 真正的墙方块不能被带走
     expect(rowOf("minecraft:cobblestone_wall"), "圆石墙是另一种物品，应保持独立").toBeTruthy();
     w.unmount();
   });
 
-  it("点跨了多个方块名的行时说清只替换其中一个名字", async () => {
+  it("点跨了多个方块名的行的替换按钮时说清只替换其中一个名字", async () => {
     // 替换在后端按方块名精确相等匹配，而这一行的数量是整个物品的合计。
     // 若只说「已设为替换源」，用户会以为墙上的火把也会被替换。
     const rows: BlockCount[] = [
@@ -2905,52 +2866,173 @@ describe("方块栏渲染图", () => {
     const w = await selectWithBlocks(rows);
     messageWarning.mockClear();
 
-    w.findAll(".block-table tbody tr")[0].trigger("click");
-    await flushPromises();
+    await clickReplaceOnRow(w, 0);
 
-    expect(
-      document.querySelector<HTMLInputElement>('input[placeholder="例如 minecraft:oak_stairs"]')!.value,
-      "替换源应是这一行的代表形态",
-    ).toBe("minecraft:torch");
-    expect(
-      document.querySelector<HTMLInputElement>('input[placeholder="例如 facing=east,half=top"]')!.value,
-      "跨形态的行不该带入属性限定",
-    ).toBe("");
+    const from = document.querySelector<HTMLInputElement>(".repl-window .repl-from-name input")!;
+    const fromProps = document.querySelector<HTMLInputElement>(
+      ".repl-window .repl-from-props input",
+    )!;
+    expect(from.value, "替换源应是这一行的代表形态").toBe("minecraft:torch");
+    expect(fromProps.value, "折叠视图不带属性限定").toBe("");
     const warning = messageWarning.mock.calls.map((c) => String(c[0])).join(" ");
     expect(warning, "必须提示只替换其中一个方块名").toContain("minecraft:torch");
     expect(warning, "必须点明另一个形态不会被替换").toContain("minecraft:wall_torch");
     w.unmount();
   });
 
-  it("点合计了多个状态的行时不带入属性限定", async () => {
-    // 表里的行按种类合计，代表状态只是画渲染图用的。若把它带进「源属性限定」，
-    // 替换会被悄悄限制在其中一个状态上，而界面上看不出这一点。
+  it("区分属性开启时，行内替换按钮带入该状态的属性限定", async () => {
+    // 分状态后每一行就是一个具体状态，属性限定跟着带入，规则才恰好只命中这一行
     const rows: BlockCount[] = [
       { name: "minecraft:oak_stairs", state: "minecraft:oak_stairs[facing=east]", count: 3, zhName: "橡木楼梯", enName: "Oak Stairs" },
       { name: "minecraft:oak_stairs", state: "minecraft:oak_stairs[facing=west]", count: 2, zhName: "橡木楼梯", enName: "Oak Stairs" },
-      { name: "minecraft:oak_log", state: "minecraft:oak_log[axis=y]", count: 1, zhName: "橡木原木", enName: "Oak Log" },
     ];
     const w = await selectWithBlocks(rows);
-    const propsBox = () =>
-      document.querySelector<HTMLInputElement>('input[placeholder="例如 facing=east,half=top"]')!;
+    await toggleSplit(w);
 
-    // 合计了两种状态的行：不带属性
-    w.findAll(".block-table tbody tr")
-      .find((r) => r.text().includes("minecraft:oak_stairs"))!
-      .trigger("click");
+    const westRow = w
+      .findAll(".block-table tbody tr")
+      .find((r) => r.text().includes("facing=west"))!;
+    await westRow.find(".block-act").trigger("click");
     await flushPromises();
+
+    const from = document.querySelector<HTMLInputElement>(".repl-window .repl-from-name input")!;
+    const fromProps = document.querySelector<HTMLInputElement>(
+      ".repl-window .repl-from-props input",
+    )!;
+    expect(from.value, "源方块是这一行的方块名").toBe("minecraft:oak_stairs");
+    expect(fromProps.value, "属性限定应带入这一行的状态").toBe("facing=west");
+    w.unmount();
+  });
+
+  it("折叠视图下同一方块的多个状态不带属性限定", async () => {
+    // 折叠视图的一行是整个物品的合计（两个朝向都在里面）。若把代表状态的
+    // 属性带进规则，替换会被悄悄限制在其中一个朝向上，而界面上看不出来。
+    const rows: BlockCount[] = [
+      { name: "minecraft:oak_stairs", state: "minecraft:oak_stairs[facing=east]", count: 3, zhName: "橡木楼梯", enName: "Oak Stairs" },
+      { name: "minecraft:oak_stairs", state: "minecraft:oak_stairs[facing=west]", count: 2, zhName: "橡木楼梯", enName: "Oak Stairs" },
+    ];
+    const w = await selectWithBlocks(rows);
+    expect(w.findAll(".block-table tbody tr").length, "折叠视图应合计成一行").toBe(1);
+
+    await clickReplaceOnRow(w, 0);
+
+    const from = document.querySelector<HTMLInputElement>(".repl-window .repl-from-name input")!;
+    const fromProps = document.querySelector<HTMLInputElement>(
+      ".repl-window .repl-from-props input",
+    )!;
+    expect(from.value, "源方块是这一行的方块名").toBe("minecraft:oak_stairs");
+    expect(fromProps.value, "折叠视图不应带入代表状态的属性").toBe("");
+    w.unmount();
+  });
+
+  it("切换区分属性后回到第一页", async () => {
+    // 分状态后行数翻倍，停在旧页码会落到一个与切换前无关的位置
+    const rows: BlockCount[] = [];
+    for (let i = 0; i < 60; i++) {
+      rows.push({
+        name: "minecraft:stone",
+        state: `minecraft:stone[note=${i}]`,
+        count: 1,
+        zhName: "石头",
+        enName: "Stone",
+      });
+    }
+    const w = await selectWithBlocks(rows);
+    // 折叠视图只有 1 行；打开区分属性后变成 60 行、共 2 页
+    await toggleSplit(w);
+    expect(w.findAll(".block-table tbody tr").length, "第一页应有 50 行").toBe(50);
+    await w.findAll(".block-table .arco-pagination-item").find((x) => x.text().trim() === "2")!.trigger("click");
+    await flushPromises();
+    expect(w.findAll(".block-table tbody tr").length, "第二页应有 10 行").toBe(10);
+
+    // 关掉再打开：行集合整个换掉，页码必须回到第一页，
+    // 否则会停在一个与当前视图无关的页码上
+    await toggleSplit(w);
+    await toggleSplit(w);
+    expect(w.findAll(".block-table tbody tr").length, "重新开启后应回到第 1 页").toBe(50);
+    const firstState = (w.findAll(".block-table tbody tr td")[3]?.text() ?? "").trim();
+    expect(firstState, "第 1 页应从数量最多的状态开始").toBe("minecraft:stone[note=0]");
+    w.unmount();
+  });
+
+  it("行内替换按钮只触发一次，不会连带触发行点击", async () => {
+    // 按钮在行内部：点击若冒泡到行的点击处理，设替换源的动作会做两遍。
+    // 用跨形态的行来验证——那一行每次都会给出「只替换其中一个名字」的警告，
+    // 做两遍就会看到两条一样的警告。
+    const rows: BlockCount[] = [
+      { name: "minecraft:torch", state: "minecraft:torch", count: 103, zhName: "火把", enName: "Torch" },
+      { name: "minecraft:wall_torch", state: "minecraft:wall_torch[facing=north]", count: 82, zhName: "墙上的火把", enName: "Wall Torch" },
+    ];
+    const w = await selectWithBlocks(rows);
+    messageWarning.mockClear();
+    messageInfo.mockClear();
+
+    await clickReplaceOnRow(w, 0);
     expect(
-      document.querySelector<HTMLInputElement>('input[placeholder="例如 minecraft:oak_stairs"]')!.value,
-      "应设为替换源",
-    ).toBe("minecraft:oak_stairs");
-    expect(propsBox().value, "合计行不该带入代表状态的属性").toBe("");
+      messageWarning.mock.calls.filter((c) => String(c[0]).includes("minecraft:torch")).length,
+      "设替换源只应做一遍，警告也只应出现一条",
+    ).toBe(1);
+    // 窗口里已经写着源方块，不必再弹一条普通提示
+    // （跨形态那条警告本身也以「已设为替换源」开头，所以只看 info 这一路）
+    expect(
+      messageInfo.mock.calls.filter((c) => String(c[0]).includes("已设为替换源")).length,
+      "从按钮进窗口时不该再弹设源的提示",
+    ).toBe(0);
+    w.unmount();
+  });
 
-    // 只有一种状态的行：那一行等价于一个具体状态，属性应当带入
-    w.findAll(".block-table tbody tr")
-      .find((r) => r.text().includes("minecraft:oak_log"))!
-      .trigger("click");
+  it("操作列固定在表格右侧，每行都有替换入口", async () => {
+    // 表格比面板宽时横向滚动，操作列不跟着滚走才随时点得到
+    const rows: BlockCount[] = [
+      { name: "minecraft:stone", state: "minecraft:stone", count: 5, zhName: "石头", enName: "Stone" },
+      { name: "minecraft:dirt", state: "minecraft:dirt", count: 3, zhName: "泥土", enName: "Dirt" },
+    ];
+    const w = await selectWithBlocks(rows);
+
+    const titles = headerTitles(w);
+    expect(titles[titles.length - 1], "最后一列应是操作列").toBe("操作");
+    const fixedTh = w.findAll(".block-table thead th.arco-table-col-fixed-right");
+    expect(fixedTh.length, "操作列应固定在右侧").toBe(1);
+    expect(
+      w.findAll(".block-table tbody tr .block-act").length,
+      "每行都应有替换入口",
+    ).toBe(2);
+    w.unmount();
+  });
+
+  it("导出的表格随开关切换列，与界面看到的一致", async () => {
+    // 导出与显示对不上会让人以为导出漏了方块：折叠视图没有状态列，
+    // 导出就不该多出一列；分状态视图按状态分行，导出也得带上状态键
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const rows: BlockCount[] = [
+      { name: "minecraft:oak_stairs", state: "minecraft:oak_stairs[facing=east]", count: 3, zhName: "橡木楼梯", enName: "Oak Stairs" },
+      { name: "minecraft:oak_stairs", state: "minecraft:oak_stairs[facing=west]", count: 2, zhName: "橡木楼梯", enName: "Oak Stairs" },
+    ];
+    const w = await selectWithBlocks(rows);
+
+    const copyBtn = () => w.findAll(".block-head button").find((b) => b.text().includes("复制表格"))!;
+    await copyBtn().trigger("click");
     await flushPromises();
-    expect(propsBox().value, "单状态行应带入它的属性").toBe("axis=y");
+
+    const folded = String(writeText.mock.calls.at(-1)?.[0] ?? "");
+    expect(folded, "折叠视图的导出不应有状态列").not.toContain("状态");
+    expect(folded.split("\r\n")[0], "表头应与界面一致").toBe(
+      "显示名称\t方块ID\t数量\t堆叠",
+    );
+    expect(folded.split("\r\n").length, "两行数据加一行表头").toBe(2);
+    expect(folded, "折叠视图的合计数量应是 5").toContain("\t5\t");
+
+    // 打开开关后再导出：多出状态列，且每个状态一行
+    await toggleSplit(w);
+    await copyBtn().trigger("click");
+    await flushPromises();
+    const split = String(writeText.mock.calls.at(-1)?.[0] ?? "");
+    expect(split.split("\r\n")[0], "分状态视图的导出应带状态列").toBe(
+      "显示名称\t方块ID\t状态\t数量\t堆叠",
+    );
+    expect(split.split("\r\n").length, "两个状态各一行").toBe(3);
+    expect(split, "应写出完整状态键").toContain("minecraft:oak_stairs[facing=west]");
     w.unmount();
   });
 
@@ -2978,7 +3060,7 @@ describe("方块栏渲染图", () => {
     const w = mountApp();
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
 
     // 切到实体页签
@@ -3054,7 +3136,7 @@ describe("方块栏渲染图", () => {
     mockOpen.mockResolvedValue("/p");
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
 
     // 失败必须让用户看见，不能被静默吞掉
@@ -3140,7 +3222,7 @@ describe("方块栏渲染图", () => {
     const w = mountApp();
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
 
     const page2 = [...document.querySelectorAll(".arco-pagination-item")].find(
@@ -3203,7 +3285,16 @@ describe("方块栏渲染图", () => {
     let staleResolve: ((v: unknown) => void) | null = null;
     let iconCall = 0;
 
-    stubInvoke();
+    stubInvoke({
+      scan_litematics: {
+        items: [
+          summary,
+          { ...summary, path: "/p/other.litematic", fileName: "other.litematic" },
+        ],
+        skippedDirs: 0,
+        skippedPaths: [],
+      },
+    });
     const base = mockInvoke.getMockImplementation()!;
     mockInvoke.mockImplementation((async (cmd: string, args: never) => {
       if (cmd === "analyze_schematic") {
@@ -3238,15 +3329,14 @@ describe("方块栏渲染图", () => {
     const w = mountApp();
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    const fileRow = w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!;
-    await fileRow.trigger("click");
+    const fileRow = w.findAll(".schematic-card").find((r) => r.text().includes("测试.litematic"))!;
+    await fileRow.trigger("dblclick");
     await flushPromises();
     expect(staleResolve, "第一个请求应已发出并停在飞行中").toBeTruthy();
 
     // 用户换到另一个投影（同一个状态键）
     selected = make("石头乙");
-    await fileRow.trigger("click");
-    await flushPromises();
+    await openFileCard(w, "other.litematic");
     expect(w.find("img.block-icon").attributes("src"), "新投影应显示新图").toContain("NEW");
 
     // 旧请求这时才回来——它属于上一个投影，必须被丢弃
@@ -3852,7 +3942,7 @@ describe("大方块数文件的渲染闸门", () => {
     mockOpen.mockResolvedValue("/p");
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes(name))!.trigger("click");
+    await openFileCard(w, name);
     await flushPromises();
   }
 
@@ -3937,12 +4027,12 @@ describe("大方块数文件的渲染闸门", () => {
     expect(builtScene(), "点过之后建了场景").toBe(true);
 
     // 切到小文件：照常渲染，闸门不出现
-    await w.findAll("tr").find((r) => r.text().includes("小.litematic"))!.trigger("click");
+    await openFileCard(w, "小.litematic");
     await flushPromises();
     expect(startButton(), "小文件不该有闸门").toBeFalsy();
 
     // 切回大文件：上一次的「开始渲染」不该带过来
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
     expect(startButton(), "离开过该文件后要重新点「开始渲染」").toBeTruthy();
     w.unmount();
@@ -4285,7 +4375,7 @@ describe("方块显示名称", () => {
     await flushPromises();
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
     return w;
   }
@@ -4370,14 +4460,14 @@ describe("投影列表排序", () => {
     // 第一列是行选择复选框列（文本为空），文件名不在第一列；
     // 直接按整行里的 .litematic 片段取，稳定且与列顺序无关
     return w
-      .findAll("tr")
+      .findAll(".schematic-card")
       .map((r) => /[\w.-]+\.litematic/.exec(r.text() ?? "")?.[0] ?? "")
       .filter(Boolean);
   }
 
   /** 点开排序下拉并选一项。下拉内容被 teleport 到 body，只能从 document 找。 */
   async function pick(w: ReturnType<typeof mountApp>, label: string) {
-    const trigger = w.find(".sidebar__checks .arco-select");
+    const trigger = w.find(".file-manager__checks .arco-select");
     expect(trigger.exists(), "底部应有排序下拉").toBe(true);
     await trigger.trigger("click");
     await flushPromises();
@@ -4409,7 +4499,7 @@ it("默认按路径排序，未选字段时就是文件系统的扫描顺序", a
     ]);
 
     // 方向按钮：再点一次变降序
-    const dirBtn = w.findAll(".sidebar__checks button").find((x) => x.text().includes("↑"));
+    const dirBtn = w.findAll(".file-manager__checks button").find((x) => x.text().includes("↑"));
     expect(dirBtn, "选了字段后应出现方向按钮").toBeTruthy();
     await dirBtn!.trigger("click");
     await flushPromises();
@@ -4445,7 +4535,7 @@ it("默认按路径排序，未选字段时就是文件系统的扫描顺序", a
       "b.litematic",
     ]);
 
-    const dirBtn = w.findAll(".sidebar__checks button").find((x) => x.text().includes("↑"));
+    const dirBtn = w.findAll(".file-manager__checks button").find((x) => x.text().includes("↑"));
     await dirBtn!.trigger("click");
     await flushPromises();
     // 降序时空的仍在末尾——这条是空值处理的关键：若跟着翻转，
@@ -4462,7 +4552,7 @@ it("默认按路径排序，未选字段时就是文件系统的扫描顺序", a
   it("选「按路径」可以取消排序，回到默认顺序", async () => {
     const w = await setup();
     await pick(w, "按文件名");
-    const dirBtn = w.findAll(".sidebar__checks button").find((x) => x.text().includes("↑"));
+    const dirBtn = w.findAll(".file-manager__checks button").find((x) => x.text().includes("↑"));
     await dirBtn!.trigger("click");
     await flushPromises();
     expect(order(w)[0], "先确认已变成降序").toBe("c.litematic");
@@ -4481,7 +4571,7 @@ it("默认按路径排序，未选字段时就是文件系统的扫描顺序", a
     // 字段名对不上也不会被发现（两边各自看都「通过」）
     const w = await setup();
     await pick(w, "按文件名");
-    const dirBtn = w.findAll(".sidebar__checks button").find((x) => x.text().includes("↑"));
+    const dirBtn = w.findAll(".file-manager__checks button").find((x) => x.text().includes("↑"));
     await dirBtn!.trigger("click");
     await flushPromises();
     expect(order(w)[0], "先确认已按文件名降序").toBe("c.litematic");
@@ -4518,20 +4608,17 @@ it("默认按路径排序，未选字段时就是文件系统的扫描顺序", a
   });
 });
 describe("界面术语一致性", () => {
-  it("投影列表的列标题说「文件名」，不与「投影名称」混淆", async () => {
-    // 这一列绑定的是 fileName，而投影名称是另一个可编辑字段。
-    // 标题若只写「名称」，用户会以为改这里就是改投影名称。
+  it("卡片标题显示文件名，编辑表单单独显示投影名称", async () => {
     stubInvoke();
     const w = mountApp();
     await flushPromises();
     mockOpen.mockResolvedValue(["/p"]);
-    const btn = w.findAll("button").find((b) => b.text().includes("添加目录"));
-    await btn!.trigger("click");
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-
-    const headers = w.findAll(".sidebar .arco-table-th").map((h) => h.text().trim());
-    expect(headers, "文件名列的标题应写明是文件名").toContain("文件名");
-    expect(headers, "不应再有笼统的「名称」列标题").not.toContain("名称");
+    const card = w.find(".schematic-card__title");
+    expect(card.text(), "卡片标题应是磁盘文件名").toContain("测试.litematic");
+    await openFileCard(w, "测试.litematic");
+    expect(w.text(), "编辑表单应区分投影名称").toContain("投影名称");
     w.unmount();
   });
 
@@ -4547,8 +4634,8 @@ describe("预览控制条", () => {
     const btn = w.findAll("button").find((b) => b.text().includes("添加目录"));
     await btn!.trigger("click");
     await flushPromises();
-    const row = w.findAll("tr").find((r) => r.text().includes("测试.litematic"));
-    await row!.trigger("click");
+    const row = w.findAll(".schematic-card").find((r) => r.text().includes("测试.litematic"));
+    await row!.trigger("dblclick");
     await flushPromises();
     return w;
   }
@@ -4571,262 +4658,6 @@ describe("预览控制条", () => {
     // 数值仍有可见的显示途径
     expect(w.text(), "亮度百分比仍要有常驻显示").toMatch(/\d+%/);
     w.unmount();
-  });
-});
-describe("预览区尺寸调整", () => {
-  /** 面板当前高度（由组件内联样式给出） */
-  function panelHeight(w: ReturnType<typeof mountApp>): number {
-    const el = w.find(".preview").element as HTMLElement;
-    return parseFloat(el.style.height || "0");
-  }
-
-  /** 舞台当前宽高（由组件内联样式给出） */
-  function stageSize(w: ReturnType<typeof mountApp>): { w: number; h: number } {
-    const el = w.find(".preview__stage").element as HTMLElement;
-    return { w: parseFloat(el.style.width || "0"), h: parseFloat(el.style.height || "0") };
-  }
-
-  function horizSplitter(w: ReturnType<typeof mountApp>): HTMLElement {
-    const el = w.find(".splitter--horizontal");
-    expect(el.exists(), "应有预览区高度分隔条").toBe(true);
-    return el.element as HTMLElement;
-  }
-
-  /** 垂直分隔条只在有选中文件时存在（信息列本身是条件渲染的） */
-  function vertSplitter(w: ReturnType<typeof mountApp>): HTMLElement {
-    const el = w.find(".preview__main .splitter");
-    expect(el.exists(), "应有预览区宽度分隔条").toBe(true);
-    return el.element as HTMLElement;
-  }
-
-  /** 挂载 → 添加目录 → 选中第一个文件，得到带信息列的完整预览行 */
-  async function mountWithSelection() {
-    stubInvoke();
-    const w = mountApp();
-    await flushPromises();
-    mockOpen.mockResolvedValue(["/p"]);
-    const btn = w.findAll("button").find((b) => b.text().includes("添加目录"));
-    await btn!.trigger("click");
-    await flushPromises();
-    const row = w.findAll("tr").find((r) => r.text().includes("测试.litematic"));
-    expect(row, "应能找到文件所在的行").toBeTruthy();
-    await row!.trigger("click");
-    await flushPromises();
-    return w;
-  }
-
-  it("默认尺寸与两条分隔条的无障碍属性", async () => {
-    const w = await mountWithSelection();
-    const s = stageSize(w);
-    expect(s.w, "舞台默认宽度应与用户标注一致").toBe(398);
-    expect(panelHeight(w), "面板高度应容得下舞台与控制条").toBeGreaterThan(200);
-
-    const hSp = w.find(".splitter--horizontal");
-    expect(hSp.attributes("role")).toBe("separator");
-    expect(hSp.attributes("aria-orientation")).toBe("horizontal");
-    expect(hSp.attributes("tabindex"), "键盘可用的前提").toBe("0");
-
-    const vSp = w.find(".preview__main .splitter");
-    expect(vSp.attributes("role")).toBe("separator");
-    expect(vSp.attributes("aria-orientation")).toBe("vertical");
-    expect(vSp.attributes("tabindex"), "键盘可用的前提").toBe("0");
-    w.unmount();
-  });
-
-  it("拖高度分隔条：只改高度，不动宽度，且分隔条跟着鼠标走", async () => {
-    const w = await mountWithSelection();
-    const beforePanel = panelHeight(w);
-    const beforeStage = stageSize(w);
-
-    const el = horizSplitter(w);
-    // 预览行在分隔条上方：指针下移（clientY 变大）让预览行变高，
-    // 分隔条本身因此向下移动，与鼠标同向
-    el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientY: 400 }));
-    window.dispatchEvent(new PointerEvent("pointermove", { clientY: 520 }));
-    await flushPromises();
-
-    expect(panelHeight(w), "往下拖应让面板变高").toBeGreaterThan(beforePanel);
-    const after = stageSize(w);
-    expect(after.h, "舞台高度应跟着变").toBeGreaterThan(beforeStage.h);
-    // 这条是「拖高度却改了宽度」的回归防护
-    expect(after.w, "拖高度不应改变舞台宽度").toBe(beforeStage.w);
-
-    window.dispatchEvent(new PointerEvent("pointerup", { clientY: 520 }));
-    await flushPromises();
-    w.unmount();
-  });
-
-  it("拖高度分隔条的方向与鼠标一致：上移变矮、下移变高", async () => {
-    const w = await mountWithSelection();
-
-    const drag = async (from: number, to: number) => {
-      const el = horizSplitter(w);
-      el.dispatchEvent(
-        new PointerEvent("pointerdown", { bubbles: true, button: 0, clientY: from }),
-      );
-      window.dispatchEvent(new PointerEvent("pointermove", { clientY: to }));
-      window.dispatchEvent(new PointerEvent("pointerup", { clientY: to }));
-      await flushPromises();
-      return panelHeight(w);
-    };
-
-    const base = panelHeight(w);
-    const down = await drag(400, 460);
-    expect(down, "指针下移应让预览行变高").toBeGreaterThan(base);
-
-    const up = await drag(460, 380);
-    expect(up, "指针上移应让预览行变矮").toBeLessThan(down);
-    w.unmount();
-  });
-
-  it("拖宽度分隔条：只改宽度，不动高度", async () => {
-    const w = await mountWithSelection();
-    const before = stageSize(w);
-
-    const el = vertSplitter(w);
-    el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: 500 }));
-    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 620 }));
-    await flushPromises();
-
-    const after = stageSize(w);
-    expect(after.w, "向右拖应让舞台变宽").toBeGreaterThan(before.w);
-    expect(after.h, "拖宽度不应改变舞台高度").toBe(before.h);
-
-    window.dispatchEvent(new PointerEvent("pointerup", { clientX: 620 }));
-    await flushPromises();
-    w.unmount();
-  });
-
-  it("信息列不写死宽度，靠伸缩吃掉剩余空间", async () => {
-    const w = await mountWithSelection();
-    // jsdom 不加载样式表，量不到真实像素，因此这里核对结构约束：
-    // 预览行里只有舞台有内联宽度，信息列不能有内联宽度或上限
-    // ——一旦给它写死宽度，剩余宽度就没人吃，右侧会空出一条。
-    // 真实的「占满」在真机上用截图核对。
-    const stage = w.find(".preview__stage").element as HTMLElement;
-    expect(stage.style.width, "舞台宽度由状态给出").toBe("398px");
-
-    const info = w.find(".preview__info").element as HTMLElement;
-    expect(info.style.width, "信息列不应写死宽度").toBe("");
-    expect(info.style.maxWidth, "信息列不应写死最大宽度").toBe("");
-    w.unmount();
-  });
-
-  it("高度被夹在上下限内", async () => {
-    const w = await mountWithSelection();
-    const el = horizSplitter(w);
-
-    const dragTo = async (clientY: number) => {
-      el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientY: 0 }));
-      window.dispatchEvent(new PointerEvent("pointermove", { clientY }));
-      window.dispatchEvent(new PointerEvent("pointerup", { clientY }));
-      await flushPromises();
-    };
-
-    // 预览行在分隔条上方：指针一路下移让它变高，停在上限
-    await dragTo(99999);
-    const max = panelHeight(w);
-    expect(max, "往下拖到底应停在最大高度").toBeLessThanOrEqual(window.innerHeight);
-    expect(max, "最大高度要容得下舞台与控制条").toBeGreaterThan(200);
-
-    // 指针一路上移让它变矮，停在下限
-    await dragTo(-99999);
-    expect(panelHeight(w), "往上拖到底应停在下限").toBe(200);
-    w.unmount();
-  });
-
-  it("宽度被夹在上下限内", async () => {
-    const w = await mountWithSelection();
-    const el = vertSplitter(w);
-
-    const dragTo = async (clientX: number) => {
-      el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: 0 }));
-      window.dispatchEvent(new PointerEvent("pointermove", { clientX }));
-      window.dispatchEvent(new PointerEvent("pointerup", { clientX }));
-      await flushPromises();
-    };
-
-    await dragTo(-99999);
-    expect(stageSize(w).w, "向左拖到底应停在最小宽度").toBeGreaterThanOrEqual(160);
-
-    await dragTo(99999);
-    expect(stageSize(w).w, "向右拖到底不应吃掉信息列").toBeLessThanOrEqual(window.innerWidth);
-    w.unmount();
-  });
-
-  it("双击高度分隔条在默认高度与最小高度之间切换", async () => {
-    const w = await mountWithSelection();
-    const def = panelHeight(w);
-    const el = horizSplitter(w);
-
-    el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
-    await flushPromises();
-    expect(panelHeight(w), "双击应收起到最小高度").toBeLessThan(def);
-
-    el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
-    await flushPromises();
-    expect(panelHeight(w), "再双击应回到默认高度").toBe(def);
-    w.unmount();
-  });
-
-  it("双击宽度分隔条在默认宽度与最小宽度之间切换", async () => {
-    const w = await mountWithSelection();
-    const def = stageSize(w).w;
-    const el = vertSplitter(w);
-
-    el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
-    await flushPromises();
-    expect(stageSize(w).w, "双击应收起到最小宽度").toBeLessThan(def);
-
-    el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
-    await flushPromises();
-    expect(stageSize(w).w, "再双击应回到默认宽度").toBe(def);
-    w.unmount();
-  });
-
-  it("宽高分别写入界面状态，重开应用后都恢复", async () => {
-    const w = await mountWithSelection();
-    // 改高度
-    const hSp = horizSplitter(w);
-    hSp.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientY: 400 }));
-    window.dispatchEvent(new PointerEvent("pointermove", { clientY: 300 }));
-    window.dispatchEvent(new PointerEvent("pointerup", { clientY: 300 }));
-    await flushPromises();
-    // 改宽度
-    const vSp = vertSplitter(w);
-    vSp.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: 500 }));
-    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 560 }));
-    window.dispatchEvent(new PointerEvent("pointerup", { clientX: 560 }));
-    await flushPromises();
-
-    const want = { h: panelHeight(w), w: stageSize(w).w };
-
-    // 卸载会立刻把防抖中的改动写出
-    w.unmount();
-    await flushPromises();
-
-    const saved = mockInvoke.mock.calls
-      .filter((c) => c[0] === "save_ui_state")
-      .map((c) => JSON.parse(String((c[1] as { json: string }).json)) as Record<string, unknown>);
-    const last = saved[saved.length - 1];
-    expect(last.previewHeight, "写出的状态应含高度").toBe(want.h);
-    expect(last.previewWidth, "写出的状态应含宽度").toBe(want.w);
-
-    // 用同一份状态重新挂载
-    stubInvoke({ load_ui_state: JSON.stringify(last) });
-    const w2 = mountApp();
-    await flushPromises();
-    mockOpen.mockResolvedValue(["/p"]);
-    const btn = w2.findAll("button").find((b) => b.text().includes("添加目录"));
-    await btn!.trigger("click");
-    await flushPromises();
-    const row = w2.findAll("tr").find((r) => r.text().includes("测试.litematic"));
-    await row!.trigger("click");
-    await flushPromises();
-
-    expect(panelHeight(w2), "重开后高度应恢复").toBe(want.h);
-    expect(stageSize(w2).w, "重开后宽度应恢复").toBe(want.w);
-    w2.unmount();
   });
 });
 describe("投影列表的键盘导航", () => {
@@ -4853,15 +4684,15 @@ describe("投影列表的键盘导航", () => {
 
   /** 列表容器：键盘事件绑在它上面 */
   function host(w: ReturnType<typeof mountApp>) {
-    const el = w.find(".sidebar__table-host");
+    const el = w.find(".schematic-cards__grid");
     expect(el.exists(), "应有带 tabindex 的列表容器").toBe(true);
     return el;
   }
 
-  /** 当前详情面板显示的是哪个文件（用文件名输入框的值判断） */
+  /** 当前聚焦的卡片；方向键只聚焦，不直接打开编辑标签 */
   function activeFile(w: ReturnType<typeof mountApp>): string {
-    const input = w.find('input[value^="a.litematic"], input[value^="b.litematic"], input[value^="c.litematic"]');
-    return input.exists() ? (input.element as HTMLInputElement).value : "";
+    const card = w.find(".schematic-card--focused .schematic-card__title");
+    return card.exists() ? card.text().trim() : "";
   }
 
   it("第一次按下方向键选中第一行", async () => {
@@ -4914,7 +4745,7 @@ describe("投影列表的键盘导航", () => {
     stubInvoke();
     const w = mountApp();
     await flushPromises();
-    const h = w.find(".sidebar__table-host");
+    const h = w.find(".schematic-cards__grid");
     // 不应抛异常，也不应做出任何选中
     await h.trigger("keydown", { key: "ArrowDown" });
     await flushPromises();
@@ -4941,12 +4772,12 @@ describe("其余列表的键盘导航", () => {
     mockOpen.mockResolvedValue("/p");
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
     return w;
   }
 
-  it("方块表：方向键选中行并回填替换源方块", async () => {
+  it("方块表：方向键选中行，回车打开替换窗口并回填源方块", async () => {
     const blocks: BlockCount[] = [
       { name: "minecraft:stone", state: "minecraft:stone", count: 5, zhName: "石头", enName: "Stone" },
       { name: "minecraft:dirt", state: "minecraft:dirt", count: 3, zhName: "泥土", enName: "Dirt" },
@@ -4965,19 +4796,21 @@ describe("其余列表的键盘导航", () => {
     await host.trigger("keydown", { key: "ArrowDown" });
     await flushPromises();
 
-    // 选中方块会把它的方块名回填到替换窗口的「源方块」，
-    // 因此这个值是「选中真的生效」的直接证据，而不只是行上多了一个类名。
-    const fromInput = w.find('.replace-window input[placeholder*="minecraft:"]');
-    if (fromInput.exists()) {
-      expect((fromInput.element as HTMLInputElement).value, "选中方块应回填源方块").toBe(
-        "minecraft:stone",
-      );
-    }
-    // 行高亮是导航可见性的必要条件
+    // 方向键只移动当前行，不打开窗口：这张表首先是统计表
     expect(
       w.findAll(".block-table tbody tr.block-row--active").length,
       "应有且只有一行被标为当前行",
     ).toBe(1);
+    expect(document.querySelector(".repl-window .arco-modal-wrapper"), "方向键不应打开窗口").toBeNull();
+
+    // 回车把当前行带进替换窗口
+    await host.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    const fromInput = document.querySelector<HTMLInputElement>(
+      ".repl-window .repl-from-name input",
+    );
+    expect(fromInput, "回车应打开替换窗口").toBeTruthy();
+    expect(fromInput!.value, "窗口里的源方块应是当前行").toBe("minecraft:stone");
     w.unmount();
   });
 
@@ -5108,7 +4941,7 @@ describe("列表键盘导航不抢输入框", () => {
     mockOpen.mockResolvedValue("/p");
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
     await w.findAll("button").find((b) => b.text().includes("版本转换"))!.trigger("click");
     await flushPromises();
@@ -5183,7 +5016,7 @@ describe("导出尺寸面板", () => {
     mockOpen.mockResolvedValue("/p");
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
     return w;
   }
@@ -5213,12 +5046,13 @@ describe("导出尺寸面板", () => {
     // 批量导出原先只能沿用记住的尺寸，而界面上已无处可改——
     // 用户无从得知批量导出会出多大图。因此它同样走这个面板。
     const w = await setup();
-    // 勾选一个文件，批量导出按钮才可用
-    const cb = w.find('.sidebar input[type="checkbox"]');
-    if (cb.exists()) {
-      await cb.setValue(true);
-      await flushPromises();
-    }
+    // 勾选一个文件，批量导出按钮才可用；复选框在文件管理页
+    await activateFiles(w);
+    const cb = w.find('.schematic-card input[type="checkbox"]');
+    expect(cb.exists(), "应能在文件管理页勾选卡片").toBe(true);
+    await cb.setValue(true);
+    await flushPromises();
+    await activateEditor(w, "测试.litematic");
     const btn = w.findAll("button").find((b) => b.text().includes("批量导出"));
     expect(btn, "应有批量导出按钮").toBeTruthy();
     await btn!.trigger("click");
@@ -5227,7 +5061,7 @@ describe("导出尺寸面板", () => {
     const dialog = document.querySelector(".export-dialog");
     expect(dialog, "批量导出也应先打开尺寸面板").toBeTruthy();
     expect(
-      document.querySelector(".arco-modal-title")?.textContent ?? "",
+      document.querySelector(".export-dialog")?.closest(".arco-modal")?.querySelector(".arco-modal-title")?.textContent ?? "",
       "标题应说明这是批量导出",
     ).toContain("批量");
     w.unmount();
@@ -5305,17 +5139,56 @@ describe("导出尺寸面板", () => {
   });
 });
 describe("保存语义（未保存草稿与另存为）", () => {
-  /** 挂载、加目录、选中唯一文件 */
+  /** 挂载、加目录、选中唯一文件。
+   *
+   * 方块表里给一行石头：替换的入口在方块表的行里，没有行就没有入口。
+   */
   async function setup(extra: Record<string, unknown> = {}) {
-    stubInvoke(extra);
+    stubInvoke({
+      analyze_schematic: {
+        blocks: [
+          {
+            name: "minecraft:stone",
+            state: "minecraft:stone",
+            count: 6,
+            zhName: "石头",
+            enName: "Stone",
+          },
+        ],
+        entities: [],
+        tileEntities: [],
+        entityInstances: [],
+        nonAirTotal: 6,
+        airTotal: 0,
+        distinctBlockTypes: 1,
+        distinctStates: 1,
+      },
+      ...extra,
+    });
     const w = mountApp();
     await flushPromises();
     mockOpen.mockResolvedValue("/p");
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
     return w;
+  }
+
+  /** 左栏的四个输入框，按稳定类名定位 */
+  function replInput(cls: string): HTMLInputElement {
+    const el = document.querySelector<HTMLInputElement>(`.repl-window ${cls} input`);
+    if (!el) throw new Error(`找不到输入框 ${cls}`);
+    return el;
+  }
+
+  /** 打开替换窗口，把目标方块填成给定值 */
+  async function openReplaceWithTarget(w: ReturnType<typeof mountApp>, target: string) {
+    await clickReplaceOnRow(w);
+    const to = replInput(".repl-to-name");
+    to.value = target;
+    to.dispatchEvent(new Event("input"));
+    await flushPromises();
   }
 
   it("方块替换不再立即写盘，而是进入待保存状态", async () => {
@@ -5332,24 +5205,12 @@ describe("保存语义（未保存草稿与另存为）", () => {
 
     expect(w.text(), "应已选中文件并进入详情面板").toContain("投影名称");
 
-    // 打开方块替换窗口，填一组规则
-    await w.findAll("button").find((b) => b.text().includes("方块替换"))!.trigger("click");
-    await flushPromises();
-    // 按 placeholder 精确定位：左栏四个输入框依次是源方块、源属性、目标方块、
-    // 目标属性，按下标取会把规则填进属性栏，规则因缺方块名而被拒
-    const byPlaceholder = (ph: string) =>
-      [...document.querySelectorAll<HTMLInputElement>(".repl-window input")].find(
-        (i) => (i.placeholder ?? "").includes(ph),
-      )! as HTMLInputElement;
-    const fromInput = byPlaceholder("oak_stairs");
-    const toInput = byPlaceholder("minecraft:stone");
-    expect(fromInput, "应有源方块输入框").toBeTruthy();
-    expect(toInput, "应有目标方块输入框").toBeTruthy();
-    fromInput.value = "minecraft:stone";
-    fromInput.dispatchEvent(new Event("input"));
-    toInput.value = "minecraft:dirt";
-    toInput.dispatchEvent(new Event("input"));
-    await flushPromises();
+    // 从方块表那一行的替换按钮打开窗口，把目标方块填成泥土
+    await openReplaceWithTarget(w, "minecraft:dirt");
+    // 源方块由点的那一行决定，不可手改
+    expect(replInput(".repl-from-name").value, "源方块应来自点的那一行").toBe(
+      "minecraft:stone",
+    );
 
     const ok = [...document.querySelectorAll<HTMLElement>(".arco-modal-footer button")].find(
       (b) => (b.textContent ?? "").trim() === "执行替换",
@@ -5380,21 +5241,7 @@ describe("保存语义（未保存草稿与另存为）", () => {
       save_metadata: () => ({ backupPath: "/p/备份/x.bak" }),
     });
 
-    await w.findAll("button").find((b) => b.text().includes("方块替换"))!.trigger("click");
-    await flushPromises();
-    // 与上一条同样的坑：左栏四个输入框依次是源方块、源属性、目标方块、
-    // 目标属性，必须按 placeholder 取源与目标那两栏
-    const pickInput = (ph: string) =>
-      [...document.querySelectorAll<HTMLInputElement>(".repl-window input")].find((i) =>
-        (i.placeholder ?? "").includes(ph),
-      )! as HTMLInputElement;
-    const fromIn = pickInput("oak_stairs");
-    const toIn = pickInput("minecraft:stone");
-    fromIn.value = "minecraft:stone";
-    fromIn.dispatchEvent(new Event("input"));
-    toIn.value = "minecraft:dirt";
-    toIn.dispatchEvent(new Event("input"));
-    await flushPromises();
+    await openReplaceWithTarget(w, "minecraft:dirt");
     [...document.querySelectorAll<HTMLElement>(".repl-window .arco-modal-footer button")]
       .find((b) => (b.textContent ?? "").trim() === "执行替换")!
       .click();
@@ -5527,14 +5374,14 @@ describe("预览区的右键菜单", () => {
     mockOpen.mockResolvedValue("/p");
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
     return w;
   }
 
   /** 在预览舞台上右键 */
   async function rightClick(w: ReturnType<typeof mountApp>) {
-    const stage = w.find(".preview__stage");
+    const stage = w.find(".editor-preview__stage");
     expect(stage.exists(), "应有预览舞台").toBe(true);
     await stage.trigger("contextmenu", { clientX: 300, clientY: 200 });
     await flushPromises();
@@ -5620,7 +5467,7 @@ describe("预览区的右键菜单", () => {
 
   it("点「正射投影」会打上勾，再点取消", async () => {
     const w = await setup();
-    const stage = w.find(".preview__stage");
+    const stage = w.find(".editor-preview__stage");
 
     await stage.trigger("contextmenu", { clientX: 300, clientY: 200 });
     await flushPromises();
@@ -5660,14 +5507,14 @@ describe("自定义视角预设", () => {
     mockOpen.mockResolvedValue("/p");
     await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
     await flushPromises();
-    await w.findAll("tr").find((r) => r.text().includes("测试.litematic"))!.trigger("click");
+    await openFileCard(w, "测试.litematic");
     await flushPromises();
     return w;
   }
 
   /** 打开预览区的右键菜单 */
   async function openMenu(w: ReturnType<typeof mountApp>) {
-    await w.find(".preview__stage").trigger("contextmenu", { clientX: 300, clientY: 200 });
+    await w.find(".editor-preview__stage").trigger("contextmenu", { clientX: 300, clientY: 200 });
     await flushPromises();
     expect(document.querySelector(".view-menu"), "菜单应已打开").toBeTruthy();
   }
@@ -5771,7 +5618,7 @@ describe("自定义视角预设", () => {
     await flushPromises();
 
     // 再开菜单、展开子菜单应看不到它
-    await w.find(".preview__stage").trigger("contextmenu", { clientX: 300, clientY: 200 });
+    await w.find(".editor-preview__stage").trigger("contextmenu", { clientX: 300, clientY: 200 });
     await flushPromises();
     const subText = (await openPresetSub()).textContent ?? "";
     expect(subText, "删除后不应再出现该预设").not.toContain("待删除");
@@ -5937,4 +5784,733 @@ describe("自定义视角预设", () => {
     ).toBe(true);
     w.unmount();
   });
+});
+
+describe("工作区选项卡与子区", () => {
+  it("固定选项卡保持顺序，关闭设置后可以重新打开", async () => {
+    const w = mountApp();
+    await flushPromises();
+    const labels = () => w.findAll(".workspace-tab__label").map((item) => item.text());
+    expect(labels().slice(0, 2)).toEqual(["文件管理", "设置"]);
+
+    const settings = w.findAll(".workspace-tab").find((item) => item.text().includes("设置"));
+    await settings!.find(".workspace-tab__close").trigger("click");
+    await flushPromises();
+    expect(w.findAll(".workspace-tab__label").map((item) => item.text())).not.toContain("设置");
+
+    const reopen = w.findAll(".workspace-tabs__actions button").find((item) => item.text() === "设置");
+    await reopen!.trigger("click");
+    await flushPromises();
+    expect(labels().slice(0, 2)).toEqual(["文件管理", "设置"]);
+    expect(labels().filter((text) => text === "设置")).toHaveLength(1);
+    w.unmount();
+  });
+
+  it("两个编辑会话分别保留自己的未保存草稿", async () => {
+    const other: SchematicSummary = {
+      ...summary,
+      path: "/p/other.litematic",
+      fileName: "other.litematic",
+      name: "另一个投影",
+    };
+    stubInvoke({ scan_litematics: { items: [summary, other], skippedDirs: 0, skippedPaths: [] } });
+    mockOpen.mockResolvedValue("/p");
+    const w = mountApp();
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+
+    await openFileCard(w, "测试.litematic");
+    let input = w.findAll("input").find((item) => (item.element as HTMLInputElement).value === "测试投影");
+    await input!.setValue("A 的未保存名称");
+
+    await openFileCard(w, "other.litematic");
+    input = w.findAll("input").find((item) => (item.element as HTMLInputElement).value === "另一个投影");
+    await input!.setValue("B 的未保存名称");
+
+    await activateEditor(w, "测试.litematic");
+    expect(w.findAll("input").some((item) => (item.element as HTMLInputElement).value === "A 的未保存名称")).toBe(true);
+    await activateEditor(w, "other.litematic");
+    expect(w.findAll("input").some((item) => (item.element as HTMLInputElement).value === "B 的未保存名称")).toBe(true);
+    expect(w.findAll(".workspace-tab__label").filter((item) => item.text().includes("litematic"))).toHaveLength(2);
+    w.unmount();
+  });
+
+  it("目录树区分直接与递归文件，并显示空目录", async () => {
+    const childFile: SchematicSummary = {
+      ...summary,
+      path: "/p/child/child.litematic",
+      fileName: "child.litematic",
+      dirName: "/p/child",
+    };
+    const root = {
+      path: "/p",
+      name: "p",
+      relativePath: "",
+      filePaths: [summary.path],
+      truncated: false,
+      children: [
+        { path: "/p/empty", name: "empty", relativePath: "empty", filePaths: [], children: [], truncated: false },
+        { path: "/p/child", name: "child", relativePath: "child", filePaths: [childFile.path], children: [], truncated: false },
+      ],
+    };
+    stubInvoke({
+      scan_litematics: { items: [summary, childFile], root, skippedDirs: 0, skippedPaths: [] },
+    });
+    mockOpen.mockResolvedValue("/p");
+    const w = mountApp();
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+
+    expect(w.findAll(".schematic-card")).toHaveLength(1);
+    expect(w.findAll(".directory-node")).toHaveLength(3);
+    expect(w.findAll(".directory-icon--solid")).toHaveLength(2);
+    expect(w.text()).toContain("empty");
+
+    await w.find(".file-manager__descendants span").trigger("click");
+    await flushPromises();
+    expect(w.findAll(".schematic-card")).toHaveLength(2);
+
+    await selectRoot(w, "/p/child");
+    expect(w.findAll(".schematic-card")).toHaveLength(1);
+    expect(w.text()).toContain("child.litematic");
+    w.unmount();
+  });
+
+  it("子区列表切换预览时传递区域名，全部子区不传该参数", async () => {
+    stubInvoke({
+      analyze_schematic: {
+        regions: [
+          { name: "A", position: [0, 0, 0], size: [4, 4, 4] },
+          { name: "B", position: [10, 0, 0], size: [2, 3, 4] },
+        ],
+        blocks: [], entities: [], tileEntities: [], entityInstances: [],
+        nonAirTotal: 0, airTotal: 0, distinctBlockTypes: 0, distinctStates: 0,
+      },
+    });
+    mockOpen.mockResolvedValue("/p");
+    const w = mountApp();
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+    await openFileCard(w, "测试.litematic");
+
+    expect(w.findAll(".region-list__item")).toHaveLength(3);
+    await w.findAll(".region-list__item").find((item) => item.text().includes("B"))!.trigger("click");
+    await flushPromises();
+    let calls = mockInvoke.mock.calls.filter((call) => call[0] === "build_scene");
+    expect(calls[calls.length - 1][1]).toMatchObject({ schematicPath: summary.path, regionName: "B" });
+
+    await w.findAll(".region-list__item").find((item) => item.text().includes("全部子区"))!.trigger("click");
+    await flushPromises();
+    calls = mockInvoke.mock.calls.filter((call) => call[0] === "build_scene");
+    expect(calls[calls.length - 1][1]).toMatchObject({ schematicPath: summary.path });
+    expect(calls[calls.length - 1][1]).not.toHaveProperty("regionName");
+    w.unmount();
+  });
+
+  it("切换到另一个文件后，旧分析响应不会覆盖当前子区", async () => {
+    const other: SchematicSummary = {
+      ...summary,
+      path: "/p/other.litematic",
+      fileName: "other.litematic",
+      name: "另一个投影",
+    };
+    let resolveOld: ((value: unknown) => void) | null = null;
+    stubInvoke({ scan_litematics: { items: [summary, other], skippedDirs: 0, skippedPaths: [] } });
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation((async (cmd: string, args: never) => {
+      if (cmd === "analyze_schematic") {
+        const path = (args as unknown as { path: string }).path;
+        if (path === summary.path) {
+          return new Promise((resolve) => {
+            resolveOld = resolve as (value: unknown) => void;
+          });
+        }
+        return {
+          regions: [{ name: "B_REGION", position: [0, 0, 0], size: [1, 1, 1] }],
+          blocks: [], entities: [], tileEntities: [], entityInstances: [],
+          nonAirTotal: 0, airTotal: 0, distinctBlockTypes: 0, distinctStates: 0,
+        };
+      }
+      return base(cmd, args);
+    }) as never);
+    mockOpen.mockResolvedValue("/p");
+    const w = mountApp();
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+
+    const first = w.findAll(".schematic-card").find((item) => item.text().includes("测试.litematic"));
+    await first!.trigger("dblclick");
+    await flushPromises();
+    expect(resolveOld, "旧分析请求应已发出").toBeTruthy();
+
+    await openFileCard(w, "other.litematic");
+    resolveOld!({
+      regions: [{ name: "A_REGION", position: [0, 0, 0], size: [1, 1, 1] }],
+      blocks: [], entities: [], tileEntities: [], entityInstances: [],
+      nonAirTotal: 0, airTotal: 0, distinctBlockTypes: 0, distinctStates: 0,
+    });
+    await flushPromises();
+    expect(w.find(".region-list").text()).toContain("B_REGION");
+    expect(w.find(".region-list").text()).not.toContain("A_REGION");
+    w.unmount();
+  });
+});
+
+
+describe("多会话并发与状态边界", () => {
+  const other: SchematicSummary = {
+    ...summary,
+    path: "/p/other.litematic",
+    fileName: "other.litematic",
+    name: "另一个投影",
+  };
+  const blockAnalysis = {
+    regions: [],
+    blocks: [{ name: "minecraft:stone", state: "minecraft:stone", count: 6, zhName: "石头", enName: "Stone" }],
+    entities: [], tileEntities: [], entityInstances: [], nonAirTotal: 6, airTotal: 0,
+    distinctBlockTypes: 1, distinctStates: 1,
+  };
+
+  async function mountTwo(overrides: Record<string, unknown> = {}) {
+    stubInvoke({
+      scan_litematics: { items: [summary, other], skippedDirs: 0, skippedPaths: [] },
+      analyze_schematic: blockAnalysis,
+      ...overrides,
+    });
+    mockOpen.mockResolvedValue("/p");
+    const w = mountApp();
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+    return w;
+  }
+
+  async function openReplaceTarget(w: ReturnType<typeof mountApp>, target: string) {
+    await clickReplaceOnRow(w);
+    const input = document.querySelector<HTMLInputElement>(".repl-window .repl-to-name input")!;
+    input.value = target;
+    input.dispatchEvent(new Event("input"));
+    await flushPromises();
+  }
+
+  async function chooseConvertTarget() {
+    const select = document.querySelector<HTMLElement>(".conv-window .arco-select-view, .conv-window .arco-select");
+    expect(select, "转换窗口应有版本选择器").toBeTruthy();
+    select!.click();
+    await flushPromises();
+    const option = [...document.querySelectorAll<HTMLElement>(".arco-select-option")].find((item) =>
+      (item.textContent ?? "").includes("1.19.2"),
+    );
+    expect(option, "应列出目标版本").toBeTruthy();
+    option!.click();
+    await flushPromises();
+  }
+
+  async function openConvert(w: ReturnType<typeof mountApp>) {
+    await w.findAll("button").find((b) => b.text().includes("版本转换"))!.trigger("click");
+    await flushPromises();
+    await chooseConvertTarget();
+  }
+
+  it("替换表单按编辑会话保存，Enter 只打开聚焦卡片", async () => {
+    const w = await mountTwo();
+    await openFileCard(w, "测试.litematic");
+    await openReplaceTarget(w, "minecraft:dirt");
+    await openFileCard(w, "other.litematic");
+    await openReplaceTarget(w, "minecraft:glass");
+
+    await activateEditor(w, "测试.litematic");
+    expect(document.querySelector<HTMLInputElement>(".repl-window .repl-to-name input")!.value).toBe("minecraft:dirt");
+    await activateEditor(w, "other.litematic");
+    expect(document.querySelector<HTMLInputElement>(".repl-window .repl-to-name input")!.value).toBe("minecraft:glass");
+    await w.unmount();
+
+    const fresh = await mountTwo();
+    // 按内容定位而不是下标：卡片顺序取决于运行环境的排序规则，
+    // 中文与拉丁文文件名在不同 ICU 数据下先后不同
+    const otherCard = fresh
+      .findAll(".schematic-card")
+      .find((card) => card.text().includes("other.litematic"));
+    expect(otherCard, "应能找到 other 卡片").toBeTruthy();
+    await otherCard!.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    const editors = fresh.findAll(".workspace-tab__label").filter((tab) => tab.attributes("title")?.includes("litematic"));
+    expect(editors).toHaveLength(1);
+    expect(editors[0].attributes("title")).toBe(other.path);
+    fresh.unmount();
+  });
+
+  it("旧替换预览响应不会写入另一个编辑器", async () => {
+    let resolveOld: ((value: unknown) => void) | null = null;
+    const w = await mountTwo({
+      preview_replace: (args: { schematicPath: string }) => {
+        if (args.schematicPath === summary.path) {
+          return new Promise((resolve) => { resolveOld = resolve; });
+        }
+        return { replaced: 9, paletteChanged: 1 };
+      },
+    });
+    await openFileCard(w, "测试.litematic");
+    await openReplaceTarget(w, "minecraft:dirt");
+    [...document.querySelectorAll<HTMLElement>(".repl-window button")]
+      .find((b) => (b.textContent ?? "").includes("预计替换数量"))!.click();
+    await flushPromises();
+    expect(resolveOld).toBeTruthy();
+
+    await openFileCard(w, "other.litematic");
+    await openReplaceTarget(w, "minecraft:dirt");
+    [...document.querySelectorAll<HTMLElement>(".repl-window button")]
+      .find((b) => (b.textContent ?? "").includes("预计替换数量"))!.click();
+    await flushPromises();
+    expect(document.querySelector(".repl-window")!.textContent).toContain("将替换 9 个方块");
+
+    resolveOld!({ replaced: 1, paletteChanged: 1 });
+    await flushPromises();
+    expect(document.querySelector(".repl-window")!.textContent).toContain("将替换 9 个方块");
+    expect(document.querySelector(".repl-window")!.textContent).not.toContain("将替换 1 个方块");
+    w.unmount();
+  });
+
+  it("旧转换分析不会覆盖另一个编辑器的结果", async () => {
+    let resolveOld: ((value: unknown) => void) | null = null;
+    const item = (name: string) => ({
+      name, nameZh: name, nameEn: name, count: 1,
+      suggested: "", suggestedZh: "", suggestedEn: "", chosen: "",
+    });
+    const w = await mountTwo({
+      convert_targets: [{ index: 0, name: "1.19.2", dataVersion: 3120 }],
+      analyze_conversion: (args: { schematicPath: string }) => {
+        if (args.schematicPath === summary.path) {
+          return new Promise((resolve) => { resolveOld = resolve; });
+        }
+        return [item("minecraft:b_result")];
+      },
+    });
+    await openFileCard(w, "测试.litematic");
+    await openConvert(w);
+    [...document.querySelectorAll<HTMLElement>(".conv-window button")]
+      .find((b) => (b.textContent ?? "").includes("分析差异"))!.click();
+    await flushPromises();
+    expect(resolveOld).toBeTruthy();
+
+    await openFileCard(w, "other.litematic");
+    await openConvert(w);
+    [...document.querySelectorAll<HTMLElement>(".conv-window button")]
+      .find((b) => (b.textContent ?? "").includes("分析差异"))!.click();
+    await flushPromises();
+    expect(document.querySelector(".conv-window")!.textContent).toContain("minecraft:b_result");
+
+    resolveOld!([item("minecraft:a_stale")]);
+    await flushPromises();
+    expect(document.querySelector(".conv-window")!.textContent).toContain("minecraft:b_result");
+    expect(document.querySelector(".conv-window")!.textContent).not.toContain("minecraft:a_stale");
+    w.unmount();
+  });
+
+  it("保存期间禁用编辑入口，完成后保留已提交内容", async () => {
+    let finishSave: ((value: unknown) => void) | null = null;
+    let saved = false;
+    const w = await mountTwo({
+      save_metadata: () => {
+        saved = true;
+        return new Promise((resolve) => { finishSave = resolve; });
+      },
+      scan_litematics: () => ({
+        items: [{ ...summary, name: saved ? "本次提交" : "测试投影" }, other],
+        skippedDirs: 0,
+        skippedPaths: [],
+      }),
+    });
+    await openFileCard(w, "测试.litematic");
+    let input = w.findAll("input").find((item) => (item.element as HTMLInputElement).value === "测试投影")!;
+    await input.setValue("本次提交");
+    await w.findAll("button").find((b) => b.text().trim() === "保存")!.trigger("click");
+    await flushPromises();
+    expect(finishSave).toBeTruthy();
+
+    input = w.findAll("input").find((item) => (item.element as HTMLInputElement).value === "本次提交")!;
+    expect(input.attributes("disabled"), "保存期间元数据输入应禁用").toBeDefined();
+    finishSave!({ backupPath: "/p/backup.litematic" });
+    await flushPromises();
+    expect(w.findAll("input").some((item) => (item.element as HTMLInputElement).value === "本次提交")).toBe(true);
+    expect(w.findAll("button").find((b) => b.text().trim() === "保存")!.attributes("disabled")).toBeDefined();
+    w.unmount();
+  });
+
+  it("另存为到未加载目录仍切换文件，并应用暂存替换", async () => {
+    const replaced: string[] = [];
+    const output = { ...summary, path: "/outside/copy.litematic", fileName: "copy.litematic", dirName: "/outside", name: "副本" };
+    const w = await mountTwo({
+      save_schematic_as: (args: { targetPath: string }) => args.targetPath,
+      apply_replace: (args: { schematicPath: string }) => {
+        replaced.push(args.schematicPath);
+        return { replaced: 2, paletteChanged: 1 };
+      },
+      peek_schematic: (args: { path: string }) => {
+        expect(args.path).toBe(output.path);
+        return output;
+      },
+    });
+    await openFileCard(w, "测试.litematic");
+    await openReplaceTarget(w, "minecraft:dirt");
+    [...document.querySelectorAll<HTMLElement>(".repl-window .arco-modal-footer button")]
+      .find((b) => (b.textContent ?? "").trim() === "执行替换")!.click();
+    await flushPromises();
+
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    vi.mocked(save).mockResolvedValueOnce(output.path);
+    await w.findAll("button").find((b) => b.text().trim() === "另存为")!.trigger("click");
+    await flushPromises();
+    expect(replaced).toEqual([output.path]);
+    expect(w.find(".workspace-tab--active").text()).toContain("copy.litematic");
+    expect(w.findAll("input").some((item) => (item.element as HTMLInputElement).value === "副本")).toBe(true);
+    w.unmount();
+  });
+
+  it("并发添加目录不会用后完成的整表覆盖新目录", async () => {
+    let finishSlow: (() => void) | null = null;
+    stubInvoke({
+      scan_litematics: (args: { dir: string }) => {
+        const item = { ...summary, path: args.dir + "/file.litematic", fileName: "file.litematic", dirName: args.dir };
+        if (args.dir === "/slow") {
+          return new Promise((resolve) => {
+            finishSlow = () => resolve({ items: [item], skippedDirs: 0, skippedPaths: [] });
+          });
+        }
+        return { items: [item], skippedDirs: 0, skippedPaths: [] };
+      },
+    });
+    const w = mountApp();
+    const add = () => w.findAll("button").find((b) => b.text().includes("添加目录"))!;
+    mockOpen.mockResolvedValueOnce(["/slow"]);
+    await add().trigger("click");
+    await flushPromises();
+    expect(finishSlow).toBeTruthy();
+
+    mockOpen.mockResolvedValueOnce(["/fast"]);
+    await add().trigger("click");
+    await flushPromises();
+    expect(w.findAll(".directory-node__name").some((n) => n.attributes("title") === "/fast")).toBe(true);
+    finishSlow!();
+    await flushPromises();
+    const roots = w.findAll(".directory-node__name").map((n) => n.attributes("title"));
+    expect(roots).toContain("/fast");
+    expect(roots).toContain("/slow");
+    w.unmount();
+  });
+
+  it("父子目录返回同一路径时只生成一份文件记录", async () => {
+    const nested = { ...summary, path: "/p/child/a.litematic", fileName: "a.litematic", dirName: "/p/child" };
+    stubInvoke({ scan_litematics: { items: [nested], skippedDirs: 0, skippedPaths: [] } });
+    mockOpen.mockResolvedValue(["/p", "/p/child"]);
+    const w = mountApp();
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+    expect(w.findAll(".schematic-card")).toHaveLength(1);
+    expect(w.text()).toContain("共 1 个投影");
+    w.unmount();
+  });
+
+  it("固定标签状态恢复时不恢复上次编辑会话", async () => {
+    stubInvoke({ load_ui_state: JSON.stringify({ version: 1, fixedTabs: ["settings"] }) });
+    const w = mountApp();
+    await flushPromises();
+    expect(w.findAll(".workspace-tab__label").map((tab) => tab.text())).toEqual(["设置"]);
+    expect(w.find(".settings-panel").exists()).toBe(true);
+    expect(w.find(".editor-detail").exists()).toBe(false);
+    w.unmount();
+  });
+
+  it("备份还原期间切换文件不会改写当前标签路径", async () => {
+    let finishRestore: (() => void) | null = null;
+    const w = await mountTwo({
+      list_backups: [{ path: "/backup/a.litematic", stem: "a", op: "save", createdNs: "0", size: 10 }],
+      restore_backup: () => new Promise<void>((resolve) => { finishRestore = () => resolve(); }),
+    });
+    await openFileCard(w, "测试.litematic");
+    await activateFiles(w);
+    await w.findAll("button").find((b) => b.text().includes("备份与日志"))!.trigger("click");
+    await flushPromises();
+    const restore = [...document.querySelectorAll<HTMLElement>(".arco-drawer .arco-link")]
+      .find((item) => (item.textContent ?? "").includes("还原"));
+    expect(restore, "备份列表应有还原入口").toBeTruthy();
+    restore!.click();
+    await flushPromises();
+    expect(finishRestore).toBeTruthy();
+
+    await openFileCard(w, "other.litematic");
+    finishRestore!();
+    await flushPromises();
+    expect(w.find(".workspace-tab--active").text()).toContain("other.litematic");
+    expect(w.findAll("input").some((item) => (item.element as HTMLInputElement).value === "另一个投影")).toBe(true);
+    expect(w.find(".workspace-tab--active").text()).not.toContain("测试.litematic");
+    w.unmount();
+  });
+
+  it("取消删除文件时保留隐藏标签的未保存草稿", async () => {
+    const confirm = vi.spyOn(Modal, "confirm").mockRejectedValue(new Error("取消"));
+    try {
+      const w = await mountTwo();
+      await openFileCard(w, "测试.litematic");
+      const input = w.findAll("input").find((item) => (item.element as HTMLInputElement).value === "测试投影")!;
+      await input.setValue("不能丢失的草稿");
+      await activateFiles(w);
+      const card = w.findAll(".schematic-card").find((item) => item.text().includes("测试.litematic"))!;
+      await card.find("input[type=checkbox]").setValue(true);
+      await w.findAll("button").find((b) => b.text().trim() === "删除")!.trigger("click");
+      await flushPromises();
+
+      expect(confirm, "删除有草稿的文件前应确认").toHaveBeenCalled();
+      expect(mockInvoke.mock.calls.some((call) => call[0] === "delete_files"), "取消后不应删除磁盘文件").toBe(false);
+      await activateEditor(w, "测试.litematic");
+      expect(w.findAll("input").some((item) => (item.element as HTMLInputElement).value === "不能丢失的草稿")).toBe(true);
+      w.unmount();
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
+  it("重扫后无草稿的隐藏会话使用新的文件元数据", async () => {
+    const w = await mountTwo();
+    await openFileCard(w, "测试.litematic");
+    await activateFiles(w);
+    const external = { ...summary, name: "外部修改后的名称", author: "外部作者" };
+    stubInvoke({
+      scan_litematics: { items: [external, other], skippedDirs: 0, skippedPaths: [] },
+      analyze_schematic: blockAnalysis,
+    });
+    mockOpen.mockResolvedValue("/p");
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+
+    await activateEditor(w, "测试.litematic");
+    expect(w.findAll("input").some((item) => (item.element as HTMLInputElement).value === "外部修改后的名称")).toBe(true);
+    expect(w.findAll("input").some((item) => (item.element as HTMLInputElement).value === "外部作者")).toBe(true);
+    expect(w.findAll("button").find((b) => b.text().trim() === "保存")!.attributes("disabled")).toBeDefined();
+    w.unmount();
+  });
+
+  it("转换分析和目标版本随编辑会话恢复", async () => {
+    const item = (name: string) => ({
+      name, nameZh: name, nameEn: name, count: 1,
+      suggested: "", suggestedZh: "", suggestedEn: "", chosen: "",
+    });
+    const w = await mountTwo({
+      convert_targets: [{ index: 0, name: "1.19.2", dataVersion: 3120 }],
+      analyze_conversion: (args: { schematicPath: string }) => [
+        item(args.schematicPath === summary.path ? "minecraft:a_saved" : "minecraft:b_saved"),
+      ],
+    });
+    await openFileCard(w, "测试.litematic");
+    await openConvert(w);
+    [...document.querySelectorAll<HTMLElement>(".conv-window button")]
+      .find((b) => (b.textContent ?? "").includes("分析差异"))!.click();
+    await flushPromises();
+    expect(document.querySelector(".conv-window")!.textContent).toContain("minecraft:a_saved");
+
+    await openFileCard(w, "other.litematic");
+    await openConvert(w);
+    [...document.querySelectorAll<HTMLElement>(".conv-window button")]
+      .find((b) => (b.textContent ?? "").includes("分析差异"))!.click();
+    await flushPromises();
+    expect(document.querySelector(".conv-window")!.textContent).toContain("minecraft:b_saved");
+
+    await activateEditor(w, "测试.litematic");
+    expect(document.querySelector(".conv-window")!.textContent).toContain("minecraft:a_saved");
+    expect(document.querySelector(".conv-window")!.textContent).not.toContain("minecraft:b_saved");
+    w.unmount();
+  });
+
+  it("移除目录后旧扫描响应不会重新写回该目录", async () => {
+    const w = await mountTwo();
+    await openFileCard(w, "测试.litematic");
+    await activateFiles(w);
+    const base = mockInvoke.getMockImplementation()!;
+    let finishScan: (() => void) | null = null;
+    mockInvoke.mockImplementation((async (cmd: string, args: never) => {
+      if (cmd === "scan_litematics") {
+        return new Promise((resolve) => {
+          finishScan = () => resolve({
+            items: [summary, other], skippedDirs: 0, skippedPaths: [],
+            root: {
+              path: "/p", name: "p", relativePath: "",
+              filePaths: [summary.path, other.path], children: [], truncated: false,
+            },
+          });
+        });
+      }
+      return base(cmd, args);
+    }) as never);
+    mockOpen.mockResolvedValue("/p");
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+    expect(finishScan).toBeTruthy();
+
+    await w.findAll("button").find((b) => b.text().includes("已加载目录"))!.trigger("click");
+    await flushPromises();
+    const remove = [...document.querySelectorAll<HTMLElement>(".dir-item button")]
+      .find((b) => (b.textContent ?? "").includes("移除"));
+    remove!.click();
+    await flushPromises();
+    finishScan!();
+    await flushPromises();
+    expect(w.findAll(".directory-node")).toHaveLength(0);
+    await activateEditor(w, "测试.litematic");
+    expect(w.find(".editor-detail").exists()).toBe(true);
+    w.unmount();
+  });
+
+  it("文件所在目录被禁用时保存替换仍刷新分析和场景", async () => {
+    let analysisCalls = 0;
+    const w = await mountTwo({
+      analyze_schematic: () => {
+        analysisCalls++;
+        return blockAnalysis;
+      },
+      apply_replace: () => ({ replaced: 3, paletteChanged: 1 }),
+      save_metadata: () => ({ backupPath: "/p/backup.litematic" }),
+    });
+    await openFileCard(w, "测试.litematic");
+    await openReplaceTarget(w, "minecraft:dirt");
+    [...document.querySelectorAll<HTMLElement>(".repl-window .arco-modal-footer button")]
+      .find((b) => (b.textContent ?? "").trim() === "执行替换")!.click();
+    await flushPromises();
+    const before = analysisCalls;
+
+    await activateFiles(w);
+    await w.findAll("button").find((b) => b.text().includes("已加载目录"))!.trigger("click");
+    await flushPromises();
+    const checkbox = document.querySelector<HTMLInputElement>(".dir-item input[type=checkbox]")!;
+    checkbox.click();
+    await flushPromises();
+    await activateEditor(w, "测试.litematic");
+    await w.findAll("button").find((b) => b.text().trim() === "保存")!.trigger("click");
+    await flushPromises();
+    expect(analysisCalls, "保存成功后即使文件不在可见列表也应重新分析").toBeGreaterThan(before);
+    expect(w.find(".editor-detail").exists()).toBe(true);
+    w.unmount();
+  });
+
+
+  it("仍加载的目录确认文件消失后关闭无草稿标签", async () => {
+    const w = await mountTwo();
+    await openFileCard(w, "测试.litematic");
+    await openFileCard(w, "other.litematic");
+    await activateFiles(w);
+    stubInvoke({
+      scan_litematics: { items: [other], skippedDirs: 0, skippedPaths: [] },
+      analyze_schematic: blockAnalysis,
+    });
+    mockOpen.mockResolvedValue("/p");
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+    const editorLabels = w.findAll(".workspace-tab__label").filter((tab) => tab.attributes("title")?.includes("litematic"));
+    expect(editorLabels.map((tab) => tab.attributes("title"))).toEqual([other.path]);
+    expect(w.find(".file-manager").exists()).toBe(true);
+    w.unmount();
+  });
+
+
+  it("切换转换目标后旧分析立即失效", async () => {
+    const w = await mountTwo({
+      convert_targets: [
+        { index: 0, name: "1.19.2", dataVersion: 3120 },
+        { index: 1, name: "1.19.4", dataVersion: 3337 },
+      ],
+      analyze_conversion: [{
+        name: "minecraft:old_target", nameZh: "旧目标", nameEn: "Old", count: 1,
+        suggested: "", suggestedZh: "", suggestedEn: "", chosen: "",
+      }],
+    });
+    await openFileCard(w, "测试.litematic");
+    await openConvert(w);
+    [...document.querySelectorAll<HTMLElement>(".conv-window button")]
+      .find((b) => (b.textContent ?? "").includes("分析差异"))!.click();
+    await flushPromises();
+    expect(document.querySelector(".conv-window")!.textContent).toContain("minecraft:old_target");
+
+    document.querySelector<HTMLElement>(".conv-window .arco-select-view, .conv-window .arco-select")!.click();
+    await flushPromises();
+    [...document.querySelectorAll<HTMLElement>(".arco-select-option")]
+      .find((item) => (item.textContent ?? "").includes("1.19.4"))!.click();
+    await flushPromises();
+    expect(document.querySelector(".conv-window")!.textContent).not.toContain("minecraft:old_target");
+    const ok = [...document.querySelectorAll<HTMLButtonElement>(".conv-window .arco-modal-footer button")]
+      .find((b) => (b.textContent ?? "").includes("开始转换"));
+    expect(ok?.disabled, "新目标必须重新分析后才能转换").toBe(true);
+    w.unmount();
+  });
+
+  it("延迟恢复固定标签不会移除已打开的编辑器", async () => {
+    let finishLoad: (() => void) | null = null;
+    stubInvoke({
+      load_ui_state: () => new Promise((resolve) => {
+        finishLoad = () => resolve(JSON.stringify({ version: 1, fixedTabs: ["files", "settings"], dirs: [] }));
+      }),
+    });
+    mockOpen.mockResolvedValue("/p");
+    const w = mountApp();
+    await w.findAll("button").find((b) => b.text().includes("添加目录"))!.trigger("click");
+    await flushPromises();
+    await openFileCard(w, "测试.litematic");
+    expect(finishLoad).toBeTruthy();
+    finishLoad!();
+    await flushPromises();
+    expect(w.find(".workspace-tab--active").text()).toContain("测试.litematic");
+    expect(w.find(".editor-detail").exists()).toBe(true);
+    w.unmount();
+  });
+
+  it("旧备份清单响应不会覆盖新文件的清单", async () => {
+    let finishOld: (() => void) | null = null;
+    const w = await mountTwo({
+      list_backups: (args: { stem: string }) => {
+        if (args.stem === "测试") {
+          return new Promise((resolve) => {
+            finishOld = () => resolve([{ path: "/backup/old-A", stem: "测试", op: "old-A", createdNs: "0", size: 1 }]);
+          });
+        }
+        return [{ path: "/backup/current-B", stem: "other", op: "current-B", createdNs: "0", size: 1 }];
+      },
+    });
+    await openFileCard(w, "测试.litematic");
+    await activateFiles(w);
+    await w.findAll("button").find((b) => b.text().includes("备份与日志"))!.trigger("click");
+    await flushPromises();
+    expect(finishOld).toBeTruthy();
+
+    await openFileCard(w, "other.litematic");
+    await activateFiles(w);
+    await w.findAll("button").find((b) => b.text().includes("备份与日志"))!.trigger("click");
+    await flushPromises();
+    expect(document.querySelector(".arco-drawer")!.textContent).toContain("current-B");
+    finishOld!();
+    await flushPromises();
+    expect(document.querySelector(".arco-drawer")!.textContent).toContain("current-B");
+    expect(document.querySelector(".arco-drawer")!.textContent).not.toContain("old-A");
+    w.unmount();
+  });
+
+  it("目录扫描完成后恢复属于后续根目录的选择", async () => {
+    stubInvoke({
+      load_ui_state: JSON.stringify({
+        version: 1,
+        dirs: ["/a", "/b"],
+        enabledDirs: ["/a", "/b"],
+        selectedDirKey: "/b\u0000",
+        fixedTabs: ["files", "settings"],
+      }),
+      scan_litematics: (args: { dir: string }) => ({
+        items: [{ ...summary, path: args.dir + "/file.litematic", fileName: args.dir + ".litematic", dirName: args.dir }],
+        skippedDirs: 0,
+        skippedPaths: [],
+      }),
+    });
+    const w = mountApp();
+    await flushPromises();
+    expect(w.find(".directory-node__row--active .directory-node__name").attributes("title")).toBe("/b");
+    expect(w.findAll(".schematic-card")).toHaveLength(1);
+    expect(w.find(".schematic-card").text()).toContain("/b.litematic");
+    w.unmount();
+  });
+
 });

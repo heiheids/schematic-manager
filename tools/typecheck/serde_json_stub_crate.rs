@@ -71,9 +71,9 @@ impl Value {
             _ => None,
         }
     }
-    pub fn get(&self, key: &str) -> Option<&Value> {
+    pub fn get<I: AsRef<str>>(&self, key: I) -> Option<&Value> {
         match self {
-            Value::Object(m) => m.get(key),
+            Value::Object(m) => m.get(key.as_ref()),
             _ => None,
         }
     }
@@ -385,4 +385,20 @@ pub fn json(v: Value) -> Value {
 /// 但**不会**验证重命名行为；那部分只在 CI 的真实 serde 下生效。
 pub fn to_value<T: ?Sized>(_v: &T) -> Result<Value, Error> {
     Ok(Value::Object(Map::new()))
+}
+
+/// 把值序列化成 JSON 文本。桩不真正序列化，只返回空对象文本。
+pub fn to_string<T: ?Sized>(_v: &T) -> Result<String, Error> {
+    Ok("{}".to_string())
+}
+
+/// 同上，带缩进版本。
+pub fn to_string_pretty<T: ?Sized>(_v: &T) -> Result<String, Error> {
+    Ok("{}".to_string())
+}
+
+/// 构造 JSON 值。桩里统一返回 Null，只保证类型能过。
+#[macro_export]
+macro_rules! json {
+    ($($t:tt)*) => { $crate::Value::Null };
 }

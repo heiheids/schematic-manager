@@ -21,6 +21,8 @@ export interface ViewPreset {
   ortho: boolean;
 }
 
+const TRUE_ISO_PITCH = (Math.asin(1 / Math.sqrt(3)) * 180) / Math.PI;
+
 /**
  * 内置视角预设。
  *
@@ -46,9 +48,9 @@ export const VIEW_PRESETS: Record<string, ViewPreset> = {
   east: { yaw: 90, pitch: 0, ortho: false },
   west: { yaw: -90, pitch: 0, ortho: false },
 
-  // 两个真等距：与上面两个等距同角度，只是换成正射
-  isoRight: { yaw: 45, pitch: 30, ortho: true },
-  isoLeft: { yaw: -45, pitch: 30, ortho: true },
+  // 两个真等距：±45° 偏航与真等距俯角让三个视线分量等幅
+  isoRight: { yaw: 45, pitch: TRUE_ISO_PITCH, ortho: true },
+  isoLeft: { yaw: -45, pitch: TRUE_ISO_PITCH, ortho: true },
 };
 
 /** 右键菜单里「预设角度」分组的显示顺序与 i18n 键 */
@@ -577,7 +579,7 @@ export function applyPreset(
  * 存的是用户当时的位置，照原样还原才是他要的那个画面。
  */
 export function applySavedPose(
-  camera: THREE.PerspectiveCamera,
+  camera: THREE.PerspectiveCamera | THREE.OrthographicCamera,
   preset: SavedViewPreset,
 ) {
   const target = new THREE.Vector3(...preset.target);
@@ -666,16 +668,25 @@ export function setOrthoViewExtent(
   cam.updateProjectionMatrix();
 }
 
-/**
- * 按新的画布宽高比重设正交视景体。
- *
- * 竖直方向的取景是基准，水平方向交给宽高比决定——这是正交投影的通行做法，
- * 也是唯一稳定的做法：若每次都拿「当前视景体」去推下一次，撑大的宽度会被
- * 当成新基准，反复拖动分隔条就会让画面越缩越小且不可逆。
- *
- * 基准半高由取景函数写下（`frameOrthoBox` / `setOrthoViewExtent`），
- * 这里只读不改，因此同一宽高比无论经历多少次 resize 都回到同一个视景体。
- */
+/** 恢复正交视景体并覆盖旧的取景基准，后续宽高比变化仍保持快照的可见半高。 */
+export function restoreOrthoExtent(
+  cam: THREE.OrthographicCamera,
+  frustum: { left: number; right: number; top: number; bottom: number } | undefined,
+  zoom: number | undefined,
+  aspect: number,
+): void {
+  if (frustum) {
+    cam.left = frustum.left;
+    cam.right = frustum.right;
+    cam.top = frustum.top;
+    cam.bottom = frustum.bottom;
+  }
+  if (zoom !== undefined) cam.zoom = zoom;
+  const visibleHalfH = orthoVisibleExtent(cam).halfH;
+  setOrthoViewExtent(cam, visibleHalfH, aspect);
+}
+
+/** 按新的画布宽高比重设视景体，竖直取景保持不变，水平范围随宽高比调整。 */
 export function adaptOrthoAspect(cam: THREE.OrthographicCamera, aspect: number): void {
   const a = Math.max(aspect, 1e-3);
   setOrthoViewExtent(cam, orthoBaseHalfHeight(cam), a);
@@ -756,6 +767,54 @@ export function exportPixelSize(aspect: ExportAspect, shortEdge: number): { w: n
   return { w: Math.max(1, shortEdge), h: Math.max(1, Math.round(shortEdge / ratio)) };
 }
 
+/** 按视角选择离屏相机并完成取景，返回本次渲染应使用的相机。 */
+export function prepareRenderCamera(
+  perspective: THREE.PerspectiveCamera,
+  orthographic: THREE.OrthographicCamera,
+  group: THREE.Group,
+  view: string | SavedViewPreset,
+  aspect: number,
+): THREE.PerspectiveCamera | THREE.OrthographicCamera {
+  const useOrtho = typeof view === "string" ? presetIsOrtho(view) : view.ortho;
+  if (!useOrtho) {
+    perspective.aspect = aspect;
+    if (typeof view === "string") {
+      applyPreset(perspective, group, view);
+    } else {
+      applySavedPose(perspective, view);
+    }
+    return perspective;
+  }
+
+  if (typeof view === "string") {
+    const dir = tryPresetDir(view);
+    if (!dir) throw new Error(`未知的视角预设：${view}`);
+    const box = new THREE.Box3().setFromObject(group);
+    if (box.isEmpty()) {
+      orthographic.position.set(12, 12, 12);
+      orthographic.up.copy(cameraUpFor(defaultViewDir()));
+      orthographic.lookAt(0, 0, 0);
+      orthographic.near = 0.1;
+      orthographic.far = 1000;
+      orthographic.updateProjectionMatrix();
+    } else {
+      frameOrthoBox(orthographic, box, dir, aspect);
+    }
+    return orthographic;
+  }
+
+  const dir = new THREE.Vector3(...view.target).sub(new THREE.Vector3(...view.position));
+  if (dir.lengthSq() < 1e-12) {
+    throw new Error(`自定义预设「${view.name}」的位置与注视点重合`);
+  }
+  const box = new THREE.Box3().setFromObject(group);
+  if (!box.isEmpty()) {
+    frameOrthoBox(orthographic, box, dir, aspect);
+  }
+  applySavedPose(orthographic, view);
+  return orthographic;
+}
+
 /**
  * 离屏渲染器：把任意场景数据渲染成透明背景的 PNG。
  *
@@ -766,7 +825,8 @@ export function exportPixelSize(aspect: ExportAspect, shortEdge: number): { w: n
 export class OffscreenRenderer {
   private renderer: THREE.WebGLRenderer;
   private scene: THREE.Scene;
-  private camera: THREE.PerspectiveCamera;
+  private perspectiveCamera: THREE.PerspectiveCamera;
+  private orthographicCamera: THREE.OrthographicCamera;
 
   constructor() {
     this.renderer = new THREE.WebGLRenderer({
@@ -779,7 +839,8 @@ export class OffscreenRenderer {
     this.renderer.setClearColor(0x000000, 0);
     this.renderer.setClearAlpha(0);
     this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
+    this.perspectiveCamera = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
+    this.orthographicCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10000);
   }
 
   /** 渲染一个场景并返回 PNG 字节。
@@ -798,13 +859,14 @@ export class OffscreenRenderer {
     try {
       this.scene.add(built.group);
       this.renderer.setSize(w, h, false);
-      this.camera.aspect = w / h;
-      if (typeof view === "string") {
-        applyPreset(this.camera, built.group, view);
-      } else {
-        applySavedPose(this.camera, view);
-      }
-      this.renderer.render(this.scene, this.camera);
+      const camera = prepareRenderCamera(
+        this.perspectiveCamera,
+        this.orthographicCamera,
+        built.group,
+        view,
+        w / h,
+      );
+      this.renderer.render(this.scene, camera);
 
       const blob: Blob = await new Promise((resolve, reject) => {
         this.renderer.domElement.toBlob(

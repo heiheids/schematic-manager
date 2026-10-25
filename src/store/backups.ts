@@ -11,8 +11,8 @@
  * 预览域重建场景，保证界面显示的是还原后的真实内容。
  * 依赖只声明本域用到的成员，避免类型上的循环引用（见 store/fileList.ts）。
  */
-import { ref } from "vue";
-import type { ComputedRef, Ref } from "vue";
+import { ref, watch } from "vue";
+import type { Ref } from "vue";
 import { Message } from "@arco-design/web-vue";
 import { t } from "../i18n";
 import {
@@ -31,14 +31,11 @@ import type { BackupEntry, SchematicSummary } from "../types";
 export interface BackupsDeps {
   /** 文件列表域的当前选中；备份清单与还原的作用对象 */
   selected: Ref<SchematicSummary | null>;
-  /** 文件列表域的文件清单；还原后按路径找回同名文件 */
-  files: ComputedRef<SchematicSummary[]>;
   /** 文件列表域的重扫；还原覆盖文件后刷新清单 */
   rescanAll: () => Promise<void>;
-  /** 文件列表域的草稿复位；还原后重新载入元数据 */
-  resetDraft: (rec: SchematicSummary) => void;
-  /** 3D 预览域的场景加载；还原后重建场景 */
-  loadScene: (record: SchematicSummary) => void;
+  /** 发起操作时的编辑会话及内容刷新入口 */
+  activeEditorToken: () => string;
+  refreshEditorContent: (path: string, tabId?: string) => void;
 }
 
 /** 一次读取的日志条数上限。
@@ -60,8 +57,10 @@ export function createBackupsSlice(s: BackupsDeps) {
   const backupOpen = ref(false);
   const backups = ref<BackupEntry[]>([]);
   const backupLoading = ref(false);
+  let backupGeneration = 0;
   const logs = ref<string[]>([]);
   const logLoading = ref(false);
+  let logGeneration = 0;
   const logLevel = ref<LogLevel>(DEFAULT_LOG_LEVEL);
   /** 独立的「日志管理」窗口。与备份抽屉里的日志页签看的是同一份内容，
    *  入口在备份与日志的「运行日志」页签里。 */
@@ -90,24 +89,41 @@ export function createBackupsSlice(s: BackupsDeps) {
   }
 
   async function refreshBackups() {
+    const generation = ++backupGeneration;
+    const stem = s.selected.value?.fileName.replace(/\.litematic$/i, "");
     backupLoading.value = true;
     try {
-      backups.value = await listBackups(s.selected.value?.fileName.replace(/\.litematic$/i, ""));
+      const result = await listBackups(stem);
+      const currentStem = s.selected.value?.fileName.replace(/\.litematic$/i, "");
+      if (generation === backupGeneration && currentStem === stem) backups.value = result;
     } catch (e) {
-      Message.error(t("backup.loadFailed", { error: String(e) }));
+      if (generation === backupGeneration) {
+        Message.error(t("backup.loadFailed", { error: String(e) }));
+      }
     } finally {
-      backupLoading.value = false;
+      if (generation === backupGeneration) backupLoading.value = false;
     }
   }
 
+  watch(backupOpen, (open, previous) => {
+    if (!open && previous) {
+      backupGeneration++;
+      backupLoading.value = false;
+    }
+  });
+
   async function refreshLogs() {
+    const generation = ++logGeneration;
     logLoading.value = true;
     try {
-      logs.value = await readRunLog(LOG_MAX_LINES);
+      const result = await readRunLog(LOG_MAX_LINES);
+      if (generation === logGeneration) logs.value = result;
     } catch (e) {
-      Message.error(t("backup.logLoadFailed", { error: String(e) }));
+      if (generation === logGeneration) {
+        Message.error(t("backup.logLoadFailed", { error: String(e) }));
+      }
     } finally {
-      logLoading.value = false;
+      if (generation === logGeneration) logLoading.value = false;
     }
   }
 
@@ -133,20 +149,13 @@ export function createBackupsSlice(s: BackupsDeps) {
   async function onRestore(row: BackupEntry) {
     const cur = s.selected.value;
     if (!cur) return;
+    const editorToken = s.activeEditorToken();
     try {
       await restoreBackup(row.path, cur.path);
       Message.success(t("backup.restored"));
       await Promise.all([refreshBackups(), refreshLogs()]);
-      // 还原后重新读取文件内容与预览，避免界面仍显示还原前的数据
       await s.rescanAll();
-      const hit = s.files.value.find((f) => f.path === cur.path);
-      if (hit) {
-        s.selected.value = hit;
-        s.resetDraft(hit);
-        const idx = s.files.value.findIndex((f) => f.path === hit.path);
-        if (idx >= 0) s.files.value[idx] = hit;
-        void s.loadScene(hit);
-      }
+      s.refreshEditorContent(cur.path, editorToken);
     } catch (e) {
       Message.error(t("backup.restoreFailed", { error: String(e) }));
     }

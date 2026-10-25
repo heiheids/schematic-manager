@@ -39,6 +39,9 @@ import { reportUiWarning } from "../utils/run_log_report";
 export interface SetupDeps {
   /** 重新解析当前选中项：基础库变了之后方块名与渲染图都会过期 */
   refreshSelectedAnalysis: () => Promise<void>;
+  /** 工作区装配后提供的设置入口与全体会话失效处理 */
+  openSettings?: () => Promise<boolean>;
+  invalidateEditors?: () => void;
 }
 
 /** 会被记住的「版本库」界面状态。版本号用于日后改结构时丢弃旧数据。 */
@@ -334,10 +337,9 @@ export function createSetupSlice(s: SetupDeps) {
         Message.success(t("library.batchAllReady", { count: r.outcomes.length }));
       }
       await refreshStatus();
-      // 基础库可能刚被重建（语言表补齐、缺的版本补上），当前选中项的方块名与
-      // 渲染图都来自旧库；这里立刻重解析一次，用户关掉弹窗就能看到新的名字，
-      // 不必自己去再点一遍那一行
-      await s.refreshSelectedAnalysis();
+      // 基础库可能刚被重建，所有编辑会话的派生数据和卡片预览都需要重载。
+      if (s.invalidateEditors) s.invalidateEditors();
+      else await s.refreshSelectedAnalysis();
     } catch (e) {
       Message.error(t("library.batchFailed", { error: String(e) }));
     } finally {
@@ -392,7 +394,10 @@ export function createSetupSlice(s: SetupDeps) {
         supported.value = st.supported;
         ready.value = st.versions;
         entityAvailable.value = st.entityAvailable;
-        if (st.versions.length === 0) await openSetup();
+        if (st.versions.length === 0) {
+          if (s.openSettings) await s.openSettings();
+          await openSetup();
+        }
       } catch (e) {
         // base_db_status 的失败已由 logged 记录，这里只留控制台一份
         console.warn("启动检查版本库状态失败：", e);

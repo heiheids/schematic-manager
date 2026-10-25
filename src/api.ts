@@ -92,15 +92,25 @@ export function saveSchematicAs(
 
 /**
  * 组装前端渲染所需的场景。
- * 基础库由后端按「版本库」准备的内容解析，前端只提供投影文件路径。
+ * 基础库由后端按「版本库」准备的内容解析。传入 regionName 时只构建该子区，
+ * 不传时构建整个文件；子区选择不改变统计、保存或替换的作用范围。
  */
-export function buildScene(schematicPath: string): Promise<SceneData> {
-  return logged<SceneData>("build_scene", { schematicPath });
+export function buildScene(schematicPath: string, regionName?: string): Promise<SceneData> {
+  if (regionName === undefined) return logged<SceneData>("build_scene", { schematicPath });
+  return logged<SceneData>("build_scene", { schematicPath, regionName });
 }
 
 /** 跨版本检索方块 */
 export function searchBlocks(query: string, limit = 200): Promise<BlockHit[]> {
   return logged<BlockHit[]>("search_blocks", { query, limit });
+}
+
+/** 列出方块库中的全部方块，按方块 ID 升序。
+ *
+ * 供方块选择列表在用户还没输入关键字时使用：挑方块要先看得到可选项。
+ */
+export function listBlocks(): Promise<BlockHit[]> {
+  return logged<BlockHit[]>("list_blocks");
 }
 
 /** 列出方块库中的全部版本 */

@@ -8,7 +8,7 @@
  * 重扫并收敛选中与勾选。依赖只声明本域用到的成员，避免类型上的
  * 循环引用（见 store/fileList.ts）。
  */
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import type { ComputedRef, Ref } from "vue";
 import { Message } from "@arco-design/web-vue";
 import { displayName, t } from "../i18n";
@@ -27,6 +27,19 @@ import type {
 } from "../types";
 
 /** 版本转换域用到的其他域成员（循环引用回避见 fileList.ts） */
+export interface ConvertEditorSnapshot {
+  open: boolean;
+  targets: ConvertTarget[];
+  targetIdx?: number;
+  items: ConvertItem[];
+  analyzed: boolean;
+  activeName: string;
+  pickQuery: string;
+  pickHits: BlockHit[];
+  names: Record<string, NamedRecord>;
+  namesQueried: string[];
+}
+
 export interface VersionConvertDeps {
   /** 文件列表域的当前选中；转换的作用对象 */
   selected: Ref<SchematicSummary | null>;
@@ -34,8 +47,9 @@ export interface VersionConvertDeps {
   files: ComputedRef<SchematicSummary[]>;
   /** 文件列表域的重扫；转换生成新文件后刷新清单 */
   rescanAll: () => Promise<void>;
-  /** 文件列表域的选中收敛；清单变化后保持选中有效 */
-  syncSelection: (items: SchematicSummary[]) => void;
+  /** 只刷新发起转换的编辑会话 */
+  activeEditorToken: () => string;
+  refreshEditorContent: (path: string, tabId?: string) => void;
   /** 文件列表域的勾选清理；清单变化后去掉已不存在的勾选 */
   pruneChecks: (items: SchematicSummary[]) => void;
   /** 确认丢弃未保存的改动；用户在确认框里选取消时返回 false */
@@ -50,6 +64,7 @@ export function createVersionConvertSlice(s: VersionConvertDeps) {
   const convTargetIdx = ref<number | undefined>(undefined);
   const convItems = ref<ConvertItem[]>([]);
   const convAnalyzed = ref(false);
+  let convGeneration = 0;
 
   /** 正在被指定替代品的源方块 ID。
    *
@@ -79,6 +94,23 @@ export function createVersionConvertSlice(s: VersionConvertDeps) {
    * 不能共用一个计时器：那样在两行之间快速输入时，后一次输入会把前一行
    * 还没落地的查询取消掉，那一行的名字就再也不显示了。 */
   const convNameTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  function invalidateRequests() {
+    convGeneration++;
+    convPickSeq++;
+    convBusy.value = false;
+    convPickBusy.value = false;
+    for (const timer of convNameTimers.values()) clearTimeout(timer);
+    convNameTimers.clear();
+  }
+
+  watch(convOpen, (open, previous) => {
+    if (!open && previous) invalidateRequests();
+  });
+
+  onBeforeUnmount(() => {
+    invalidateRequests();
+  });
 
   /** 列定义随界面语言变化，用 computed 包住，切语言后表头跟着变 */
   const convColumns = computed(() => [
@@ -237,8 +269,10 @@ export function createVersionConvertSlice(s: VersionConvertDeps) {
   /** 查一个方块 ID 的显示名称。查不到时记为空（界面据此说明库里没有） */
   async function lookupConvName(id: string) {
     if (!id || convNameQueried(id)) return;
+    const generation = convGeneration;
     try {
       const hits = await searchBlocks(id, 50);
+      if (generation !== convGeneration || !convOpen.value) return;
       const exact = hits.find((h) => h.name.toLowerCase() === id.toLowerCase());
       rememberName(id, { zhName: exact?.zh, enName: exact?.en });
       // 方块库认识这个 ID、但它不在目标版本里：如实提醒一句。
@@ -257,21 +291,39 @@ export function createVersionConvertSlice(s: VersionConvertDeps) {
     }
   }
 
+  function selectConvTarget(index: number | undefined) {
+    if (convTargetIdx.value === index) return;
+    invalidateRequests();
+    convTargetIdx.value = index;
+    convItems.value = [];
+    convAnalyzed.value = false;
+    convActiveName.value = "";
+  }
+
   /** 重新读取可转换版本。
    *
    * 单独成函数是因为「版本转换」窗口里点一个尚未加载的版本会现场补库，
    * 补完必须重取一次列表——新版本在方块库里的下标只有后端知道。
    */
-  async function reloadConvTargets(): Promise<void> {
-    if (!s.selected.value) {
+  async function reloadConvTargets(): Promise<boolean> {
+    const record = s.selected.value;
+    if (!record || !convOpen.value) {
       convTargets.value = [];
-      return;
+      return false;
     }
+    const generation = convGeneration;
     try {
-      convTargets.value = await convertTargets(s.selected.value.path);
+      const targets = await convertTargets(record.path);
+      if (generation !== convGeneration || !convOpen.value || s.selected.value?.path !== record.path) {
+        return false;
+      }
+      convTargets.value = targets;
+      return true;
     } catch (e) {
+      if (generation !== convGeneration) return false;
       Message.error(t("convert.loadTargetsFailed", { error: String(e) }));
       convTargets.value = [];
+      return false;
     }
   }
 
@@ -279,6 +331,7 @@ export function createVersionConvertSlice(s: VersionConvertDeps) {
     // 转换的产物是一个新文件，不带未保存的改动；先问一句免得用户以为会带上。
     // 放在打开窗口之前：用户若选择返回，不该看到一个已经打开的转换窗口。
     if (!(await s.confirmDiscard("files.unsavedReplace"))) return;
+    invalidateRequests();
     convOpen.value = true;
     convItems.value = [];
     convAnalyzed.value = false;
@@ -302,9 +355,20 @@ export function createVersionConvertSlice(s: VersionConvertDeps) {
       Message.warning(t("convert.pickTargetFirst"));
       return;
     }
+    const generation = convGeneration;
+    const targetIdx = convTargetIdx.value;
     convBusy.value = true;
     try {
-      convItems.value = await analyzeConversion(cur.path, convTargetIdx.value);
+      const items = await analyzeConversion(cur.path, targetIdx);
+      if (
+        generation !== convGeneration ||
+        !convOpen.value ||
+        s.selected.value?.path !== cur.path ||
+        convTargetIdx.value !== targetIdx
+      ) {
+        return;
+      }
+      convItems.value = items;
       convAnalyzed.value = true;
       // 分析结果自带源方块与自动推荐的两个名字，一次收进缓存：
       // 界面上凡出现方块 ID 的地方都要显示名字，逐条回查既慢又没必要
@@ -332,6 +396,7 @@ export function createVersionConvertSlice(s: VersionConvertDeps) {
         );
       }
     } catch (e) {
+      if (generation !== convGeneration) return;
       Message.error(t("convert.analyzeFailed", { error: String(e) }));
       convItems.value = [];
       // 必须复位分析标志。否则模板里「convAnalyzed 且条目为空」这一组合
@@ -339,16 +404,20 @@ export function createVersionConvertSlice(s: VersionConvertDeps) {
       // 而实际是分析失败、根本没有结果。
       convAnalyzed.value = false;
     } finally {
-      convBusy.value = false;
+      if (generation === convGeneration) convBusy.value = false;
     }
   }
 
   async function doConvert() {
     const cur = s.selected.value;
-    if (!cur || convTargetIdx.value === undefined) return;
+    if (!cur || convTargetIdx.value === undefined || !convAnalyzed.value) return;
+    const generation = convGeneration;
+    const targetIdx = convTargetIdx.value;
+    const items = convItems.value.map((item) => ({ ...item }));
+    const editorToken = s.activeEditorToken();
     convBusy.value = true;
     try {
-      const r = await applyConversion(cur.path, convTargetIdx.value, convItems.value);
+      const r = await applyConversion(cur.path, targetIdx, items);
       Message.success(
         (r.skippedKinds > 0
           ? t("convert.convertedSkipped", {
@@ -363,16 +432,53 @@ export function createVersionConvertSlice(s: VersionConvertDeps) {
               path: r.outputPath,
             })) as string,
       );
-      convOpen.value = false;
-      // 转换会生成新文件并可能改动原文件；重扫全部已加载目录后再定位选中项
+      if (generation === convGeneration) convOpen.value = false;
       await s.rescanAll();
-      s.syncSelection(s.files.value);
+      s.refreshEditorContent(cur.path, editorToken);
       s.pruneChecks(s.files.value);
     } catch (e) {
-      Message.error(t("convert.convertFailed", { error: String(e) }));
+      if (generation === convGeneration) {
+        Message.error(t("convert.convertFailed", { error: String(e) }));
+      }
     } finally {
-      convBusy.value = false;
+      if (generation === convGeneration) convBusy.value = false;
     }
+  }
+
+  function captureConvertEditor(): ConvertEditorSnapshot {
+    invalidateRequests();
+    return {
+      open: convOpen.value,
+      targets: [...convTargets.value],
+      targetIdx: convTargetIdx.value,
+      items: convItems.value.map((item) => ({ ...item })),
+      analyzed: convAnalyzed.value,
+      activeName: convActiveName.value,
+      pickQuery: convPickQuery.value,
+      pickHits: [...convPickHits.value],
+      names: { ...convNames.value },
+      namesQueried: [...convNamesQueried.value],
+    };
+  }
+
+  function restoreConvertEditor(snapshot: ConvertEditorSnapshot) {
+    invalidateRequests();
+    convTargets.value = [...snapshot.targets];
+    convTargetIdx.value = snapshot.targetIdx;
+    convItems.value = snapshot.items.map((item) => ({ ...item }));
+    convAnalyzed.value = snapshot.analyzed;
+    convActiveName.value = snapshot.activeName;
+    convPickQuery.value = snapshot.pickQuery;
+    convPickHits.value = [...snapshot.pickHits];
+    convNames.value = { ...snapshot.names };
+    convNamesQueried.value = new Set(snapshot.namesQueried);
+    convOpen.value = snapshot.open;
+    if (snapshot.open && snapshot.targets.length === 0) void reloadConvTargets();
+  }
+
+  function clearConvertEditor() {
+    convOpen.value = false;
+    invalidateRequests();
   }
 
   return {
@@ -398,10 +504,14 @@ export function createVersionConvertSlice(s: VersionConvertDeps) {
     onConvPickSearch,
     pickConvBlock,
     scheduleConvNameLookup,
+    selectConvTarget,
     openConvert,
     reloadConvTargets,
     runConvertAnalyze,
     doConvert,
+    captureConvertEditor,
+    restoreConvertEditor,
+    clearConvertEditor,
   };
 }
 

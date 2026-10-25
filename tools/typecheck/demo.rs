@@ -19,33 +19,23 @@
 
 #![allow(dead_code)]
 #[path = "error_stub.rs"] mod error;
-#[path = "../../src-tauri/src/blockdb.rs"] mod blockdb;
-#[path = "../../src-tauri/src/blockdb_write.rs"] mod blockdb_write;
-#[path = "../../src-tauri/src/block_model.rs"] mod block_model;
-#[path = "../../src-tauri/src/block_search.rs"] mod block_search;
-#[path = "../../src-tauri/src/blockstate.rs"] mod blockstate;
-#[path = "../../src-tauri/src/blockstate_chain.rs"] mod blockstate_chain;
-#[path = "../../src-tauri/src/backup.rs"] mod backup;
-#[path = "../../src-tauri/src/convert.rs"] mod convert;
-#[path = "../../src-tauri/src/duplicate.rs"] mod duplicate;
-#[path = "../../src-tauri/src/geometry.rs"] mod geometry;
-#[path = "../../src-tauri/src/jar_index.rs"] mod jar_index;
-#[path = "../../src-tauri/src/litematic.rs"] mod litematic;
-#[path = "../../src-tauri/src/mcver.rs"] mod mcver;
-#[path = "../../src-tauri/src/mesh.rs"] mod mesh;
-#[path = "../../src-tauri/src/model_pack.rs"] mod model_pack;
-#[path = "../../src-tauri/src/nbt.rs"] mod nbt;
-#[path = "../../src-tauri/src/pack_build.rs"] mod pack_build;
-#[path = "../../src-tauri/src/png.rs"] mod png;
-#[path = "../../src-tauri/src/pool.rs"] mod pool;
-#[path = "../../src-tauri/src/replace.rs"] mod replace;
-#[path = "../../src-tauri/src/run_log.rs"] mod run_log;
-#[path = "../../src-tauri/src/scene.rs"] mod scene;
-// 方块染色：visibility 用它给四边形算着色系数
-#[path = "../../src-tauri/src/tint.rs"] mod tint;
-#[path = "../../src-tauri/src/transform.rs"] mod transform;
-#[path = "../../src-tauri/src/visibility.rs"] mod visibility;
-#[path = "../../src-tauri/src/zip.rs"] mod zip;
+
+#[path = "../../src-tauri/src/block/mod.rs"] mod block;
+#[path = "../../src-tauri/src/format/mod.rs"] mod format;
+#[path = "../../src-tauri/src/pack/mod.rs"] mod pack;
+#[path = "../../src-tauri/src/render/mod.rs"] mod render;
+#[path = "../../src-tauri/src/schematic/mod.rs"] mod schematic;
+
+mod app {
+    #[path = "../../../src-tauri/src/app/backup.rs"] pub mod backup;
+    #[path = "../../../src-tauri/src/app/open_url.rs"] pub mod open_url;
+    #[path = "../../../src-tauri/src/app/run_log.rs"] pub mod run_log;
+}
+
+mod mc {
+    #[path = "../../../src-tauri/src/mc/download.rs"] pub mod download;
+    #[path = "../../../src-tauri/src/mc/ver.rs"] pub mod ver;
+}
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -76,7 +66,7 @@ fn main() {
     let _ = std::fs::remove_file(format!("{out_dir}/进展报告.txt"));
 
     let repo = args.get(2).cloned().unwrap_or_else(|| ".".to_string());
-    let sample = format!("{repo}/src-tauri/tests/data/28速单区块简单熔炉.litematic");
+    let sample = format!("{repo}/src-tauri/src/tests/data/28速单区块简单熔炉.litematic");
     // 方块库不再随包分发：演示用 SM_DEMO_DB 指向一份，
     // 通常是「版本库」在 app 数据目录下生成的单版本包
     let dbz = match std::env::var("SM_DEMO_DB") {
@@ -118,8 +108,8 @@ fn main() {
         }
     };
     out!("  样本大小：{} 字节", raw.len());
-    let root = crate::nbt::parse_maybe_gzip(&raw).expect("解析失败");
-    let summary = crate::litematic::summary_from_nbt(&root);
+    let root = crate::format::nbt::parse_maybe_gzip(&raw).expect("解析失败");
+    let summary = crate::schematic::litematic::summary_from_nbt(&root);
     out!("  名称：{}", summary.name);
     out!("  作者：{}", summary.author);
     out!("  区域数：{}", summary.region_count);
@@ -129,7 +119,7 @@ fn main() {
     out!("  文件大小：{} 字节", summary.file_size);
     out!("  含预览图：{}", summary.has_preview);
     out!("  实体数：{}，方块实体数：{}", summary.entity_count, summary.tile_entity_count);
-    let sc = crate::litematic::Schematic::load(&sample).expect("载入失败");
+    let sc = crate::schematic::litematic::Schematic::load(&sample).expect("载入失败");
     let an = sc.analyze();
     out!("  非空气方块：{}", an.non_air_total);
     out!("  空气方块：{}", an.air_total);
@@ -143,8 +133,8 @@ fn main() {
     check(
         "NBT 往返零损失",
         {
-            let s = crate::nbt::serialize_gzip(&root, "", 6).unwrap();
-            crate::nbt::parse_maybe_gzip(&s).unwrap() == root
+            let s = crate::format::nbt::serialize_gzip(&root, "", 6).unwrap();
+            crate::format::nbt::parse_maybe_gzip(&s).unwrap() == root
         },
         "序列化后重新解析与原树完全一致".into(),
     );
@@ -166,8 +156,8 @@ fn main() {
     };
     out!("  压缩后大小：{} 字节", db_bytes.len());
     // 走产品同一条载入路径（按容器魔数自动解压）
-    let db = crate::blockdb::BlockDb::load(&dbz, false).expect("加载失败");
-    out!("  格式版本：{}", crate::blockdb::FORMAT_VERSION);
+    let db = crate::block::db::BlockDb::load(&dbz, false).expect("加载失败");
+    out!("  格式版本：{}", crate::block::db::FORMAT_VERSION);
     out!("  字符串表：{} 条", db.strings.len());
     out!("  贴图：{} 张", db.textures.len());
     out!("  模型：{} 个", db.models.len());
@@ -191,16 +181,16 @@ fn main() {
 
     // ---- 3. 场景与网格 ----
     out!("【3】场景构建与网格生成（渲染管线核心）");
-    let scene = crate::scene::build_from(&sc, &db).expect("场景构建失败");
+    let scene = crate::render::scene::build_from(&sc, &db).expect("场景构建失败");
     out!("  场景批次：{}", scene.batches.len());
-    let quads = crate::visibility::collect_quads(&sc, &db, 0);
-    let md = crate::mesh::build(&quads);
+    let quads = crate::render::visibility::collect_quads(&sc, &db, 0);
+    let md = crate::render::mesh::build(&quads);
     out!("  批次（按贴图分组）：{}", md.batches.len());
     for (i, b) in md.batches.iter().enumerate() {
         if i < 6 {
             out!(
                 "    批次 {i}：贴图 {}，顶点 {}",
-                if b.texture == blockdb::NO_TEXTURE { "无".to_string() } else { b.texture.to_string() },
+                if b.texture == block::db::NO_TEXTURE { "无".to_string() } else { b.texture.to_string() },
                 b.positions.len() / 3
             );
         }
@@ -232,7 +222,7 @@ fn main() {
     // ---- 4. 方块检索 ----
     out!("【4】方块检索");
     for kw in ["stone", "stairs", "glass", "石"] {
-        let hits = crate::block_search::search(&db, kw, 5);
+        let hits = crate::block::search::search(&db, kw, 5);
         out!("  关键词「{kw}」命中 {} 条：", hits.len());
         for h in hits.iter().take(3) {
             out!("    {:<40} 中文 {} 英文 {}", h.name,
@@ -240,11 +230,11 @@ fn main() {
                 if h.en.is_empty() { "-" } else { &h.en });
         }
     }
-    let max_version = crate::block_search::version_options(&db);
+    let max_version = crate::block::search::version_options(&db);
     out!("  版本下拉项：{} 个（最新 {}）", max_version.len(), max_version.last().map(|v| v.name.as_str()).unwrap_or("-"));
     // 空查询按设计返回空：不提供「列出全部」语义。
     // 用一个必然命中的前缀来确认检索覆盖整库。
-    let mine = crate::block_search::search(&db, "minecraft:", 100000);
+    let mine = crate::block::search::search(&db, "minecraft:", 100000);
     out!("  以「minecraft:」为前缀命中：{} 条", mine.len());
     check(
         "方块检索",
@@ -255,13 +245,13 @@ fn main() {
 
     // ---- 5. 版本转换 ----
     out!("【5】版本转换分析");
-    let targets = crate::convert::targets(&db, ver.data_version);
+    let targets = crate::schematic::convert::targets(&db, ver.data_version);
     out!("  当前版本 {}（数据版本 {}）", ver.name, ver.data_version);
     out!("  可转换目标 {} 个", targets.len());
     for t in targets.iter().take(5) {
         out!("    -> {}（数据版本 {}）", t.name, t.data_version);
     }
-    let items = crate::convert::analyze(&sc, &db, 0);
+    let items = crate::schematic::convert::analyze(&sc, &db, 0);
     out!("  待转换方块种类：{}", items.len());
     for it in items.iter().take(6) {
         let rep = it.replacement();
@@ -277,7 +267,7 @@ fn main() {
 
     // ---- 6. 方块替换 ----
     out!("【6】方块替换的匹配计数");
-    let info = block_model::DbBlockInfo { db: &db, version: ver };
+    let info = schematic::model::DbBlockInfo { db: &db, version: ver };
     let mut demo_rule = None;
     for it in items.iter().take(20) {
         let r = it.replacement();
@@ -288,14 +278,14 @@ fn main() {
     }
     match demo_rule {
         Some((from, to, cnt)) => {
-            let rule = replace::ReplaceRule {
+            let rule = schematic::replace::ReplaceRule {
                 from_name: from.clone(),
                 from_props: Vec::new(),
                 to_name: to.clone(),
                 to_props: Vec::new(),
                 inherit_props: true,
             };
-            let n = crate::replace::count_matches(&sc, &rule, &info);
+            let n = crate::schematic::replace::count_matches(&sc, &rule, &info);
             out!("  规则：{from} -> {to}");
             out!("  匹配数：{n}（分析给出的数量 {cnt}）");
             check("替换匹配计数", n == cnt, format!("计数一致：{n}"));
@@ -309,21 +299,21 @@ fn main() {
 
     // ---- 7. 重复文件筛查 ----
     out!("【7】重复文件筛查");
-    let dir = format!("{repo}/src-tauri/tests/data");
+    let dir = format!("{repo}/src-tauri/src/tests/data");
     let mut cands = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let p = e.path();
             if p.is_file() {
                 if let Ok(md) = std::fs::metadata(&p) {
-                    cands.push(crate::duplicate::Candidate { path: p.clone(), size: md.len() });
+                    cands.push(crate::schematic::duplicate::Candidate { path: p.clone(), size: md.len() });
                 }
             }
         }
     }
     out!("  扫描目录：{dir}");
     out!("  候选文件：{} 个", cands.len());
-    let scan = crate::duplicate::find(&cands);
+    let scan = crate::schematic::duplicate::find(&cands);
     out!("  重复组：{} 个", scan.groups.len());
     for g in scan.groups.iter().take(3) {
         out!("    组（{} 字节）：{} 个文件", g.size, g.paths.len());
@@ -336,7 +326,7 @@ fn main() {
     struct FakeJar {
         files: HashMap<String, Vec<u8>>,
     }
-    impl pack_build::JarSource for FakeJar {
+    impl pack::build::JarSource for FakeJar {
         fn entries(&self) -> Vec<String> {
             let mut v: Vec<String> = self.files.keys().cloned().collect();
             v.sort();
@@ -376,15 +366,15 @@ fn main() {
     jar.files.insert("assets/minecraft/textures/block/stone.png".into(), png.clone());
     jar.files.insert("assets/minecraft/textures/block/base.png".into(), png.clone());
 
-    let built = pack_build::build(&jar, "demo", 0, false, |_p: &str| None).expect("构建失败");
-    out!("  输入 jar 条目：{}", pack_build::JarSource::entries(&jar).len());
+    let built = pack::build::build(&jar, "demo", 0, false, |_p: &str| None).expect("构建失败");
+    out!("  输入 jar 条目：{}", pack::build::JarSource::entries(&jar).len());
     out!("  命名空间：{}", built.stats.namespaces);
     out!("  产出方块：{}", built.stats.blocks);
     out!("  产出模型：{}", built.stats.models);
     out!("  产出贴图：{}", built.stats.textures);
     out!("  跳过的 blockstate：{}", built.stats.failed_blockstates);
     out!("  产出的资源包：{} 字节", built.data.len());
-    let rebuilt = blockdb::BlockDb::load_from_bytes(&built.data, false).expect("回读失败");
+    let rebuilt = block::db::BlockDb::load_from_bytes(&built.data, false).expect("回读失败");
     out!("  回读校验 -> 版本 {}，方块 {} 个，模型 {} 个，贴图 {} 张",
         rebuilt.versions[0].name, rebuilt.versions[0].blocks.len(),
         rebuilt.models.len(), rebuilt.textures.len());
@@ -422,7 +412,7 @@ fn main() {
 
     // ---- 9. PNG ----
     out!("【9】PNG 编解码");
-    let img = crate::png::decode(&png).expect("PNG 解码失败");
+    let img = crate::format::png::decode(&png).expect("PNG 解码失败");
     out!("  自造 PNG：{} 字节 -> {}x{} RGBA", png.len(), img.width, img.height);
     out!("  首像素：{:?}", &img.rgba[0..4]);
     check("PNG 解码", img.width == 2 && img.height == 2 && img.rgba.len() == 16, "2x2 RGBA 正确解出".into());
@@ -432,11 +422,11 @@ fn main() {
     out!("【10】zip 解析");
     let zbytes = make_zip(&jar);
     out!("  自造 zip：{} 字节", zbytes.len());
-    let ar = crate::zip::open(&zbytes).expect("zip 解析失败");
+    let ar = crate::format::zip::open(&zbytes).expect("zip 解析失败");
     out!("  条目数：{}", ar.entries.len());
     let mut all_ok = true;
     for e in ar.entries.iter().take(5) {
-        let data = crate::zip::read(&zbytes, e).expect("条目读取失败");
+        let data = crate::format::zip::read(&zbytes, e).expect("条目读取失败");
         let expect = jar.files.get(&e.name).map(|v| v.len()).unwrap_or(0);
         if data.len() != expect {
             all_ok = false;
@@ -461,7 +451,7 @@ fn main() {
         check("备份与还原", false, format!("输出目录不可写：{e}"));
         return;
     }
-    let outcome = match crate::backup::create(&bdir, &src_file, "编辑") {
+    let outcome = match crate::app::backup::create(&bdir, &src_file, "编辑") {
         Ok(o) => o,
         Err(e) => {
             out!("  备份失败：{e}");
@@ -470,12 +460,12 @@ fn main() {
         }
     };
     out!("  备份成功：{}", outcome.backup_path.display());
-    let root = crate::backup::backup_root(&bdir);
+    let root = crate::app::backup::backup_root(&bdir);
     out!("  备份根目录：{}", root.display());
     // 运行日志：改动投影的操作都要留一条记录（演示写在自己的临时目录里）
-    run_log::open(&bdir).expect("运行日志应能打开");
-    run_log::info("演示：备份了一次");
-    let entries = crate::backup::list(&root);
+    app::run_log::open(&bdir).expect("运行日志应能打开");
+    app::run_log::info("演示：备份了一次");
+    let entries = crate::app::backup::list(&root);
     out!("  备份列表：{} 条", entries.len());
     for e in entries.iter().take(3) {
         out!("    {}（操作 {}，大小 {} 字节）", e.stem, e.op, e.size);
@@ -486,10 +476,10 @@ fn main() {
         check("备份与还原", false, "备份未被列出".into());
         return;
     }
-    crate::backup::restore(&entries[0].path, &src_file).expect("还原失败");
+    crate::app::backup::restore(&entries[0].path, &src_file).expect("还原失败");
     let restored = std::fs::read_to_string(&src_file).unwrap();
     out!("  还原后内容：{restored}");
-    let log = run_log::read(5);
+    let log = app::run_log::read(5);
     out!("  运行日志：{} 行", log.len());
     check("备份与还原", restored == "原始内容", "内容正确恢复".into());
     out!("");
@@ -498,17 +488,17 @@ fn main() {
     //
     // 相机不在这里：视角由前端 three.js 负责，后端只给出几何与明暗系数。
     out!("【12】几何与剔除");
-    use blockdb::Face;
+    use block::db::Face;
     out!("  六个面的亮度系数：");
     for f in [Face::Down, Face::Up, Face::North, Face::South, Face::West, Face::East] {
-        out!("    {:?}：{:.2}", f, geometry::face_shade(f));
+        out!("    {:?}：{:.2}", f, render::geometry::face_shade(f));
     }
     out!("  六个面的邻面剔除偏移：");
     for f in [Face::Down, Face::Up, Face::North, Face::South, Face::West, Face::East] {
-        let o = geometry::cull_neighbor_offset(f);
+        let o = render::geometry::cull_neighbor_offset(f);
         out!("    {:?}：({}, {}, {})", f, o[0], o[1], o[2]);
     }
-    let corners = geometry::build_face_corners(Face::Up, [0.0, 0.0, 0.0], [16.0, 16.0, 16.0], [0.0, 0.0, 16.0, 16.0]);
+    let corners = render::geometry::build_face_corners(Face::Up, [0.0, 0.0, 0.0], [16.0, 16.0, 16.0], [0.0, 0.0, 16.0, 16.0]);
     out!("  up 面的四个角（单位：1/16 方块）：");
     for (i, c) in corners.pos.iter().enumerate() {
         out!("    角 {i}：({:.1}, {:.1}, {:.1}) UV ({:.1}, {:.1})", c[0], c[1], c[2], corners.uv[i][0], corners.uv[i][1]);
@@ -532,7 +522,7 @@ fn main() {
 /// 造一张 NxN 的 8 位 RGBA PNG
 fn make_png(w: u32, h: u32) -> Vec<u8> {
     fn crc32(data: &[u8]) -> u32 {
-        crate::zip::crc32(data)
+        crate::format::zip::crc32(data)
     }
     fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
         out.extend_from_slice(&(body.len() as u32).to_be_bytes());
@@ -564,13 +554,13 @@ fn make_png(w: u32, h: u32) -> Vec<u8> {
 }
 
 /// 把假 jar 存成 zip（stored 方式，避免依赖压缩）
-fn make_zip(jar: &impl pack_build::JarSource) -> Vec<u8> {
+fn make_zip(jar: &impl pack::build::JarSource) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let mut central: Vec<u8> = Vec::new();
     let mut count = 0u16;
     for name in jar.entries() {
         let data = jar.read(&name).unwrap();
-        let crc = crate::zip::crc32(&data);
+        let crc = crate::format::zip::crc32(&data);
         let off = out.len() as u32;
         out.extend_from_slice(&0x04034b50u32.to_le_bytes());
         out.extend_from_slice(&20u16.to_le_bytes());

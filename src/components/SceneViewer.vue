@@ -22,6 +22,7 @@ import {
   frameBox,
   frameOrthoBox,
   orthoVisibleExtent,
+  restoreOrthoExtent,
   orthoZoomLimits,
   perspectiveViewHalfHeight,
   presetDir,
@@ -78,6 +79,7 @@ let orthoCamera: THREE.OrthographicCamera | null = null;
  * 用户看到的是「同一个角度换了投影」，而不是画面忽然跳一下。
  */
 let useOrtho = false;
+let userAdjustedCamera = false;
 let controls: OrbitControls | null = null;
 // 按需渲染：只在场景或相机变化时重绘。持续跑 requestAnimationFrame
 // 会让笔记本常态占用 GPU，而这是静态预览，不操作时画面不会变。
@@ -140,13 +142,8 @@ function startFpsClock() {
     }
   }, 1000);
 }
-// 容器尺寸变化用 ResizeObserver 而不是只监听 window：预览舞台会因
-// 侧栏拖动、分隔条拖动、页签切换而改变大小，这些都不触发 window resize。
-//
-// 只重设画布尺寸、不重新取景：相机 FOV 是垂直方向的，而舞台的宽高比固定
-// （398:344，由 composables/usePreviewResize 保证），因此画布变大后同一个
-// 相机看到的是同一个角范围——模型占画面的**比例**不变而**像素**变多，
-// 正好是「舞台变大就画得更大」。重新取景反而会把用户转好的视角掰回去。
+// 容器尺寸变化用 ResizeObserver 而不是只监听 window：三栏布局与标签切换
+// 都会改变画布尺寸。自动取景的相机沿当前方向重新计算，手动调整过的相机保留构图。
 let resizeObserver: ResizeObserver | null = null;
 
 /** 请求在下一帧重绘 */
@@ -156,6 +153,7 @@ function requestRender() {
 
 /** 释放当前网格 */
 function disposeScene() {
+  built?.group.removeFromParent();
   built?.dispose();
   built = null;
 }
@@ -174,9 +172,16 @@ function activeCamera(): THREE.PerspectiveCamera | THREE.OrthographicCamera | nu
  *
  * 两种相机的取景算法不同：透视按 FOV 解距离，正交按投影尺寸定视景体。
  */
-function fitCamera() {
+function fitCamera(preserveDirection = false) {
   const cam = activeCamera();
   if (!cam || !built) return;
+  userAdjustedCamera = false;
+  const direction =
+    preserveDirection && controls
+      ? new THREE.Vector3().subVectors(controls.target, cam.position)
+      : defaultViewDir();
+  if (direction.lengthSq() < 1e-12) direction.copy(defaultViewDir());
+  direction.normalize();
   const box = new THREE.Box3().setFromObject(built.group);
   if (box.isEmpty()) {
     // 空场景（理论上不会走到，几何建好后包围盒就不空）：交给透视那套给个固定位置
@@ -192,7 +197,9 @@ function fitCamera() {
   }
   const center = box.getCenter(new THREE.Vector3());
   if (cam instanceof THREE.OrthographicCamera) {
-    frameOrthoBox(cam, box, defaultViewDir(), orthoAspect());
+    frameOrthoBox(cam, box, direction, orthoAspect());
+  } else if (preserveDirection) {
+    frameBox(cam, box, direction);
   } else {
     fitCameraTo(cam, built.group);
   }
@@ -229,6 +236,7 @@ function rememberFit() {
 function applyPreset(name: string) {
   const cam = activeCamera();
   if (!cam || !built) return;
+  userAdjustedCamera = false;
   const box = new THREE.Box3().setFromObject(built.group);
   if (box.isEmpty()) return;
   const dir = presetDir(name);
@@ -351,6 +359,7 @@ function onResize() {
     cam.aspect = w / h;
     cam.updateProjectionMatrix();
   }
+  if (built && !userAdjustedCamera) fitCamera(true);
   renderSoon();
 }
 
@@ -464,6 +473,7 @@ onBeforeUnmount(() => {
   disposeScene();
   controls?.dispose();
   renderer.value?.dispose();
+  renderer.value?.forceContextLoss();
   dom?.remove();
   renderer.value = null;
   threeScene = null;
@@ -581,6 +591,9 @@ function makeControls(cam: THREE.Camera, dom: HTMLElement): OrbitControls {
   c.enableZoom = true;
   c.zoomSpeed = 0.9;
   c.addEventListener("change", onControlsChange);
+  c.addEventListener("start", () => {
+    userAdjustedCamera = true;
+  });
   return c;
 }
 
@@ -714,13 +727,56 @@ function fitOrthoClipPlanes(cam: THREE.OrthographicCamera, target: THREE.Vector3
 function cameraPose(): {
   position: [number, number, number];
   target: [number, number, number];
+  up: [number, number, number];
+  ortho: boolean;
+  zoom?: number;
+  frustum?: { left: number; right: number; top: number; bottom: number };
 } | null {
   const cam = activeCamera();
   if (!cam || !controls) return null;
+  const ortho = cam instanceof THREE.OrthographicCamera;
   return {
     position: [cam.position.x, cam.position.y, cam.position.z],
     target: [controls.target.x, controls.target.y, controls.target.z],
+    up: [cam.up.x, cam.up.y, cam.up.z],
+    ortho,
+    zoom: ortho ? cam.zoom : undefined,
+    frustum: ortho
+      ? { left: cam.left, right: cam.right, top: cam.top, bottom: cam.bottom }
+      : undefined,
   };
+}
+
+/** 恢复标签切换前的相机，避免只恢复预设而丢掉手动旋转和缩放。 */
+function restoreCameraPose(pose: {
+  position: [number, number, number];
+  target: [number, number, number];
+  up?: [number, number, number];
+  ortho?: boolean;
+  zoom?: number;
+  frustum?: { left: number; right: number; top: number; bottom: number };
+}) {
+  if (!controls) return;
+  if (pose.ortho !== undefined) setOrtho(pose.ortho);
+  const cam = activeCamera();
+  if (!cam) return;
+  cam.position.set(...pose.position);
+  controls.target.set(...pose.target);
+  if (pose.up) cam.up.set(...pose.up);
+  if (cam instanceof THREE.OrthographicCamera) {
+    restoreOrthoExtent(cam, pose.frustum, pose.zoom, orthoAspect());
+    fitOrthoClipPlanes(cam, controls.target);
+    cam.updateProjectionMatrix();
+  } else {
+    cam.updateProjectionMatrix();
+  }
+  cam.lookAt(controls.target);
+  ensureControlsUp();
+  rememberFit();
+  controls.update();
+  userAdjustedCamera = true;
+  syncOrientation();
+  renderSoon();
 }
 
 /** 应用一条自定义预设：按存下来的位置与目标点还原视角。
@@ -758,6 +814,7 @@ function applySavedView(preset: SavedViewPreset) {
   controls.target.set(...preset.target);
   rememberFit();
   controls.update();
+  userAdjustedCamera = true;
   syncOrientation();
   renderSoon();
 }
@@ -794,6 +851,7 @@ defineExpose({
   fitCamera,
   setOrtho,
   cameraPose,
+  restoreCameraPose,
   applySavedView,
 });
 </script>

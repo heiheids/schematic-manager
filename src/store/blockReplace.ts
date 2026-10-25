@@ -15,15 +15,28 @@ import { Message } from "@arco-design/web-vue";
 import type { TableData } from "@arco-design/web-vue";
 import { displayName, t } from "../i18n";
 import type { NamedRecord } from "../i18n";
-import {
-  applyReplace,
-  listBlockVersions,
-  previewReplace,
-  searchBlocks,
-} from "../api";
+import { listBlockVersions, listBlocks, previewReplace, searchBlocks } from "../api";
 import type { BlockHit, BlockRow, ReplaceRule, SchematicSummary, VersionOption } from "../types";
 
 /** 方块替换域用到的其他域成员（循环引用回避见 fileList.ts） */
+export interface ReplaceEditorSnapshot {
+  open: boolean;
+  form: {
+    fromName: string;
+    fromPropsText: string;
+    toName: string;
+    toPropsText: string;
+    inheritProps: boolean;
+  };
+  preview: number | null;
+  pickQuery: string;
+  hits: BlockHit[];
+  names: Record<string, NamedRecord>;
+  namesQueried: string[];
+  activeBlockKey: string | null;
+  versions: VersionOption[];
+}
+
 export interface BlockReplaceDeps {
   /** 文件列表域的当前选中；替换的作用对象 */
   selected: Ref<SchematicSummary | null>;
@@ -37,10 +50,17 @@ export interface BlockReplaceDeps {
   loadScene: (record: SchematicSummary) => void;
   /** 把替换规则记入待保存的草稿；保存时才写回文件 */
   stageReplace: (rule: ReplaceRule) => void;
+  /** 方块表是否按状态分行；决定行内替换入口要不要带入属性限定 */
+  blockSplitStates: Ref<boolean>;
 }
 
 export function createBlockReplaceSlice(s: BlockReplaceDeps) {
-  const activeBlock = ref<{ name: string } | null>(null);
+  /** 方块表里当前选中的那一行（行键）。
+   *
+   * 存行键而不是方块名：按物品合计时同一个方块名可能出现在两行里
+   * （带花的花盆既是「花盆」也是「植物」），只比名字会让两行同时高亮。
+   */
+  const activeBlock = ref<{ key: string } | null>(null);
 
   // 方块替换
   const replaceOpen = ref(false);
@@ -59,22 +79,14 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
   const blockPickQuery = ref("");
   const blockHits = ref<BlockHit[]>([]);
   const blockSearching = ref(false);
-  /** 搜索请求序号：只接受最后一次查询的结果（逐字符搜会并发多个请求） */
+  /** 关键字检索的请求序号：只接受最后一次查询的结果（逐字符搜会并发多个请求） */
   let blockSearchSeq = 0;
-
-  /** 右侧列表点选后填到哪一个输入框。
-   *
-   * 弹窗里有两个方块输入框（源、目标），右侧列表必须知道该填哪个，
-   * 否则点下去不知道改的是哪一栏。跟随用户最后点过/聚焦的那个输入框，
-   * 默认目标是替换目标——替换时更常选的是「换成什么」。
-   */
-  const replacePickField = ref<"from" | "to">("to");
 
   /** 方块 ID -> 显示名称的两套名字（中文、英文，取自 Minecraft 语言表）。
    *
-   * 源方块与目标方块共用一份：两个输入框都要显示名字，而来源有三处
-   * （手输、右侧列表点选、从「方块」页签点行填入），汇总到一处才不会
-   * 出现同一个方块在两个框里显示不同名字。
+   * 源方块与目标方块共用一份：两个输入框都要显示名字。源方块来自
+   * 「方块」页签点的那一行，目标方块可以手输，也可以从右侧列表点选。
+   * 汇总到一处才不会出现同一个方块在两个框里显示不同名字。
    *
    * 两套都留着、而不是只存当前语言那一套：切语言后输入框要立刻改用另一套，
    * 只存一套会让它继续显示旧语言的名字。
@@ -98,7 +110,7 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
 
   /** 从「方块 ID 或 带属性的状态串」里取出纯 ID。
    *
-   * 输入框是自由文本，用户可能把手输/粘贴的 `minecraft:chest[facing=east]`
+   * 目标方块是自由文本，用户可能把手输/粘贴的 `minecraft:chest[facing=east]`
    * 这种状态串直接留在框里。严格按整串去方块库比对必然匹配不上，于是明明
    * 能找到的方块也会被报成「未找到」。方块库里的名字不含属性，因此先剥掉
    * 方括号部分。
@@ -111,9 +123,9 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
   /** 把「方块名[属性]」拆成方块名与属性串；不是这种写法时返回 null。
    *
    * 后端契约要求方块名不含属性（见 replace.rs 的 ReplaceRule）：带属性的名字
-   * 会被原样写进投影的调色板，游戏读不出来。旧界面用下拉框选方块，取值域
-   * 天然挡住了这条路；改成自由文本后必须自己拆。拆法与从「方块」页签点行
-   * 填入一致——名字进方块栏，方括号里的进属性栏，用户看得见拆成了什么。
+   * 会被原样写进投影的调色板，游戏读不出来。目标方块的输入框是自由文本，
+   * 因此粘进来的状态串必须自己拆——名字进方块栏，方括号里的进属性栏，
+   * 用户看得见拆成了什么。
    */
   function splitStateString(raw: string): { name: string; props: string } | null {
     const m = /^([^[\]]+)\[([^\]]*)\]\s*$/.exec(raw.trim());
@@ -132,8 +144,10 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
   async function lookupBlockName(raw: string) {
     const id = bareBlockId(raw);
     if (!id || blockNameQueried(id)) return;
+    const generation = editorGeneration;
     try {
       const hits = await searchBlocks(id, 50);
+      if (generation !== editorGeneration || !replaceOpen.value) return;
       // 只认名字完全一致的命中：搜索是模糊匹配，取自第一项会把
       // minecraft:oak_stairs 显示成 minecraft:oak_planks 这类近邻的名字
       const exact = hits.find((h) => h.name === id);
@@ -171,11 +185,6 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
     return blockNamesQueried.value.has(bareBlockId(raw));
   }
 
-  /** 让右侧列表接下来填到指定的输入框 */
-  function setPickField(field: "from" | "to") {
-    replacePickField.value = field;
-  }
-
   /** 方块栏的值变了：先拆掉可能粘贴进来的属性串，再查中文名。
    *
    * 拆完会再触发一次本函数（值已不含方括号，第二次直接走到查询），因此
@@ -207,6 +216,7 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
   watch(
     replaceForm,
     () => {
+      if (restoringSnapshot) return;
       replacePreview.value = null;
       previewSeq += 1;
     },
@@ -215,8 +225,7 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
 
   // 卸载时清掉待触发的查询：否则组件已销毁仍会发一次无意义的请求
   onBeforeUnmount(() => {
-    for (const timer of blockNameTimers.values()) clearTimeout(timer);
-    blockNameTimers.clear();
+    invalidateRequests();
   });
 
   /** 解析 "key=value,key2=value2" 形式的属性限定；空串表示不限定 */
@@ -245,114 +254,188 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
     };
   }
 
+  /** 方块库中的全部方块，按方块 ID 升序。
+   *
+   * 打开弹窗时取一次：替换的目标方块需要一个默认可选范围，只给空列表等于
+   * 要求用户先知道方块叫什么。清空关键字时回填这一份，不必再查一遍库。
+   */
+  const allBlocks = ref<BlockHit[]>([]);
+  /** 全量列表是否已成功取回（空库也算取到）——清空关键字时据此决定是回填还是重取 */
+  let allBlocksLoaded = false;
+  /** 全量请求序号：只接受最后一次全量请求的结果 */
+  let allBlocksSeq = 0;
+  let editorGeneration = 0;
+  let restoringSnapshot = false;
+
+  function invalidateRequests() {
+    editorGeneration++;
+    previewSeq++;
+    blockSearchSeq++;
+    allBlocksSeq++;
+    pendingLoads.clear();
+    blockSearching.value = false;
+    replaceBusy.value = false;
+    for (const timer of blockNameTimers.values()) clearTimeout(timer);
+    blockNameTimers.clear();
+  }
+
+  watch(replaceOpen, (open, previous) => {
+    if (!open && previous) invalidateRequests();
+  });
+
+  /** 每次请求独立结算，旧请求的 finally 不影响新会话的加载状态。 */
+  const pendingLoads = new Set<number>();
+  let nextLoadId = 1;
+
+  function beginLoad(): number {
+    const id = nextLoadId++;
+    pendingLoads.add(id);
+    blockSearching.value = true;
+    return id;
+  }
+
+  function endLoad(id: number) {
+    pendingLoads.delete(id);
+    blockSearching.value = pendingLoads.size > 0;
+  }
+
+  /** 把检索结果里的名字记下来（并标记为已查过），点选时就不必再查 */
+  function rememberHits(hits: BlockHit[]) {
+    const names = { ...blockNames.value };
+    const checked = new Set(blockNamesQueried.value);
+    for (const h of hits) {
+      names[h.name] = { zhName: h.zh, enName: h.en };
+      checked.add(h.name);
+    }
+    blockNames.value = names;
+    blockNamesQueried.value = checked;
+  }
+
   async function onBlockSearch(text: string) {
     const q = text.trim();
     // 记下这次查询的序号：逐字符搜索会并发多个请求，慢的旧响应回来时
     // 不能覆盖新结果，否则列表内容与输入框里的关键字对不上
     const seq = ++blockSearchSeq;
     if (!q) {
-      blockHits.value = [];
-      // 空查询自己就是最新的一次查询，而它在途的前一次查询已经因为序号
-      // 不匹配不再复位这个标志；这里必须复位，否则「输入后立刻清空」会把
-      // 转圈状态永久留在界面上
-      blockSearching.value = false;
+      // 清空关键字回到全量列表。还没有取到过（打开时那次被搜索抢先、
+      // 或上一次取回失败）就重新取，否则会把空列表当成「库里没有方块」
+      if (allBlocksLoaded) blockHits.value = allBlocks.value;
+      else void loadAllBlocks();
       return;
     }
-    blockSearching.value = true;
+    const loadId = beginLoad();
     try {
       const hits = await searchBlocks(q, 200);
       if (seq !== blockSearchSeq) return; // 已有更新的查询，丢弃这份过期结果
       blockHits.value = hits;
-      // 顺手把结果里的名字记下来（并标记为已查过），点选时就不必再查
-      const names = { ...blockNames.value };
-      const checked = new Set(blockNamesQueried.value);
-      for (const h of hits) {
-        names[h.name] = { zhName: h.zh, enName: h.en };
-        checked.add(h.name);
-      }
-      blockNames.value = names;
-      blockNamesQueried.value = checked;
+      rememberHits(hits);
     } catch (e) {
       if (seq !== blockSearchSeq) return;
       Message.error(t("replace.searchFailed", { error: String(e) }));
     } finally {
-      if (seq === blockSearchSeq) blockSearching.value = false;
+      endLoad(loadId);
     }
   }
 
-  /** 点选右侧列表里的方块，填到当前选定的那个输入框 */
+  /** 取回方块库的全部方块填进右侧列表。
+   *
+   * 全量结果与关键字检索各用各的序号：用户在等待期间输入关键字时，
+   * 晚到的全量结果只更新缓存、不覆盖屏幕上的检索结果；反过来，
+   * 全量还在途时清空关键字，也不会把空缓存当成「库里没有方块」。
+   */
+  async function loadAllBlocks() {
+    const seq = ++allBlocksSeq;
+    const loadId = beginLoad();
+    try {
+      const hits = await listBlocks();
+      if (seq !== allBlocksSeq) return;
+      allBlocks.value = hits;
+      allBlocksLoaded = true;
+      rememberHits(hits);
+      // 用户这时没有在搜关键字，才把列表换成全量；否则会把他正在看的检索结果顶掉
+      if (!blockPickQuery.value.trim()) blockHits.value = hits;
+    } catch (e) {
+      if (seq !== allBlocksSeq) return;
+      allBlocksLoaded = false;
+      // 不能留一个空列表了事：用户会以为方块库里一个方块都没有
+      Message.error(t("replace.listFailed", { error: String(e) }));
+    } finally {
+      endLoad(loadId);
+    }
+  }
+
+  /** 点选右侧列表里的方块，填到目标方块 */
   function pickBlock(hit: BlockHit) {
     const f = replaceForm.value;
     rememberBlockName(hit.name, { zhName: hit.zh, enName: hit.en });
     // 提示里报出用户当前语言看得懂的名字，而不是方块 ID
     const shown = displayName({ zhName: hit.zh, enName: hit.en }) || hit.name;
-    if (replacePickField.value === "from") {
-      // 换源方块必须同时清掉属性限定：属性是上一个方块特有的，留着它
-      // 会让这条规则一个都匹配不上，而界面看上去「明明填好了」
-      const hadProps = f.fromPropsText.trim().length > 0;
-      f.fromName = hit.name;
-      f.fromPropsText = "";
-      Message.success(
-        t("replace.setSource", { name: shown }) +
-          (hadProps ? t("replace.sourcePropsCleared") : ""),
-      );
-    } else {
-      // 目标属性覆盖同理：它是无条件写上去的（replace.rs 里 to_props 最后
-      // 强制 set_prop），留着上一个目标方块的属性会把新目标也带上那个属性
-      const hadProps = f.toPropsText.trim().length > 0;
-      f.toName = hit.name;
-      f.toPropsText = "";
-      Message.success(
-        t("replace.setTarget", { name: shown }) +
-          (hadProps ? t("replace.targetPropsCleared") : ""),
-      );
-    }
-  }
-
-  /** 点方块统计表的一行，把它设为替换源。
-   *
-   * 表里的行是**物品**行（水折成水桶、门只算下半），而替换规则在后端按方块名
-   * 精确相等匹配（见 replace.rs 的 matches）。因此替换源取这一行的代表状态
-   * 所属的方块名，而不是行名：行名可能是这个投影里根本不存在的物品——库里
-   * 只有墙上的告示牌时，行名是告示牌物品，填进去一条都匹配不上。
-   *
-   * 两种情况必须说清覆盖范围，否则用户以为「替换整行」而实际只替换了一部分：
-   * 跨多个方块名时（火把与墙上的火把）只覆盖其中一个；合计了多条状态记录时
-   * 不带属性限定。
-   */
-  function onBlockRowClick(raw: TableData) {
-    const rec = raw as unknown as BlockRow;
-    // 状态串形如 minecraft:oak_stairs[facing=east,half=top]
-    const m = /^([^[\]]+)\[([^\]]*)\]\s*$/.exec(rec.state ?? "");
-    const blockName = m ? m[1] : rec.state;
-    activeBlock.value = { name: blockName };
-    replaceForm.value.fromName = blockName;
-    const single = rec.forms.length === 1 && rec.stateCount === 1;
-    replaceForm.value.fromPropsText = single && m ? m[2] : "";
-    if (rec.forms.length > 1) {
-      const others = rec.forms.filter((f) => f !== blockName);
-      Message.warning(
-        t("replace.rowMergedForms", {
-          name: blockName,
-          forms: rec.forms.length,
-          others: others.join(t("common.listSeparator")),
-        }),
-      );
-      return;
-    }
-    Message.info(
-      t("replace.setSource", { name: blockName }) + (single ? "" : t("replace.rowMultiState")),
+    // 目标属性覆盖是无条件写上去的（replace.rs 里 to_props 最后强制 set_prop），
+    // 留着上一个目标方块的属性会把新目标也带上那个属性
+    const hadProps = f.toPropsText.trim().length > 0;
+    f.toName = hit.name;
+    f.toPropsText = "";
+    Message.success(
+      t("replace.setTarget", { name: shown }) +
+        (hadProps ? t("replace.targetPropsCleared") : ""),
     );
   }
 
-  async function openReplace() {
+  /** 某一行对应的替换源：方块名与属性限定。
+   *
+   * 表里的行有两种口径：按物品合计时一行是「这个东西一共用多少」，属性一律
+   * 不带（那一行本就是所有状态的合计）；分状态时一行就是一个方块状态，
+   * 属性限定带入它自己的属性串，这样规则恰好只命中这一行。
+   *
+   * 方块名取代表状态所属的那个方块，而不是行名：行名可能是这个投影里根本
+   * 不存在的物品（库里只有墙上的告示牌时行名是告示牌物品），填进去一条都
+   * 匹配不上。
+   */
+  function sourceOf(row: BlockRow): { name: string; propsText: string } {
+    // 状态串形如 minecraft:oak_stairs[facing=east,half=top]
+    const m = /^([^[\]]+)\[([^\]]*)\]\s*$/.exec(row.state ?? "");
+    const name = m ? m[1] : row.state;
+    return { name, propsText: s.blockSplitStates.value && m ? m[2] : "" };
+  }
+
+  /** 点方块统计表的一行：只把它标为当前行。
+   *
+   * 选行本身不打开窗口：这张表首先是统计表，用户点行多半只是想看它。
+   * 要替换时点行内的「替换」，或用方向键选中后按回车。
+   */
+  function onBlockRowClick(raw: TableData) {
+    activeBlock.value = { key: (raw as unknown as BlockRow).key };
+  }
+
+  /** 把某一行设为替换源并打开替换窗口。
+   *
+   * 跨多个方块名时（火把与墙上的火把）必须说清只覆盖其中一个：这一行的数量
+   * 是整个物品的合计，用户会以为另一个形态也一起替换。
+   */
+  async function openReplaceFor(row: BlockRow) {
+    invalidateRequests();
+    const { name, propsText } = sourceOf(row);
+    activeBlock.value = { key: row.key };
+    replaceForm.value.fromName = name;
+    replaceForm.value.fromPropsText = propsText;
+    if (row.forms.length > 1) {
+      const others = row.forms.filter((f) => f !== name);
+      Message.warning(
+        t("replace.rowMergedForms", {
+          name,
+          forms: row.forms.length,
+          others: others.join(t("common.listSeparator")),
+        }),
+      );
+    }
     replaceOpen.value = true;
     replacePreview.value = null;
     blockPickQuery.value = "";
     blockHits.value = [];
-    // 列表默认填「替换目标」：替换时更常选的是「换成什么」，
-    // 而源方块多半是从「方块」页签点行带过来的
-    replacePickField.value = "to";
+    allBlocks.value = [];
+    // 全量列表按本次打开重取（库可能被换过）；同时让之前在途的全量请求作废
+    allBlocksLoaded = false;
+    allBlocksSeq += 1;
     // 名字缓存每次打开都作废：方块库可能在本程序运行期间被换掉
     // （到「版本库」里补齐或重建版本后，后端每条命令都会重新读库），
     // 留着旧结果会让明明能查到的方块一直显示「未找到」。
@@ -360,17 +443,27 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
     blockNameTimers.clear();
     blockNames.value = {};
     blockNamesQueried.value = new Set();
-    // 源方块默认取当前选中的方块，省去用户重打一遍
-    if (!replaceForm.value.fromName && activeBlock.value) {
-      replaceForm.value.fromName = activeBlock.value.name;
+    // 刚点的那一行带着名字时直接可用，不必再查一次库；名字为空（该版本的
+    // 语言表里没有这个方块）时保留「未查过」，让下面的查询真正去检索一次，
+    // 否则会被记成「已查过且查不到」，界面上直接显示未找到
+    if (row.zhName || row.enName) {
+      rememberBlockName(bareBlockId(replaceForm.value.fromName), {
+        zhName: row.zhName,
+        enName: row.enName,
+      });
     }
     // 本次打开时就查一次名字：值可能来自上次的填写而没有发生变化，
     // 只靠 watch 不会触发，那一栏就会空着
     void lookupBlockName(replaceForm.value.fromName);
     void lookupBlockName(replaceForm.value.toName);
+    // 目标方块默认列出全部方块：用户往往还不知道要换成什么，先给全貌再筛
+    void loadAllBlocks();
     if (blockVersions.value.length === 0) {
+      const generation = editorGeneration;
       try {
-        blockVersions.value = await listBlockVersions();
+        const versions = await listBlockVersions();
+        if (generation !== editorGeneration || !replaceOpen.value) return;
+        blockVersions.value = versions;
       } catch (e) {
         Message.error(t("replace.loadVersionsFailed", { error: String(e) }));
       }
@@ -391,7 +484,7 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
     replaceBusy.value = true;
     try {
       const r = await previewReplace(cur.path, rule);
-      if (seq !== previewSeq) return;
+      if (seq !== previewSeq || !replaceOpen.value || s.selected.value?.path !== cur.path) return;
       replacePreview.value = r.replaced;
     } catch (e) {
       if (seq !== previewSeq) return;
@@ -420,6 +513,44 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
     replaceOpen.value = false;
   }
 
+  function captureReplaceEditor(): ReplaceEditorSnapshot {
+    invalidateRequests();
+    return {
+      open: replaceOpen.value,
+      form: { ...replaceForm.value },
+      preview: replacePreview.value,
+      pickQuery: blockPickQuery.value,
+      hits: [...blockHits.value],
+      names: { ...blockNames.value },
+      namesQueried: [...blockNamesQueried.value],
+      activeBlockKey: activeBlock.value?.key ?? null,
+      versions: [...blockVersions.value],
+    };
+  }
+
+  function restoreReplaceEditor(snapshot: ReplaceEditorSnapshot) {
+    invalidateRequests();
+    restoringSnapshot = true;
+    activeBlock.value = snapshot.activeBlockKey ? { key: snapshot.activeBlockKey } : null;
+    replaceForm.value = { ...snapshot.form };
+    replacePreview.value = snapshot.preview;
+    blockPickQuery.value = snapshot.pickQuery;
+    blockHits.value = [...snapshot.hits];
+    blockNames.value = { ...snapshot.names };
+    blockNamesQueried.value = new Set(snapshot.namesQueried);
+    blockVersions.value = [...snapshot.versions];
+    replaceOpen.value = snapshot.open;
+    queueMicrotask(() => {
+      restoringSnapshot = false;
+    });
+    if (snapshot.open && snapshot.hits.length === 0) void loadAllBlocks();
+  }
+
+  function clearReplaceEditor() {
+    replaceOpen.value = false;
+    invalidateRequests();
+  }
+
   return {
     activeBlock,
     replaceOpen,
@@ -428,18 +559,19 @@ export function createBlockReplaceSlice(s: BlockReplaceDeps) {
     blockHits,
     blockSearching,
     blockVersions,
-    replacePickField,
     replaceForm,
     replacePreview,
     blockNameOf,
     blockNameQueried,
     onBlockSearch,
     onBlockRowClick,
-    setPickField,
+    openReplaceFor,
     pickBlock,
-    openReplace,
     doPreview,
     doReplace,
+    captureReplaceEditor,
+    restoreReplaceEditor,
+    clearReplaceEditor,
   };
 }
 

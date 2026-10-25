@@ -133,6 +133,7 @@ async function confirm() {
     :cancel-text="t('export.dialogCancel')"
     :ok-loading="exporting"
     :mask-closable="false"
+    unmount-on-close
     width="520px"
     @ok="confirm"
   >

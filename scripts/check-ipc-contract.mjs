@@ -24,9 +24,9 @@
  *
  * 用法：node scripts/check-ipc-contract.mjs
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 
-const COMMANDS_RS = "src-tauri/src/commands.rs";
+const COMMANDS_DIR = "src-tauri/src/commands";
 const LIB_RS = "src-tauri/src/lib.rs";
 const API_TS = "src/api.ts";
 
@@ -38,7 +38,7 @@ function toLowerCamel(snake) {
   return parts[0] + parts.slice(1).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join("");
 }
 
-/** 从 commands.rs 提取：命令名 -> { params: [{name, optional, injected}] } */
+/** 从命令层各模块提取：命令名 -> { params: [{name, optional, injected}] } */
 function parseRustCommands(src) {
   const out = new Map();
   // 匹配 `pub fn name(` 到配对的 `)` 之前的内容（参数表可能跨多行）
@@ -204,7 +204,20 @@ function findTopLevelColon(piece) {
   return -1;
 }
 
-const rustSrc = read(COMMANDS_RS);
+function listRustFiles(dir) {
+  const out = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const p = `${dir}/${entry.name}`;
+    if (entry.isDirectory()) out.push(...listRustFiles(p));
+    else if (entry.name.endsWith(".rs")) out.push(p);
+  }
+  return out;
+}
+
+const rustSrc = listRustFiles(COMMANDS_DIR)
+  .sort()
+  .map((p) => read(p))
+  .join("\n");
 const libSrc = read(LIB_RS);
 const apiSrc = read(API_TS);
 
@@ -215,10 +228,19 @@ const front = parseFrontendCalls(apiSrc);
 const errors = [];
 const warnings = [];
 
+// 命令函数的解析依赖正则；出现无返回类型、嵌套泛型逗号或以后拆出子目录时
+// 可能静默漏掉某个命令。用 #[tauri::command] 的数量兜底：漏解析就报错。
+const attrCount = (rustSrc.match(/#\[tauri::command\]/g) || []).length;
+if (attrCount !== rust.size) {
+  errors.push(
+    `命令层有 ${attrCount} 个 #[tauri::command]，但只解析出 ${rust.size} 个命令（解析规则需要同步更新）`,
+  );
+}
+
 // 1) 前端调用的命令必须已注册且已实现
 for (const [cmd, info] of front) {
   if (!rust.has(cmd)) {
-    errors.push(`前端调用 ${cmd}，但 commands.rs 里没有这个函数`);
+    errors.push(`前端调用 ${cmd}，但命令层里没有这个函数`);
     continue;
   }
   if (!handlers.has(cmd)) {

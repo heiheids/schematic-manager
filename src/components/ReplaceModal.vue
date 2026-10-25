@@ -1,13 +1,17 @@
 /**
  * 方块替换弹窗。
  *
- * 向导式流程：填替换规则（源方块、属性限定、目标方块）→ 预览数量 → 执行。
+ * 向导式流程：确认源方块（来自「方块」页签里点的那一行）→ 填目标方块 → 预览数量 → 执行。
  * 状态与流程都在 store/blockReplace.ts，这里只做展示与触发。
  *
- * 布局分左右两栏：左栏填规则，右栏是方块列表（搜索后点选即填入当前的
- * 那一栏）。两件事必须同时可见——填规则时要能随手挑方块，挑的时候又要
- * 看得见已经填了什么，挤在一个窄列里只能来回滚动，因此弹窗明显加宽。
- * 两栏各自用 Arco 的无轨道滚动条，超出的部分在栏内滚。
+ * 布局分左右两栏：左栏填规则，右栏是方块列表（搜索后点选即填入目标方块）。
+ * 两件事必须同时可见——填规则时要能随手挑方块，挑的时候又要看得见已经填了什么，
+ * 挤在一个窄列里只能来回滚动，因此弹窗明显加宽。两栏各自用 Arco 的无轨道滚动条，
+ * 超出的部分在栏内滚。
+ *
+ * 源方块与它的属性限定不能改：替换的入口是「方块」页签里某一行的替换按钮，
+ * 规则作用于哪一行在点按钮那一刻就已经确定。允许手改会让用户以为改的是那一行，
+ * 实际却按另一条规则执行。
  *
  * 凡是出现方块 ID 的地方都一并给出显示名称：只给 ID 时用户无法确认自己
  * 要替换掉的、要换成的到底是哪一个方块。名字分中英两套（后端从 Minecraft
@@ -28,13 +32,11 @@ const {
   blockHits,
   blockSearching,
   blockVersions,
-  replacePickField,
   replaceForm,
   replacePreview,
   blockNameOf,
   blockNameQueried,
   onBlockSearch,
-  setPickField,
   pickBlock,
   doPreview,
   doReplace,
@@ -56,9 +58,14 @@ function nameStatus(raw: string): string {
   return blockNameQueried(id) ? t("replace.notFound") : t("replace.querying");
 }
 
-/** 右侧列表点选会填到哪一栏 */
-function pickFieldLabel(): string {
-  return replacePickField.value === "from" ? t("replace.fieldFrom") : t("replace.fieldTo");
+/** 右侧列表为空时说明是「库里没有方块」还是「这次搜索没命中」 */
+function emptyDescription(): string {
+  return blockPickQuery.value.trim() ? t("common.noMatch") : t("replace.noBlocksInLibrary");
+}
+
+/** 列表为空且不在加载时才显示空状态：加载中显示「方块库为空」会误导 */
+function showEmpty(): boolean {
+  return !blockSearching.value && blockHits.value.length === 0;
 }
 </script>
 
@@ -88,18 +95,11 @@ function pickFieldLabel(): string {
                  一行，说明文字跑到输入框右边，左侧就对不齐了。 -->
             <a-form-item :label="t('replace.fromLabel')">
               <div class="repl-field">
-                <!-- 还空着的必填输入框给一圈红边（见 .repl-block--empty），
-                     填上就不上色：颜色只在需要提示时才出现 -->
-                <div
-                  class="repl-block"
-                  :class="{ 'repl-block--empty': !replaceForm.fromName.trim() }"
-                >
+                <div class="repl-block">
                   <a-input
                     v-model="replaceForm.fromName"
-                    :placeholder="t('replace.fromPlaceholder')"
-                    allow-clear
-                    @focus="setPickField('from')"
-                    @click="setPickField('from')"
+                    class="repl-from-name"
+                    readonly
                   />
                 </div>
                 <div v-if="shownName(replaceForm.fromName)" class="repl-block__zh">
@@ -108,17 +108,14 @@ function pickFieldLabel(): string {
                 <div v-else-if="nameStatus(replaceForm.fromName)" class="hint-dim">
                   {{ nameStatus(replaceForm.fromName) }}
                 </div>
-                <div class="hint-dim">{{ t("replace.fromPickHint") }}</div>
+                <div class="hint-dim">{{ t("replace.fixedSource") }}</div>
               </div>
             </a-form-item>
 
             <a-form-item :label="t('replace.fromPropsLabel')">
               <div class="repl-field">
-                <a-input
-                  v-model="replaceForm.fromPropsText"
-                  :placeholder="t('replace.fromPropsPlaceholder')"
-                  allow-clear
-                />
+                <!-- 只读框不给 placeholder：空着时写一句示例会让人以为这里能填 -->
+                <a-input v-model="replaceForm.fromPropsText" class="repl-from-props" readonly />
               </div>
             </a-form-item>
 
@@ -130,10 +127,9 @@ function pickFieldLabel(): string {
                 >
                   <a-input
                     v-model="replaceForm.toName"
+                    class="repl-to-name"
                     :placeholder="t('replace.toPlaceholder')"
                     allow-clear
-                    @focus="setPickField('to')"
-                    @click="setPickField('to')"
                   />
                 </div>
                 <div v-if="shownName(replaceForm.toName)" class="repl-block__zh">
@@ -149,6 +145,7 @@ function pickFieldLabel(): string {
               <div class="repl-field">
                 <a-input
                   v-model="replaceForm.toPropsText"
+                  class="repl-to-props"
                   :placeholder="t('replace.toPropsPlaceholder')"
                   allow-clear
                 />
@@ -189,7 +186,7 @@ function pickFieldLabel(): string {
         </a-scrollbar>
       </div>
 
-      <!-- 右栏：方块列表，点选即填到左栏选定的输入框 -->
+      <!-- 右栏：方块列表，点选即填到目标方块 -->
       <div class="repl-split__pane repl-split__pane--pick">
         <a-input-search
           v-model="blockPickQuery"
@@ -202,27 +199,20 @@ function pickFieldLabel(): string {
           @clear="onBlockSearch('')"
         />
         <div class="hint-dim" style="margin: 6px 0">
-          <i18n-t scope="global" keypath="replace.pickHint" tag="span">
-            <template #field><b>{{ pickFieldLabel() }}</b></template>
-          </i18n-t>
+          {{ t("replace.pickHint") }}
         </div>
         <a-scrollbar
           type="embed"
           class="repl-pick scroll-fill__inner"
           outer-class="scroll-fill"
         >
-          <a-empty
-            v-if="blockHits.length === 0"
-            :description="
-              blockPickQuery.trim() ? t('common.noMatch') : t('common.typeToSearch')
-            "
-          />
+          <a-empty v-if="showEmpty()" :description="emptyDescription()" />
           <button
             v-for="h in blockHits"
             :key="h.name"
             type="button"
             class="repl-pick__item"
-            :title="t('replace.pickTitle', { field: pickFieldLabel() })"
+            :title="t('replace.pickTitle')"
             @click="pickBlock(h)"
           >
             <!-- 显示名称在上、方块 ID 与英文名在下：名字是用户认方块的

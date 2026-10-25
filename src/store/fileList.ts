@@ -28,12 +28,16 @@ import {
   saveSchematicAs,
   scanDuplicates,
   scanLitematics,
+  peekSchematic,
 } from "../api";
 import { NAME_COL_W } from "../composables/useSidebarResize";
+import { directoryRootOrDefault } from "../utils/directory";
 import type {
   AnalysisResult,
+  DirectoryNode,
   DuplicateScan,
   ReplaceRule,
+  ScanResult,
   SchematicSummary,
   SceneData,
 } from "../types";
@@ -70,6 +74,13 @@ export interface FileListDeps {
   resetBlockIcons: () => void;
   /** 3D 预览域的场景加载；选中变化时调用 */
   loadScene: (record: SchematicSummary) => void;
+  /** 切换文件时清除子区选择 */
+  resetRegion: () => void;
+  /** 工作区装配后提供的标签同步入口 */
+  renameEditorPath?: (oldPath: string, newPath: string, newName: string) => void;
+  removeEditorPaths?: (paths: string[]) => void;
+  invalidateCardPreviews?: (paths?: string[]) => void;
+  confirmRemoveEditorPaths?: (paths: string[]) => Promise<boolean>;
 }
 
 /** 疑似重复组：名称、尺寸、方块总数都相同，但内容并不相同。
@@ -96,6 +107,15 @@ export interface StatusText {
   params?: Record<string, unknown>;
 }
 
+/** 可序列化的编辑会话部分，目录和勾选状态仍由文件管理域共享。 */
+export interface FileEditorSnapshot {
+  record: SchematicSummary;
+  analysis: AnalysisResult | null;
+  draft: { fileName: string; name: string; author: string; description: string };
+  dirtyMeta: boolean;
+  pendingReplace: ReplaceRule | null;
+}
+
 /** 重复组配色的种类数，与 global.scss 里生成的色相数量一致。
  *
  * 两组共用一种颜色会让人误以为它们是同一组，因此这个数一旦调整，
@@ -114,6 +134,9 @@ export function createFileListSlice(s: FileListDeps) {
    * 「它属于哪次加载」。
    */
   const dirItems = ref<Record<string, SchematicSummary[]>>({});
+  /** 每个根目录的目录树，和 dirItems 使用同一次扫描结果。 */
+  const dirTrees = ref<Record<string, DirectoryNode>>({});
+  const dirScanGenerations = new Map<string, number>();
 
   /** 已加载的目录，按加载顺序 */
   const loadedDirs = computed(() => Object.keys(dirItems.value));
@@ -131,6 +154,53 @@ export function createFileListSlice(s: FileListDeps) {
     return enabledDirs.value.has(dir);
   }
 
+  /** 同时替换文件清单和目录树，避免两个视图读到不同扫描代次。 */
+  function applyScanResult(dir: string, result: ScanResult) {
+    dirItems.value = { ...dirItems.value, [dir]: result.items };
+    dirTrees.value = {
+      ...dirTrees.value,
+      [dir]: directoryRootOrDefault(dir, result.root, result.items),
+    };
+  }
+
+  /** 每个根目录独立提交扫描结果，移除或重新扫描会使旧响应失效。 */
+  async function scanDirectories(
+    dirs: string[],
+    options: { enableNew?: boolean } = {},
+  ): Promise<{
+    scanned: string[];
+    missing: string[];
+    results: Record<string, ScanResult>;
+    errors: Record<string, unknown>;
+  }> {
+    const scanned: string[] = [];
+    const missing: string[] = [];
+    const results: Record<string, ScanResult> = {};
+    const errors: Record<string, unknown> = {};
+    for (const dir of [...new Set(dirs)]) {
+      const generation = (dirScanGenerations.get(dir) ?? 0) + 1;
+      dirScanGenerations.set(dir, generation);
+      const wasLoaded = dir in dirItems.value;
+      try {
+        const result = await scanLitematics(dir);
+        if (dirScanGenerations.get(dir) !== generation) continue;
+        applyScanResult(dir, result);
+        s.invalidateCardPreviews?.();
+        results[dir] = result;
+        if (options.enableNew && !wasLoaded) {
+          enabledDirs.value = new Set([...enabledDirs.value, dir]);
+        }
+        scanned.push(dir);
+      } catch (error) {
+        if (dirScanGenerations.get(dir) === generation) {
+          missing.push(dir);
+          errors[dir] = error;
+        }
+      }
+    }
+    return { scanned, missing, results, errors };
+  }
+
   /** 勾选/取消一个目录 */
   function toggleDir(dir: string, on: boolean) {
     const next = new Set(enabledDirs.value);
@@ -143,20 +213,32 @@ export function createFileListSlice(s: FileListDeps) {
     pruneChecks(files.value);
   }
 
+  /** 按码元比较，结果与运行环境的语言数据无关。
+   *
+   * 不用 localeCompare：同一份文件在不同系统上会排出不同顺序，
+   * 用户看到的列表顺序与「记住了哪个文件」都会随机器变化。
+   */
+  function comparePath(a: string, b: string): number {
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+
   /** 全部目录合并后的文件列表，只含被勾选目录的文件，按路径排序保证顺序稳定 */
   const files = computed<SchematicSummary[]>(() => {
-    const all: SchematicSummary[] = [];
+    const byPath = new Map<string, SchematicSummary>();
     for (const d of loadedDirs.value) {
       if (!enabledDirs.value.has(d)) continue;
-      all.push(...(dirItems.value[d] ?? []));
+      for (const item of dirItems.value[d] ?? []) {
+        if (!byPath.has(item.path)) byPath.set(item.path, item);
+      }
     }
-    all.sort((a, b) => a.path.localeCompare(b.path));
-    return all;
+    return [...byPath.values()].sort((a, b) => comparePath(a.path, b.path));
   });
 
   const selected = ref<SchematicSummary | null>(null);
   const analysis = ref<AnalysisResult | null>(null);
   const analyzing = ref(false);
+  /** 切换文件或会话时递增，迟到的分析响应不得写入新会话。 */
+  let analysisGeneration = 0;
   const saving = ref(false);
   // 元数据编辑草稿。选中文件时用文件中的值填充
   const draft = ref({ fileName: "", name: "", author: "", description: "" });
@@ -322,7 +404,7 @@ export function createFileListSlice(s: FileListDeps) {
       .filter((g) => g.paths.length > 1)
       .map((g) => ({ ...g, paths: g.paths.filter((p) => !confirmed.has(p)).sort() }))
       .filter((g) => g.paths.length > 0)
-      .sort((a, b) => a.paths[0].localeCompare(b.paths[0]));
+      .sort((a, b) => comparePath(a.paths[0], b.paths[0]));
   }
 
   /** 默认勾选「多于重复文件」：每组保留第一份，其余勾上待处理。
@@ -416,7 +498,7 @@ export function createFileListSlice(s: FileListDeps) {
   function sortFiles(list: SchematicSummary[]): SchematicSummary[] {
     const key = sortKey.value;
     const order = sortOrder.value;
-    if (!key || !order) return [...list].sort((a, b) => a.path.localeCompare(b.path));
+    if (!key || !order) return [...list].sort((a, b) => comparePath(a.path, b.path));
     const dir = order === "descend" ? -1 : 1;
     return [...list].sort((a, b) => {
       const va = sortValue(a, key);
@@ -425,13 +507,13 @@ export function createFileListSlice(s: FileListDeps) {
       const ea = va === "";
       const eb = vb === "";
       if (ea !== eb) return ea ? 1 : -1;
-      if (ea && eb) return a.path.localeCompare(b.path);
+      if (ea && eb) return comparePath(a.path, b.path);
       const cmp =
         typeof va === "number" && typeof vb === "number"
           ? va - vb
           : String(va).localeCompare(String(vb), "zh-Hans-CN");
       // 值相同时按路径定序，保证顺序稳定（否则每次重排都可能换位置）
-      return cmp !== 0 ? cmp * dir : a.path.localeCompare(b.path);
+      return cmp !== 0 ? cmp * dir : comparePath(a.path, b.path);
     });
   }
 
@@ -563,16 +645,9 @@ export function createFileListSlice(s: FileListDeps) {
     const hit = items.find((f) => f.path === cur.path);
     if (hit) {
       selected.value = hit;
-      resetDraft(hit);
-      return;
+      if (!dirty.value) resetDraft(hit);
     }
-    // 文件已不在新列表中：清空选中，以及只属于它的解析结果与预览，
-    // 否则右侧面板会显示上一个目录的数据
-    selected.value = null;
-    resetDraft(null);
-    analysis.value = null;
-    s.scene.value = null;
-    s.sceneError.value = "";
+    // 编辑会话独立于目录的启用与加载状态；目录变化只刷新仍存在的摘要。
   }
 
   // ---------------------------------------------------------------- 目录栏多选与文件操作
@@ -694,12 +769,23 @@ export function createFileListSlice(s: FileListDeps) {
   }
 
   /** 删除勾选的文件（移入回收站） */
-  async function doDeleteFiles() {
-    const list = checkedFiles.value;
+  async function doDeleteFiles(list = checkedFiles.value) {
     if (list.length === 0) return;
+    const paths = list.map((file) => file.path);
+    try {
+      await Modal.confirm({
+        title: t("files.delete"),
+        content: t("files.deleteConfirm", { count: paths.length }),
+        okText: t("files.delete"),
+        cancelText: t("files.unsavedCancel"),
+      });
+    } catch {
+      return;
+    }
+    if (s.confirmRemoveEditorPaths && !(await s.confirmRemoveEditorPaths(paths))) return;
     fileBusy.value = true;
     try {
-      const r = await deleteFiles(list.map((f) => f.path));
+      const r = await deleteFiles(paths);
       Message.success(
         t("files.deleted", { count: r.names.length, size: formatBytes(r.totalBytes) }),
       );
@@ -712,6 +798,9 @@ export function createFileListSlice(s: FileListDeps) {
         next[d] = (dirItems.value[d] ?? []).filter((f) => !gone.has(f.path));
       }
       dirItems.value = next;
+      for (const tree of Object.values(dirTrees.value)) removeTreePaths(tree, gone);
+      s.removeEditorPaths?.([...gone]);
+      s.invalidateCardPreviews?.([...gone]);
       pruneChecks(files.value);
       syncSelection(files.value);
     } catch (e) {
@@ -722,8 +811,7 @@ export function createFileListSlice(s: FileListDeps) {
   }
 
   /** 复制勾选的文件到剪贴板 */
-  async function doCopyFiles() {
-    const list = checkedFiles.value;
+  async function doCopyFiles(list = checkedFiles.value) {
     if (list.length === 0) return;
     fileBusy.value = true;
     try {
@@ -742,8 +830,7 @@ export function createFileListSlice(s: FileListDeps) {
   }
 
   /** 复制到指定目录：先让用户选目标目录 */
-  async function doCopyFilesTo() {
-    const list = checkedFiles.value;
+  async function doCopyFilesTo(list = checkedFiles.value) {
     if (list.length === 0) return;
     try {
       const dest = await open({
@@ -773,8 +860,8 @@ export function createFileListSlice(s: FileListDeps) {
    * 只处理第一个：资源管理器的「选中」语义只对一个目标有意义，
    * 因此界面上也如实提示用的是哪一个。
    */
-  async function doOpenFolder() {
-    const first = checkedFiles.value[0];
+  async function doOpenFolder(list = checkedFiles.value) {
+    const first = list[0];
     if (!first) return;
     try {
       await revealInFileManager(first.path);
@@ -805,9 +892,11 @@ export function createFileListSlice(s: FileListDeps) {
     const row = raw as unknown as SchematicSummary;
     const me = ev as MouseEvent;
     // 视口下边缘附近要向上翻，否则菜单会被窗口裁掉
+    const menuW = 140;
     const menuH = 40;
-    const y = me.clientY + menuH > window.innerHeight ? me.clientY - menuH : me.clientY;
-    ctxMenu.value = { open: true, x: me.clientX, y, path: row.path, name: row.fileName };
+    const x = Math.max(4, Math.min(me.clientX, window.innerWidth - menuW - 4));
+    const y = Math.max(4, Math.min(me.clientY, window.innerHeight - menuH - 4));
+    ctxMenu.value = { open: true, x, y, path: row.path, name: row.fileName };
   }
 
   function closeRowMenu() {
@@ -873,6 +962,7 @@ export function createFileListSlice(s: FileListDeps) {
     window.addEventListener("blur", onGlobalPointerDown);
     // 拦截浏览器默认右键菜单（capture 阶段，确保在组件处理之前生效）
     document.addEventListener("contextmenu", onDocumentContextMenu, true);
+    document.addEventListener("scroll", closeRowMenu, true);
   });
 
   // 组件卸载时摘掉 window 上的监听，避免留下悬挂的监听
@@ -881,6 +971,7 @@ export function createFileListSlice(s: FileListDeps) {
     window.removeEventListener("keydown", onGlobalKey);
     window.removeEventListener("blur", onGlobalPointerDown);
     document.removeEventListener("contextmenu", onDocumentContextMenu, true);
+    document.removeEventListener("scroll", closeRowMenu, true);
   });
 
   async function pickDirectory() {
@@ -908,43 +999,27 @@ export function createFileListSlice(s: FileListDeps) {
     if (dirs.length === 0) return;
 
     setStatus("files.statusScanning");
-    const next = { ...dirItems.value };
-    const parts: string[] = [];
-    let bad = 0;
-    let skippedDirs = 0;
-    const skippedPaths: string[] = [];
-    let added = 0;
-
-    for (const dir of dirs) {
-      try {
-        const r = await scanLitematics(dir);
-        if (!(dir in next)) added++;
-        next[dir] = r.items;
-        bad += r.items.filter((f) => f.error).length;
-        skippedDirs += r.skippedDirs;
-        skippedPaths.push(...r.skippedPaths);
-      } catch (e) {
-        // 一个目录失败不应让其余目录也加载不了；如实报出是哪个目录
-        Message.error(t("files.scanDirFailed", { dir, error: String(e) }));
-      }
+    const previousDirs = new Set(loadedDirs.value);
+    const { scanned, missing, results, errors } = await scanDirectories(dirs, { enableNew: true });
+    for (const dir of missing) {
+      Message.error(t("files.scanDirFailed", { dir, error: String(errors[dir]) }));
     }
-
-    if (Object.keys(next).length === Object.keys(dirItems.value).length && added === 0) {
-      // 一个目录都没加进来（全部失败或被取消）
-      if (skippedDirs === 0) Message.warning(t("files.noNewDirs"));
+    if (scanned.length === 0) {
+      Message.warning(t("files.noNewDirs"));
       setStatus("files.statusScanDone");
       return;
     }
 
-    dirItems.value = next;
-    // 新加载的目录默认勾选：用户刚选完目录，期望立刻看到内容。
-    // 已存在的目录保持原勾选状态，不因为重新扫描而被重置。
-    const checked = new Set(enabledDirs.value);
-    for (const dir of dirs) {
-      if (dir in next) checked.add(dir);
+    const parts: string[] = [];
+    const skippedPaths: string[] = [];
+    let bad = 0;
+    let skippedDirs = 0;
+    for (const result of Object.values(results)) {
+      bad += result.items.filter((file) => file.error).length;
+      skippedDirs += result.skippedDirs;
+      skippedPaths.push(...result.skippedPaths);
     }
-    enabledDirs.value = checked;
-    // 新的合并列表出来后收敛选中与勾选
+    const added = scanned.filter((dir) => !previousDirs.has(dir)).length;
     syncSelection(files.value);
     pruneChecks(files.value);
 
@@ -973,9 +1048,14 @@ export function createFileListSlice(s: FileListDeps) {
    * 某个目录临时不可读而连带失败，而用户只是想移掉一个目录。
    */
   function removeDir(dir: string) {
+    dirScanGenerations.set(dir, (dirScanGenerations.get(dir) ?? 0) + 1);
     const next = { ...dirItems.value };
     delete next[dir];
     dirItems.value = next;
+    const nextTrees = { ...dirTrees.value };
+    delete nextTrees[dir];
+    dirTrees.value = nextTrees;
+    s.invalidateCardPreviews?.();
     // 勾选集里也要去掉它：留着已卸载目录的条目，之后重新加载同名目录时
     // 会「自己就勾上了」，与用户预期不符
     const checked = new Set(enabledDirs.value);
@@ -1002,6 +1082,16 @@ export function createFileListSlice(s: FileListDeps) {
    *
    * 这里只做本地收敛，不重新扫描：调用方随后会 rescanAll 或在失败分支里补扫。
    */
+  function renameTreePath(node: DirectoryNode, oldPath: string, newPath: string) {
+    node.filePaths = node.filePaths.map((p) => (p === oldPath ? newPath : p));
+    for (const child of node.children) renameTreePath(child, oldPath, newPath);
+  }
+
+  function removeTreePaths(node: DirectoryNode, paths: Set<string>) {
+    node.filePaths = node.filePaths.filter((p) => !paths.has(p));
+    for (const child of node.children) removeTreePaths(child, paths);
+  }
+
   function syncRenamedPath(cur: SchematicSummary, newPath: string, newName: string) {
     const patch = <T extends SchematicSummary>(f: T): T =>
       f.path === cur.path ? { ...f, path: newPath, fileName: newName } : f;
@@ -1015,6 +1105,7 @@ export function createFileListSlice(s: FileListDeps) {
       moved[dir] = items.map(patch);
     }
     dirItems.value = moved;
+    for (const tree of Object.values(dirTrees.value)) renameTreePath(tree, cur.path, newPath);
 
     if (checkedPaths.value.has(cur.path)) {
       const next = new Set(checkedPaths.value);
@@ -1025,22 +1116,72 @@ export function createFileListSlice(s: FileListDeps) {
     // 改名会改动 dirItems，下面的 watcher 随即作废上一次的筛查结论，
     // 因此这里不需要（也不该）把组里的旧路径改成新路径：
     // 旁路维护一份随时会被清掉的镜像，只会让人以为它还有用。
+    s.renameEditorPath?.(cur.path, newPath, newName);
+    s.invalidateCardPreviews?.([cur.path]);
   }
 
   async function rescanAll(): Promise<void> {
-    const dirs = loadedDirs.value;
-    if (dirs.length === 0) return;
-    const next: Record<string, SchematicSummary[]> = {};
-    for (const d of dirs) {
-      try {
-        const r = await scanLitematics(d);
-        next[d] = r.items;
-      } catch (e) {
-        Message.error(t("files.rescanFailed", { dir: d, error: String(e) }));
-        next[d] = dirItems.value[d] ?? [];
-      }
+    const { missing, errors } = await scanDirectories(loadedDirs.value);
+    for (const dir of missing) {
+      Message.error(t("files.rescanFailed", { dir, error: String(errors[dir]) }));
     }
-    dirItems.value = next;
+    pruneChecks(files.value);
+  }
+
+  function captureFileEditor(): FileEditorSnapshot | null {
+    const record = selected.value;
+    if (!record) return null;
+    analysisGeneration++;
+    analyzing.value = false;
+    return {
+      record,
+      analysis: analysis.value,
+      draft: { ...draft.value },
+      dirtyMeta: dirtyMeta.value,
+      pendingReplace: pendingReplace.value
+        ? {
+            ...pendingReplace.value,
+            fromProps: [...pendingReplace.value.fromProps],
+            toProps: [...pendingReplace.value.toProps],
+          }
+        : null,
+    };
+  }
+
+  function invalidateAnalysis() {
+    analysisGeneration++;
+    analysis.value = null;
+    analyzing.value = false;
+    s.resetBlockIcons();
+  }
+
+  function restoreFileEditor(snapshot: FileEditorSnapshot) {
+    analysisGeneration++;
+    selected.value = snapshot.record;
+    analysis.value = snapshot.analysis;
+    draft.value = { ...snapshot.draft };
+    dirtyMeta.value = snapshot.dirtyMeta;
+    pendingReplace.value = snapshot.pendingReplace
+      ? {
+          ...snapshot.pendingReplace,
+          fromProps: [...snapshot.pendingReplace.fromProps],
+          toProps: [...snapshot.pendingReplace.toProps],
+        }
+      : null;
+    analyzing.value = false;
+    s.resetBlockIcons();
+  }
+
+  function clearEditor() {
+    analysisGeneration++;
+    selected.value = null;
+    analysis.value = null;
+    analyzing.value = false;
+    resetDraft(null);
+    s.scene.value = null;
+    s.sceneError.value = "";
+    s.resetRegion();
+    s.resetBlockIcons();
   }
 
   function resetDraft(record: SchematicSummary | null) {
@@ -1079,9 +1220,18 @@ export function createFileListSlice(s: FileListDeps) {
   async function saveDraft() {
     const cur = selected.value;
     if (!cur) return;
+    const submittedDraft = { ...draft.value };
+    const submittedReplace = pendingReplace.value;
     saving.value = true;
     let renameNote = "";
     let renamedOk = false;
+    let contentChanged = false;
+    const refreshChangedContent = async () => {
+      const current = selected.value;
+      if (!contentChanged || !current) return;
+      s.resetBlockIcons();
+      if (await loadAnalysis(current)) void s.loadScene(current);
+    };
     try {
       // 顺序：替换 → 改名 → 写元数据。
       //
@@ -1089,10 +1239,10 @@ export function createFileListSlice(s: FileListDeps) {
       // 之后再用旧路径去替换就找不到文件了。元数据放最后，原因是改名本身
       // 需要先把元数据写到新路径上（见下）。
       let replaceNote = "";
-      if (pendingReplace.value) {
-        const rule = pendingReplace.value;
+      if (submittedReplace) {
         try {
-          const r = await applyReplace(cur.path, rule);
+          const r = await applyReplace(cur.path, submittedReplace);
+          contentChanged = r.replaced > 0 || r.paletteChanged > 0;
           if (r.replaced > 0) {
             replaceNote = t("files.savedReplace", { count: r.replaced });
           } else {
@@ -1100,7 +1250,7 @@ export function createFileListSlice(s: FileListDeps) {
           }
           // 替换已写进文件，草稿里的这条规则必须立刻清掉：
           // 留着的话用户再点一次保存会重复替换一遍
-          pendingReplace.value = null;
+          if (pendingReplace.value === submittedReplace) pendingReplace.value = null;
         } catch (e) {
           // 替换失败不阻断元数据保存：两者互不影响，能存下去的应当存下去，
           // 但必须让用户知道替换没成功，不能悄悄跳过
@@ -1112,8 +1262,8 @@ export function createFileListSlice(s: FileListDeps) {
       // 顺序不能反：先写元数据再改名，会先给旧名字留一份备份，
       // 而改名又要重新链接备份，同一件事被做两遍且中间态对不上。
       let targetPath = cur.path;
-      if (fileNameChanged(cur)) {
-        const renamed = await renameSchematic(cur.path, draft.value.fileName.trim());
+      if (submittedDraft.fileName.trim() !== cur.fileName) {
+        const renamed = await renameSchematic(cur.path, submittedDraft.fileName.trim());
         targetPath = renamed.path;
         renameNote = t("files.renamedTo", { name: renamed.fileName });
         renamedOk = true;
@@ -1131,17 +1281,25 @@ export function createFileListSlice(s: FileListDeps) {
         syncRenamedPath(cur, renamed.path, renamed.fileName);
       }
       const out = await saveMetadata(targetPath, {
-        name: draft.value.name,
-        author: draft.value.author,
-        description: draft.value.description,
+        name: submittedDraft.name,
+        author: submittedDraft.author,
+        description: submittedDraft.description,
       });
-      dirtyMeta.value = false;
       // 重新读取，确保界面显示的是文件中的真实内容而不是内存里的草稿
       await rescanAll();
+      const metadataUnchanged =
+        draft.value.fileName === submittedDraft.fileName &&
+        draft.value.name === submittedDraft.name &&
+        draft.value.author === submittedDraft.author &&
+        draft.value.description === submittedDraft.description;
+      dirtyMeta.value = !metadataUnchanged;
       const hit = files.value.find((f) => f.path === targetPath);
       if (hit) {
         selected.value = hit;
-        resetDraft(hit);
+        if (metadataUnchanged && !pendingReplace.value) resetDraft(hit);
+      }
+      await refreshChangedContent();
+      if (hit) {
         Message.success(
           t("files.saved", { note: `${replaceNote}${renameNote}`, path: out.backupPath }),
         );
@@ -1164,26 +1322,20 @@ export function createFileListSlice(s: FileListDeps) {
       // 重新扫描，让界面回到与磁盘一致的状态（改名已生效的那部分也要体现出来）。
       // 重扫本身失败时 rescanAll 已逐目录提示过，这里只是兜底不让它打断 finally。
       await rescanAll().catch(() => {});
+      await refreshChangedContent();
     } finally {
       saving.value = false;
     }
   }
 
-  /** 另存为新文件。
-   *
-   * 与「保存」的区别：产物是一个全新文件，原文件不动；保存成功后把编辑对象
-   * 切到新文件，之后的保存都写到新路径上。
-   *
-   * 待替换规则不跟随：它记的是「在原文件上改哪些方块」，写到新文件里再执行
-   * 一次是合理的，但这里刻意不带过去——另存为的语义是「把当前状态存一份」，
-   * 用户随后仍可在新文件上重新挑规则。
-   */
+  /** 把当前元数据与暂存替换写入新文件，原文件保持不变。 */
   async function saveAs() {
     const cur = selected.value;
     if (!cur) return;
+    const submittedDraft = { ...draft.value };
+    const submittedReplace = pendingReplace.value;
     saving.value = true;
     try {
-      // 保存对话框失败必须提示：放在 try 外会让这个 Promise 静默 reject
       let target: unknown;
       try {
         const stem = cur.fileName.replace(/\.litematic$/i, "");
@@ -1199,20 +1351,29 @@ export function createFileListSlice(s: FileListDeps) {
       if (typeof target !== "string") return;
 
       const out = await saveSchematicAs(cur.path, target, {
-        name: draft.value.name,
-        author: draft.value.author,
-        description: draft.value.description,
+        name: submittedDraft.name,
+        author: submittedDraft.author,
+        description: submittedDraft.description,
       });
+      if (submittedReplace) await applyReplace(out, submittedReplace);
+      const hit = await peekSchematic(out);
       Message.success(t("files.saveAsDone", { path: out }));
-
-      // 切到新文件：用户是拿它当「换个名字继续编辑」用的，
-      // 留在原文件上会让后续保存又写回原路径，与刚才的动作相反
       await rescanAll();
-      const hit = files.value.find((f) => f.path === out);
-      if (hit) {
-        selected.value = hit;
-        resetDraft(hit);
-        void s.loadScene(hit);
+      if (selected.value?.path === cur.path) {
+        const latestDraft = { ...draft.value };
+        const latestReplace = pendingReplace.value;
+        const metadataChanged =
+          latestDraft.fileName !== submittedDraft.fileName ||
+          latestDraft.name !== submittedDraft.name ||
+          latestDraft.author !== submittedDraft.author ||
+          latestDraft.description !== submittedDraft.description;
+        const replacementChanged = latestReplace !== submittedReplace;
+        await selectRecord(hit, { confirm: false });
+        if (metadataChanged) {
+          draft.value = latestDraft;
+          dirtyMeta.value = true;
+        }
+        if (replacementChanged) pendingReplace.value = latestReplace;
       }
     } catch (e) {
       Message.error(t("files.saveAsFailed", { error: String(e) }));
@@ -1243,42 +1404,66 @@ export function createFileListSlice(s: FileListDeps) {
     }
   }
 
+  /** 只加载分析结果，保留当前草稿。返回 false 表示响应已属于旧会话。 */
+  async function loadAnalysis(record: SchematicSummary): Promise<boolean> {
+    const generation = ++analysisGeneration;
+    analyzing.value = true;
+    try {
+      const result = await analyzeSchematic(record.path);
+      if (generation !== analysisGeneration || selected.value?.path !== record.path) return false;
+      analysis.value = result;
+      return true;
+    } catch (e) {
+      if (generation === analysisGeneration && selected.value?.path === record.path) {
+        Message.error(t("files.analyzeFailed", { error: String(e) }));
+        return true;
+      }
+      return false;
+    } finally {
+      if (generation === analysisGeneration) analyzing.value = false;
+    }
+  }
+
+  /** 选中一个文件并开始加载。已有会话恢复走 restoreFileEditor，不经过这里。 */
+  async function selectRecord(
+    record: SchematicSummary,
+    options: { confirm?: boolean } = {},
+  ): Promise<boolean> {
+    const switching = selected.value?.path !== record.path;
+    if (
+      switching &&
+      options.confirm !== false &&
+      !(await confirmDiscard("files.unsavedSwitch"))
+    ) {
+      return false;
+    }
+    analysisGeneration++;
+    selected.value = record;
+    s.resetRegion();
+    s.resetBlockIcons();
+    analysis.value = null;
+    analyzing.value = false;
+    s.scene.value = null;
+    s.sceneError.value = record.error || "";
+    resetDraft(record);
+    if (record.error) return true;
+    // 先解析再建场景，方块数过大时由分析结果决定是否允许自动渲染。
+    if (await loadAnalysis(record)) void s.loadScene(record);
+    return true;
+  }
+
   // Arco 的 row-click 回调给出的是通用的 TableData，
   // 这里收窄回业务类型；行数据本就来自 files，字段是一致的。
   async function onRowClick(raw: TableData) {
-    const record = raw as unknown as SchematicSummary;
-    // 换成另一个文件前先确认：未保存的改动会随 resetDraft 一起丢掉。
-    // 点的是当前这个文件时不必问——那正是「重新载入」，用户本来就想丢弃草稿。
-    const switching = selected.value?.path !== record.path;
-    if (switching && !(await confirmDiscard("files.unsavedSwitch"))) return;
-    selected.value = record;
-    s.resetBlockIcons();
-    analysis.value = null;
-    resetDraft(record);
-    if (record.error) return;
-    // 先解析再建 3D 场景：方块数过大时预览区不自动渲染，而「过大」要看
-    // 统计结果才能判断。两个命令各自都要读一遍文件，串行并不比并行慢多少。
-    analyzing.value = true;
-    try {
-      analysis.value = await analyzeSchematic(record.path);
-    } catch (e) {
-      Message.error(t("files.analyzeFailed", { error: String(e) }));
-    } finally {
-      analyzing.value = false;
-    }
-    void s.loadScene(record);
+    await selectRecord(raw as unknown as SchematicSummary);
   }
 
-  /** 重新解析当前选中项。
-   *
-   * 方块名与渲染图都来自基础库，库一变（版本库补/重建了版本、语言表补齐）
-   * 先前那份分析结果里存的就是旧名字。不重解析的话，用户会看到「库已经更新了、
-   * 界面还是英文名」，只能靠再点一次那一行才会变——那不该由用户去猜。
-   */
+  /** 基础库变化后刷新当前分析，保留正在编辑的草稿。 */
   async function refreshSelectedAnalysis() {
     const cur = selected.value;
-    if (!cur) return;
-    await onRowClick(cur as unknown as TableData);
+    if (!cur || cur.error) return;
+    s.resetBlockIcons();
+    if (await loadAnalysis(cur)) void s.loadScene(cur);
   }
 
   /** 列表行的样式类：当前选中项高亮，重复文件按组上色，疑似重复另行标出。
@@ -1315,6 +1500,8 @@ export function createFileListSlice(s: FileListDeps) {
 
   return {
     dirItems,
+    dirTrees,
+    applyScanResult,
     loadedDirs,
     enabledDirs,
     isDirEnabled,
@@ -1345,9 +1532,16 @@ export function createFileListSlice(s: FileListDeps) {
     pickDirectory,
     removeDir,
     rescanAll,
+    scanDirectories,
     syncSelection,
     syncRenamedPath,
     onRowClick,
+    selectRecord,
+    loadAnalysis,
+    invalidateAnalysis,
+    captureFileEditor,
+    restoreFileEditor,
+    clearEditor,
     refreshSelectedAnalysis,
     columns,
     colWidths,

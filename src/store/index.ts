@@ -17,12 +17,15 @@ import type { InjectionKey } from "vue";
 import { useSidebarResize } from "../composables/useSidebarResize";
 import { usePreviewResize } from "../composables/usePreviewResize";
 import { createFileListSlice } from "./fileList";
+import { createFileManagerSlice } from "./fileManager";
+import { createCardPreviewSlice } from "./cardPreview";
 import { createScenePreviewSlice } from "./scenePreview";
 import { createBlockReplaceSlice } from "./blockReplace";
 import { createVersionConvertSlice } from "./versionConvert";
 import { createBackupsSlice } from "./backups";
 import { createSetupSlice } from "./setup";
 import { createUpdateSlice } from "./update";
+import { createWorkspaceSlice } from "./workspace";
 import { createUiStateSlice } from "./uiState";
 
 export interface AppStore
@@ -35,6 +38,9 @@ export interface AppStore
     ReturnType<typeof createBackupsSlice>,
     ReturnType<typeof createSetupSlice>,
     ReturnType<typeof createUpdateSlice>,
+    ReturnType<typeof createFileManagerSlice>,
+    ReturnType<typeof createCardPreviewSlice>,
+    ReturnType<typeof createWorkspaceSlice>,
     ReturnType<typeof createUiStateSlice> {}
 
 /**
@@ -56,6 +62,9 @@ export function createAppStore(): AppStore {
   Object.assign(s, createBackupsSlice(s));
   Object.assign(s, createSetupSlice(s));
   Object.assign(s, createUpdateSlice());
+  Object.assign(s, createFileManagerSlice(s));
+  Object.assign(s, createCardPreviewSlice());
+  Object.assign(s, createWorkspaceSlice(s));
   Object.assign(s, createUiStateSlice(s));
   return s;
 }

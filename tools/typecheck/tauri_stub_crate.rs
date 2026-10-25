@@ -33,7 +33,7 @@ impl std::fmt::Display for Error {
 /// `Result<T, Error>`，命令层的 `spawn_blocking(..).await.map_err(..)` 才检查得下去。
 ///
 /// 桩**真的把任务跑掉**并立刻给出结果，而不是永远挂着：命令层的单元测试
-/// 会经 `block_on` 跑整条链路（见 commands.rs 里那条异步外壳用例），
+/// 会经 `block_on` 跑整条链路（见 commands/duplicates.rs 里那条异步外壳用例），
 /// 若此处返回 Pending，那个测试会一直转下去（run.ps1 没有超时）。
 pub mod async_runtime {
     use std::future::Future;
@@ -137,4 +137,23 @@ impl Manager for AppHandle {
 
 pub fn stub_path(p: &str) -> PathBuf {
     PathBuf::from(p)
+}
+
+/// 事件发送。真实 tauri 要求 payload: Serialize + Clone；这里放宽为任意类型，
+/// 只验证命令层调用形状。
+pub trait Emitter {
+    fn emit<T>(&self, _event: &str, _payload: T) -> Result<(), Error>;
+}
+
+impl Emitter for AppHandle {
+    fn emit<T>(&self, _event: &str, _payload: T) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+impl path::PathResolver {
+    /// 应用数据目录。离线检查只验证调用形状。
+    pub fn app_data_dir(&self) -> Result<std::path::PathBuf, Error> {
+        Ok(std::path::PathBuf::from("data"))
+    }
 }

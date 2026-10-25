@@ -22,6 +22,8 @@ export interface ListKeyboardOptions {
   activeIndex: () => number;
   /** 选中第 index 行（同页内下标） */
   onSelect: (index: number) => void;
+  /** 回车激活第 index 行（可选）。没有提供时回车不做事 */
+  onActivate?: (index: number) => void;
   /** 是否分页；不分页时翻页键退回为「跳到首/末行」 */
   paged: () => boolean;
   /** 当前页（从 1 起），仅分页时使用 */
@@ -108,6 +110,12 @@ export function useListKeyboard(opts: ListKeyboardOptions) {
         break;
       case "End":
         select(count - 1);
+        break;
+      case "Enter":
+        // 回车把「键盘停在这一行」变成「打开这一行」；
+        // 没有选中行时先落到第一行，与列表里直接按回车的习惯一致
+        if (!opts.onActivate) return;
+        opts.onActivate(cur < 0 ? 0 : cur);
         break;
       default:
         return;
