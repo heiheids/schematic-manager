@@ -61,8 +61,7 @@ fn get_now_date() -> String {
 }
 
 pub struct LogFileObject {
-    latest_dir: PathBuf,
-    debug_dir: PathBuf,
+    log_dir: PathBuf,
     latest_writer: Mutex<BufWriter<File>>,
     debug_writer: Mutex<BufWriter<File>>,
 }
@@ -73,48 +72,51 @@ impl LogFileObject {
         fn show_error(text: &str, title: &str) {
             println!("[{}][ERROR][::logger] {} - {}", get_now_time(), title, text);
             if cfg!(target_os = "windows") {
-                use windows::core::{HSTRING, PCWSTR};
-                use windows::Win32::Foundation::{BOOL, HWND};
-                use windows::Win32::UI::Controls::{
-                    TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
-                    TASKDIALOG_BUTTON, TDCBF_OK_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TD_INFORMATION_ICON,
-                };
+                #[cfg(target_os = "windows")]
+                {
+                    use windows::core::{HSTRING, PCWSTR};
+                    use windows::Win32::Foundation::{BOOL, HWND};
+                    use windows::Win32::UI::Controls::{
+                        TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
+                        TASKDIALOG_BUTTON, TDCBF_OK_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TD_INFORMATION_ICON,
+                    };
 
-                let title       = HSTRING::from(title);
-                let instruction = HSTRING::from("Error when the log system initialization: The log output file cannot be initialized.");
-                let content     = HSTRING::from(text);
-                // let ok_text     = HSTRING::from("确定(&O)");
-                let cancel_text = HSTRING::from("终止(&A)");
-                let buttons = [
-                    // TASKDIALOG_BUTTON { nButtonID: 100, pszButtonText: PCWSTR(ok_text.as_ptr()) },
-                    TASKDIALOG_BUTTON { nButtonID: 100, pszButtonText: PCWSTR(cancel_text.as_ptr()) },
-                ];
+                    let title       = HSTRING::from(title);
+                    let instruction = HSTRING::from("Error when the log system initialization: The log output file cannot be initialized.");
+                    let content     = HSTRING::from(text);
+                    // let ok_text     = HSTRING::from("确定(&O)");
+                    let cancel_text = HSTRING::from("终止(&A)");
+                    let buttons = [
+                        // TASKDIALOG_BUTTON { nButtonID: 100, pszButtonText: PCWSTR(ok_text.as_ptr()) },
+                        TASKDIALOG_BUTTON { nButtonID: 100, pszButtonText: PCWSTR(cancel_text.as_ptr()) },
+                    ];
 
-                let config = TASKDIALOGCONFIG {
-                    cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
-                    hwndParent: HWND::default(),
-                    dwFlags: TDF_ALLOW_DIALOG_CANCELLATION,
-                    dwCommonButtons: TDCBF_OK_BUTTON,
-                    pszWindowTitle:     PCWSTR(title.as_ptr()),
-                    pszMainInstruction: PCWSTR(instruction.as_ptr()),
-                    pszContent:         PCWSTR(content.as_ptr()),
-                    cButtons: buttons.len() as u32,
-                    pButtons: buttons.as_ptr(),
-                    Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: TD_INFORMATION_ICON }, // ✅ 字段名修正
-                    Anonymous2: TASKDIALOGCONFIG_1::default(),
-                    ..Default::default()
-                };
+                    let config = TASKDIALOGCONFIG {
+                        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+                        hwndParent: HWND::default(),
+                        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION,
+                        // dwCommonButtons: TDCBF_OK_BUTTON,
+                        pszWindowTitle:     PCWSTR(title.as_ptr()),
+                        pszMainInstruction: PCWSTR(instruction.as_ptr()),
+                        pszContent:         PCWSTR(content.as_ptr()),
+                        cButtons: buttons.len() as u32,
+                        pButtons: buttons.as_ptr(),
+                        Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: TD_INFORMATION_ICON }, // ✅ 字段名修正
+                        Anonymous2: TASKDIALOGCONFIG_1::default(),
+                        ..Default::default()
+                    };
 
-                let mut button_pressed = 0i32;
-                let mut radio_pressed = 0i32;
-                let mut verification_checked = BOOL(0);
-                unsafe {
-                    let _ = TaskDialogIndirect(
-                        &config,
-                        Some(&mut button_pressed),        // ✅
-                        Some(&mut radio_pressed),         // ✅ 或 None
-                        Some(&mut verification_checked),  // ✅ 或 None
-                    );
+                    let mut button_pressed = 0i32;
+                    let mut radio_pressed = 0i32;
+                    let mut verification_checked = BOOL(0);
+                    unsafe {
+                        let _ = TaskDialogIndirect(
+                            &config,
+                            Some(&mut button_pressed),        // ✅
+                            Some(&mut radio_pressed),         // ✅ 或 None
+                            Some(&mut verification_checked),  // ✅ 或 None
+                        );
+                    }
                 }
             } else {
                 let _ = MessageDialog::new()
@@ -125,17 +127,16 @@ impl LogFileObject {
             }
         }
 
-        let latest_dir = run_path.clone();
-        let debug_dir = run_path.clone();
+        let log_dir = run_path.clone();
 
         // 线保证日志目录一定存在
-        if let Err(e) = std::fs::create_dir_all(&latest_dir) {
+        if let Err(e) = std::fs::create_dir_all(&log_dir) {
             show_error(&format!("Failed to create log directory: \n{}", e), "Log System Error");
             std::process::exit(0x6);
         }
 
         // 然后再去吧日志滚走
-        match LogFileObject::roll_old_log_file(&latest_dir) {
+        match LogFileObject::roll_old_log_file(&log_dir) {
             Ok(()) => println!("Log system initialization: archived old log files."),
             Err(e) => {
                 println!("[{}][ERROR][::logger] {}", get_now_time(), e);
@@ -147,8 +148,8 @@ impl LogFileObject {
             },
         };
 
-        LogFileObject::clean_old_archives(&latest_dir, "latest", LOG_ARCHIVES_MAX_ITEM.into());
-        LogFileObject::clean_old_archives(&latest_dir, "debug", LOG_ARCHIVES_MAX_ITEM.into());
+        LogFileObject::clean_old_archives(&log_dir, "latest", LOG_ARCHIVES_MAX_ITEM.into());
+        LogFileObject::clean_old_archives(&log_dir, "debug", LOG_ARCHIVES_MAX_ITEM.into());
 
         let mut file_opts = OpenOptions::new();
         file_opts.create(true).append(true);
@@ -157,14 +158,14 @@ impl LogFileObject {
         {file_opts.share_mode(0x1 | 0x2);}
 
         // 再去创建文件
-        let latest_file = match file_opts.open(&latest_dir.join(LOG_FILE_NAME)) {
+        let latest_file = match file_opts.open(&log_dir.join(LOG_FILE_NAME)) {
             Ok(file) => file,
             Err(e) => {
                 show_error(&format!("The latest.log initialization failed and the log file could not be saved: \n{}", e), "Log System Error");
                 std::process::exit(0x6);
             },
         };
-        let debug_file  = match file_opts.open(&latest_dir.join(LOG_DEBUG_FILE_NAME)) {
+        let debug_file  = match file_opts.open(&log_dir.join(LOG_DEBUG_FILE_NAME)) {
             Ok(file) => file,
             Err(e) => {
                 show_error(&format!("The debug.log initialization failed and the log file could not be saved: \n{}", e), "Log System Error");
@@ -174,8 +175,7 @@ impl LogFileObject {
 
         // 然后再把自己搞回去
         let out_self = Self {
-            latest_dir: run_path.clone(),
-            debug_dir: run_path.clone(),
+            log_dir: run_path.clone(),
             latest_writer: Mutex::new(BufWriter::new(latest_file)),
             debug_writer: Mutex::new(BufWriter::new(debug_file)),
         };
@@ -278,22 +278,25 @@ impl LogFileObject {
         }
     }
 
-    
+    #[track_caller]
+    pub fn write_log(&self, level: LEVEL, class: &str, message: &str) {
+        Self::write_log_(&self, level, class, message, Location::caller());
+    }
 
     #[track_caller]
-    pub fn write_log(&self, level: LEVEL, class: &str, message: &[&str]) {
+    fn write_log_(&self, level: LEVEL, class: &str, message: &str, caller: &'static Location<'static>) {
         if message.is_empty() {return;}
 
         let max_char_len = LOG_ITEM_MAX_CHAR_LENGTH as usize;
-        let out_message = replace_template_placeholders_manual(message[0], &message[1..]);
+        let out_message = message;
         
         let log_length = out_message.chars().count();
         let out_message = if log_length > max_char_len {
             out_message.chars().take(max_char_len).collect::<String>()
         } else {
-            out_message
+            String::from(out_message)
         };
-        let caller = Location::caller();
+        let caller = caller;
         let out_text = format!(
             "[{}][{}][{}:{}][{}] {}",
              get_now_time(),
@@ -340,18 +343,42 @@ impl LogFileObject {
                 , e
             )
         }
+
+        
         let _ = writer_debug.flush(); // 刷新
 
+
+    }
+
+    pub fn debug(&self, class: &str, message: &str) {
+        Self::write_log_(&self, LEVEL::DEBUG, class, message, Location::caller());
+    }
+
+    pub fn info(&self, class: &str, message: &str) {
+        Self::write_log_(&self, LEVEL::INFO, class, message, Location::caller());
+    }
+
+    pub fn warn(&self, class: &str, message: &str) {
+        Self::write_log_(&self, LEVEL::WARN, class, message, Location::caller());
+    }
+
+    pub fn error(&self, class: &str, message: &str) {
+        Self::write_log_(&self, LEVEL::ERROR, class, message, Location::caller());
+    }
+
+    pub fn fatal(&self, class: &str, message: &str) {
+        Self::write_log_(&self, LEVEL::FATAL, class, message, Location::caller());
     }
 }
 
-////////////////////////////////////////////
-/// -----------------------------------  ///
-////////////////////////////////////////////
+/////////////////////////////////////////
+// ----------------------------------- //
+/////////////////////////////////////////
 
 /// 替换字符串中的 `{}` 和 `%s`
 /// AICG
 /// 参考代码
+/// 保留代码，用作 `%s` 的处理上，并且不应当替代 `format` 宏
 pub fn replace_template_placeholders_manual(template: &str, args: &[&str]) -> String {
     let mut result = String::with_capacity(template.len());
     let mut chars = template.chars().peekable();
@@ -415,7 +442,7 @@ macro_rules! logger_impl {
     // $level: 日志级别, $target: 标签, $fmt: 格式字符串, $($arg:expr),* : 可变
     ($level:expr, $target:expr, $fmt:expr $(, $arg:expr)*) => {
         if let Some(logger) = $crate::logger::LOGGER.get() {
-            logger.write_log($level, $target, &[$fmt $(, $arg)*]);
+            logger.write_log($level, $target, &format!($fmt $(, $arg)*));
         }
     };
 }
@@ -456,60 +483,3 @@ macro_rules! logger_fatal {
     };
 }
 
-#[cfg(test)]
-mod test {
-    use tauri::menu::NativeIcon::Path;
-    use crate::logger::{LogFileObject, init_log_object}; // 我不认为 Never Use，因为删了报错
-
-    #[test]
-    #[cfg(target_os = "windows")]
-    fn sdsdsdsd() {
-        use rfd::MessageDialog;
-        use std::path::PathBuf;
-        use crate::logger::LOGGER;
-        use crate::logger::LEVEL;
-
-        init_log_object(&PathBuf::from("H:\\"));
-
-        if let Some(logger) = LOGGER.get() {
-            logger.write_log(LEVEL::INFO, "TEST", &["测试"]);
-        }
-        
-        
-        let _ = MessageDialog::new()
-            .set_title("Log System Error")
-            .set_description(format!("Log system initialization: archived old log files.\nYou can still choose to continue running the program, but the archive log is lost.\n\n {}", "sss"))
-            .set_level(rfd::MessageLevel::Error)
-            .show();
-    }
-
-    #[test]
-    fn fnffff() {
-        // LogFileObject::write_log(&self, super::LEVEL::ERROR, "ssds {} wdwsd {} wdrwr %s", "12", "2353253wr23rt23", "3253265fefdfds5g4d5g5d4g5");
-        
-        #[cfg(target_os = "windows")]
-        pub fn show_message_box(message: &str, title: &str) {
-            // use windows::core::w;
-            use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONERROR};
-        
-            // windows crate 提供的 w! 宏可以方便地将字符串字面量转为宽字符串，
-            // 但变量的宽字符串转换需要我们自己处理。
-            let message_wide: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
-            let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-        
-            unsafe {
-                MessageBoxW(
-                    None, // 父窗口句柄，None 表示没有父窗口
-                    windows::core::PCWSTR(message_wide.as_ptr()),
-                    windows::core::PCWSTR(title_wide.as_ptr()),
-                    MB_OK | MB_ICONERROR, // 按钮和图标标志
-                );
-            }
-        }
-
-        // 调用示例
-        show_message_box("无法打开日志文件！", "错误");
-        
-        return;
-    }
-}
