@@ -8,6 +8,7 @@ const enUS: typeof zhCN = {
   lang: {
     label: "Language",
     zhCN: "简体中文",
+    zhTW: "繁體中文",
     enUS: "English",
   },
   titleBar: {

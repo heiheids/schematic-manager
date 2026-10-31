@@ -4348,6 +4348,31 @@ describe("界面语言", () => {
     ).toBe(false);
     w.unmount();
   });
+
+  it("在工具条上切到繁體中文后界面文案跟着变", async () => {
+    stubInvoke();
+    const w = mountApp();
+    await flushPromises();
+
+    await w.findAll("button").find((b) => b.text().includes("简体中文"))!.trigger("click");
+    await flushPromises();
+    const option = [...document.querySelectorAll(".arco-dropdown-option")].find((o) =>
+      (o.textContent ?? "").includes("繁體中文"),
+    );
+    expect(option, "语言下拉里应有繁體中文").toBeTruthy();
+    (option as HTMLElement).click();
+    await flushPromises();
+
+    expect(
+      w.findAll("button").some((b) => b.text().includes("新增資料夾")),
+      "切到繁体中文后按钮应显示繁体文案",
+    ).toBe(true);
+    expect(
+      w.findAll("button").some((b) => b.text().includes("添加目录")),
+      "切换后不应再留着简体按钮",
+    ).toBe(false);
+    w.unmount();
+  });
 });
 
 /** 显示名称：方块名分中英两套（取自 Minecraft 语言表），界面用哪种语言就显示哪一套 */
@@ -4403,6 +4428,16 @@ describe("方块显示名称", () => {
     setLocale("en-US");
     await flushPromises();
     expect(nameCells(w), "英语界面应改显示英文名").toEqual(["Stone", "Oak Log"]);
+    w.unmount();
+  });
+
+  it("繁体中文界面没有繁体名字表，仍显示中文名而不退到英文名", async () => {
+    const w = await selectWithBlocks([
+      { name: "minecraft:stone", state: "minecraft:stone", count: 10, zhName: "石头", enName: "Stone" },
+    ]);
+    setLocale("zh-TW");
+    await flushPromises();
+    expect(nameCells(w), "繁体中文界面应显示中文名").toEqual(["石头"]);
     w.unmount();
   });
 

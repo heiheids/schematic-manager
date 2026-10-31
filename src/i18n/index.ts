@@ -1,17 +1,20 @@
 /** 界面语言：语言清单、文案实例，以及显示名称的取用规则。
  *
- * 两种语言在这里成对定义。`locale` 给 vue-i18n 用，`lang` 是 Minecraft 语言
+ * 各语言在这里成对定义。`locale` 给 vue-i18n 用，`lang` 是 Minecraft 语言
  * 文件的键名——客户端 jar 里名字表的路径就是 `assets/minecraft/lang/<lang>.json`，
  * 方块与实体的显示名称要按这个键去取，两者必须成对维护。
  */
 import { createI18n } from "vue-i18n";
 import arcoEnUS from "@arco-design/web-vue/es/locale/lang/en-us";
 import arcoZhCN from "@arco-design/web-vue/es/locale/lang/zh-cn";
+import arcoZhTW from "@arco-design/web-vue/es/locale/lang/zh-tw";
 import enUS from "./en-US";
 import zhCN from "./zh-CN";
+import zhTW from "./zh-TW";
 
 export const LOCALES = [
   { locale: "zh-CN", lang: "zh_cn", labelKey: "lang.zhCN" },
+  { locale: "zh-TW", lang: "zh_tw", labelKey: "lang.zhTW" },
   { locale: "en-US", lang: "en_us", labelKey: "lang.enUS" },
 ] as const;
 
@@ -28,7 +31,7 @@ const i18n = createI18n({
   legacy: false,
   locale: FALLBACK_LOCALE,
   fallbackLocale: FALLBACK_LOCALE,
-  messages: { "zh-CN": zhCN, "en-US": enUS },
+  messages: { "zh-CN": zhCN, "zh-TW": zhTW, "en-US": enUS },
 });
 
 /** 组件里用 `useI18n()`；store 和工具函数不在组件上下文里，用这个 */
@@ -50,7 +53,7 @@ export function setLocale(next: Locale): void {
 }
 
 /** Arco 自己那些内置文案（分页、空数据、弹窗按钮）的语言包 */
-const ARCO_LOCALES = { "zh-CN": arcoZhCN, "en-US": arcoEnUS } as const;
+const ARCO_LOCALES = { "zh-CN": arcoZhCN, "zh-TW": arcoZhTW, "en-US": arcoEnUS } as const;
 
 export function arcoLocaleOf(current: Locale) {
   return ARCO_LOCALES[current];
@@ -62,9 +65,10 @@ export interface NamedRecord {
   enName?: string;
 }
 
-/** 当前语言该优先看哪个名字，另一个是备选 */
+/** 当前语言该优先看哪个名字，另一个是备选。后端只取 zh_cn 与 en_us 两张语言表，
+ * 繁体中文界面没有对应的繁体名字表，按中文名优先，比退到英文名更贴近使用者 */
 function namesByPreference(record: NamedRecord): [string, string] {
-  return currentLocale() === "zh-CN"
+  return currentLocale() !== "en-US"
     ? [record.zhName ?? "", record.enName ?? ""]
     : [record.enName ?? "", record.zhName ?? ""];
 }
