@@ -447,6 +447,16 @@ macro_rules! logger_impl {
     };
 }
 
+#[macro_export]
+macro_rules! logger_caller_impl {
+    // $level: 日志级别, $target: 标签, $fmt: 格式字符串, $($arg:expr),* : 可变
+    ($level:expr, $target:expr, $caller:expr, $fmt:expr $(, $arg:expr)*) => {
+        if let Some(logger) = $crate::logger::LOGGER.get() {
+            logger.write_log_caller($level, $target, &format!($fmt $(, $arg)*), $caller);
+        }
+    };
+}
+
 // 对外的具体宏，按级别封装
 #[macro_export]
 macro_rules! logger_debug {
