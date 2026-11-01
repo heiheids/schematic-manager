@@ -280,11 +280,11 @@ impl LogFileObject {
 
     #[track_caller]
     pub fn write_log(&self, level: LEVEL, class: &str, message: &str) {
-        Self::write_log_(&self, level, class, message, Location::caller());
+        Self::write_log_caller(&self, level, class, message, Location::caller());
     }
 
     #[track_caller]
-    fn write_log_(&self, level: LEVEL, class: &str, message: &str, caller: &'static Location<'static>) {
+    pub fn write_log_caller(&self, level: LEVEL, class: &str, message: &str, caller: &'static Location<'static>) {
         if message.is_empty() {return;}
 
         let max_char_len = LOG_ITEM_MAX_CHAR_LENGTH as usize;
@@ -351,23 +351,23 @@ impl LogFileObject {
     }
 
     pub fn debug(&self, class: &str, message: &str) {
-        Self::write_log_(&self, LEVEL::DEBUG, class, message, Location::caller());
+        Self::write_log_caller(&self, LEVEL::DEBUG, class, message, Location::caller());
     }
 
     pub fn info(&self, class: &str, message: &str) {
-        Self::write_log_(&self, LEVEL::INFO, class, message, Location::caller());
+        Self::write_log_caller(&self, LEVEL::INFO, class, message, Location::caller());
     }
 
     pub fn warn(&self, class: &str, message: &str) {
-        Self::write_log_(&self, LEVEL::WARN, class, message, Location::caller());
+        Self::write_log_caller(&self, LEVEL::WARN, class, message, Location::caller());
     }
 
     pub fn error(&self, class: &str, message: &str) {
-        Self::write_log_(&self, LEVEL::ERROR, class, message, Location::caller());
+        Self::write_log_caller(&self, LEVEL::ERROR, class, message, Location::caller());
     }
 
     pub fn fatal(&self, class: &str, message: &str) {
-        Self::write_log_(&self, LEVEL::FATAL, class, message, Location::caller());
+        Self::write_log_caller(&self, LEVEL::FATAL, class, message, Location::caller());
     }
 }
 

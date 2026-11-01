@@ -15,6 +15,9 @@ use windows::Win32::UI::WindowsAndMessaging::HICON;
 #[cfg(not(target_os = "windows"))]
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
+use crate::logger::LEVEL;
+use std::panic::Location;
+
 
 /// 由于 rfd::MessageDialog 不支持太多窗口按钮类型组合，导致能用的只有这么几个 ------ @see <https://docs.rs/rfd/latest/rfd/struct.MessageDialog.html>
 /// // rfd::MessageButtons
@@ -42,7 +45,7 @@ pub enum MessageWindowButton {
 pub enum MessageWindowDialog {
     NULL,
     ABORT,
-    CANECL, // 根据 Win32 文档，此处为 Escape 返回
+    CANCEL, // 根据 Win32 文档，此处为 Escape 返回
     CLOSE,
     CONTINUE,
     HELP,
@@ -64,16 +67,15 @@ pub enum MessageWindowIcon {
     WARN,
     INFO,
     #[cfg(windows)]
-    HICON(HICON),
+    HICON(HICON), // 不建议使用此标志，它在非 Windows 上没有实现
 }
 
 #[derive(Debug)]
 pub enum MessageWindowError {
     /// Windows 上 TaskDialog 自身的失败。非 Windows 平台没有 windows crate，故不参与编译。
     #[cfg(target_os = "windows")]
-    System(windows::core::Error),    // Win32
+    WindowsSystem(windows::core::Error),    // Win32
     TooManyButtons(usize),           // 非 Windows 上按钮超过 3 个
-    Abort()                          // 要求退出
 
 }
 
@@ -84,9 +86,24 @@ pub struct MessageWindow {
     instruction: String,
     content: String,
     expanded_info: String
+}
 
+impl std::fmt::Display for MessageWindowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WindowsSystem(e) => write!(f, "Windows API 调用失败: {e}"),
+            Self::TooManyButtons(n) => write!(f, "按钮数量 {n} 超出非 Windows 平台的上限（最多 3 个）"),
+        }
+    }
+}
 
-    // Default::default()
+impl std::error::Error for MessageWindowError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WindowsSystem(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 impl MessageWindow {
@@ -153,17 +170,24 @@ impl MessageWindow {
     #[cfg(target_os = "windows")]
     pub fn show(self) -> Result<MessageWindowDialog, MessageWindowError> {
         use windows::Win32::UI::Controls::{TD_ERROR_ICON, TD_SHIELD_ICON, TD_WARNING_ICON};
-        use windows::Win32::UI::Controls::{TDCBF_ABORT_BUTTON, TDCBF_CONTINUE_BUTTON, TDCBF_HELP_BUTTON, TDCBF_IGNORE_BUTTON, TDCBF_TRYAGAIN_BUTTON};
+        use windows::Win32::UI::Controls::{TDCBF_ABORT_BUTTON, TDF_USE_HICON_MAIN, TDCBF_CONTINUE_BUTTON, TDCBF_HELP_BUTTON, TDCBF_IGNORE_BUTTON, TDCBF_TRYAGAIN_BUTTON};
         use windows::Win32::UI::WindowsAndMessaging::{MESSAGEBOX_RESULT, IDABORT, IDCANCEL, IDNO, IDCLOSE, IDCONTINUE, IDHELP, IDIGNORE, IDOK, IDRETRY, IDTRYAGAIN, IDYES};
 
         let mut p_buttons = vec![];
         let mut c_buttons = TASKDIALOG_COMMON_BUTTON_FLAGS(0);
         let mut button_texts: Vec<HSTRING> = Vec::new(); // 文本指针指向，目的是为了防止提前释放内存导致的非预期行为
+        let mut flags = TDF_ALLOW_DIALOG_CANCELLATION;
 
         let content = HSTRING::from(self.content);
         let title = HSTRING::from(self.title);
         let instruction = HSTRING::from(self.instruction);
-        let expanded_info = HSTRING::from(self.expanded_info);
+        let expanded_info = if self.expanded_info.is_empty() {None} else {Some(HSTRING::from(self.expanded_info))};
+
+        if self.buttons.len() > 3 {
+            if let Some(logger) = crate::logger::LOGGER.get() {
+                logger.write_log_caller(LEVEL::WARN, "message_windows", &format!("Unexpected behavior that may occur on non-Windows systems: the number of buttons exceeds 3, and the number of incoming buttons is {}.", self.buttons.len()), Location::caller());
+            }
+        };
 
         for item in self.buttons {
             match item {
@@ -180,7 +204,7 @@ impl MessageWindow {
                 MessageWindowButton::YES        => c_buttons = c_buttons | TDCBF_YES_BUTTON,
                 
                 MessageWindowButton::Custom(int_var, content) => {
-                    let text = HSTRING::from(content.clone());
+                    let text = HSTRING::from(content);
 
                     p_buttons.push(TASKDIALOG_BUTTON {
                         nButtonID: int_var,
@@ -192,19 +216,20 @@ impl MessageWindow {
             }
         }
 
-        let icon = match self.icon {
-            MessageWindowIcon::ERROR              => TASKDIALOGCONFIG_0 { pszMainIcon: TD_ERROR_ICON },
-            MessageWindowIcon::INFO               => TASKDIALOGCONFIG_0 { pszMainIcon: TD_INFORMATION_ICON },
-            MessageWindowIcon::SHIELD             => TASKDIALOGCONFIG_0 { pszMainIcon: TD_SHIELD_ICON },
-            MessageWindowIcon::WARN               => TASKDIALOGCONFIG_0 { pszMainIcon: TD_WARNING_ICON },
-            MessageWindowIcon::NULL               => TASKDIALOGCONFIG_0 { pszMainIcon: PCWSTR::null()},
-            MessageWindowIcon::HICON(icon) => TASKDIALOGCONFIG_0 { hMainIcon: icon },
+        let (icon, use_h_icon) = match self.icon {
+            MessageWindowIcon::ERROR              => (TASKDIALOGCONFIG_0 { pszMainIcon: TD_ERROR_ICON }, false),
+            MessageWindowIcon::INFO               => (TASKDIALOGCONFIG_0 { pszMainIcon: TD_INFORMATION_ICON }, false),
+            MessageWindowIcon::SHIELD             => (TASKDIALOGCONFIG_0 { pszMainIcon: TD_SHIELD_ICON }, false),
+            MessageWindowIcon::WARN               => (TASKDIALOGCONFIG_0 { pszMainIcon: TD_WARNING_ICON }, false),
+            MessageWindowIcon::NULL               => (TASKDIALOGCONFIG_0 { pszMainIcon: PCWSTR::null()}, false),
+            MessageWindowIcon::HICON(icon) => (TASKDIALOGCONFIG_0 { hMainIcon: icon }, true),
         };
-        
+        if use_h_icon { flags |= TDF_USE_HICON_MAIN; }; // 根据 Win32 文档，此处需要设置标志
+
         let config = TASKDIALOGCONFIG {
             cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
             hwndParent: HWND::default(),
-            dwFlags: TDF_ALLOW_DIALOG_CANCELLATION,
+            dwFlags: flags,
 
             dwCommonButtons: c_buttons,
             
@@ -218,7 +243,7 @@ impl MessageWindow {
             Anonymous1: icon,
             Anonymous2: TASKDIALOGCONFIG_1::default(),
 
-            pszExpandedInformation: PCWSTR(expanded_info.as_ptr()),
+            pszExpandedInformation: expanded_info.as_ref().map_or(PCWSTR::null(), |h| PCWSTR(h.as_ptr())),
 
             ..Default::default()
 
@@ -235,7 +260,7 @@ impl MessageWindow {
                 Some(&mut radio_pressed),       
                 Some(&mut verification_checked),
             ) { // 后两个参数保留备用
-                Err(error) => {return Err(MessageWindowError::System(error))},
+                Err(error) => {return Err(MessageWindowError::WindowsSystem(error))},
                 Ok(()) => {},
             }
         }
@@ -244,7 +269,7 @@ impl MessageWindow {
 
         return Ok(match button_pressed_box {
             IDABORT      => MessageWindowDialog::ABORT   ,
-            IDCANCEL     => MessageWindowDialog::CANECL  ,
+            IDCANCEL     => MessageWindowDialog::CANCEL  ,
             IDCLOSE      => MessageWindowDialog::CLOSE   ,
             IDCONTINUE   => MessageWindowDialog::CONTINUE,
             IDHELP       => MessageWindowDialog::HELP    ,
@@ -263,6 +288,8 @@ impl MessageWindow {
     /// 参数含义与 Windows 版一致：title 是窗口标题，instruction 与 content 依次拼成正文，
     /// icon 映射到 rfd 的等级。rfd 的 `MessageButtons` 只定义了 OK、OK+取消、是+否、
     /// 是+否+取消四种固定组合，因此按钮组合与之不符或超过 3 个时见 [`to_rfd_buttons`]。
+    /// AIGC
+    /// 尚未人工审核和 TEST
     #[cfg(not(target_os = "windows"))]
     pub fn show(self) -> Result<MessageWindowDialog, MessageWindowError> {
         let rfd_buttons = to_rfd_buttons(&self.buttons)?;
@@ -286,22 +313,21 @@ impl MessageWindow {
 /// rfd 只定义了 OK、Yes、No、取消四种固定按钮，其余按钮必须以文本形式传入，
 /// 这里给出每种按钮的固定显示文案。
 ///
-/// 「重试」与「再试一次」的文案必须不同：rfd 的自定义按钮只回报按钮文本，
-/// 文本重复就再也分不清用户点的是哪一个。
+/// AIGC
 #[cfg(not(target_os = "windows"))]
 fn button_text(button: &MessageWindowButton) -> &str {
     match button {
-        MessageWindowButton::ABORT      => "中止",
-        MessageWindowButton::CANCEL     => "取消",
-        MessageWindowButton::CLOSE      => "关闭",
-        MessageWindowButton::CONTINUE   => "继续",
-        MessageWindowButton::HELP       => "帮助",
-        MessageWindowButton::IGNORE     => "忽略",
-        MessageWindowButton::NO         => "否",
-        MessageWindowButton::OK         => "确定",
-        MessageWindowButton::RETRY      => "重试",
-        MessageWindowButton::TRYAGAIN   => "再试一次",
-        MessageWindowButton::YES        => "是",
+        MessageWindowButton::ABORT      => "Abort",
+        MessageWindowButton::CANCEL     => "Cancel",
+        MessageWindowButton::CLOSE      => "Close",
+        MessageWindowButton::CONTINUE   => "Continue",
+        MessageWindowButton::HELP       => "Help",
+        MessageWindowButton::IGNORE     => "Ignore",
+        MessageWindowButton::NO         => "No",
+        MessageWindowButton::OK         => "OK",
+        MessageWindowButton::RETRY      => "Retry",
+        MessageWindowButton::TRYAGAIN   => "Tryagnin",
+        MessageWindowButton::YES        => "Yes",
         MessageWindowButton::Custom(_, text) => text.as_str(),
     }
 }
@@ -314,6 +340,7 @@ fn button_text(button: &MessageWindowButton) -> &str {
 ///
 /// 自定义组合里最后一个按钮在 GTK 与 macOS 上同时承担 Esc 的角色，这与 TaskDialog
 /// 的「Esc 一律返回取消」不完全一致，是 rfd 没有按钮身份概念的必然结果。
+/// AIGC
 #[cfg(not(target_os = "windows"))]
 fn to_rfd_buttons(buttons: &[MessageWindowButton]) -> Result<MessageButtons, MessageWindowError> {
     match buttons {
@@ -350,6 +377,7 @@ fn to_rfd_buttons(buttons: &[MessageWindowButton]) -> Result<MessageButtons, Mes
 ///
 /// 按文本反查时，文本重复就取声明顺序里的第一个：rfd 不回报按钮身份，无从区分。
 /// 找不到对应按钮（例如对话框被直接关闭）返回 NULL。
+/// AIGC
 #[cfg(not(target_os = "windows"))]
 fn to_dialog(result: MessageDialogResult, buttons: &[MessageWindowButton]) -> MessageWindowDialog {
     match result {
@@ -358,7 +386,7 @@ fn to_dialog(result: MessageDialogResult, buttons: &[MessageWindowButton]) -> Me
             .map_or(MessageWindowDialog::OK, dialog_for_button),
         MessageDialogResult::Yes    => MessageWindowDialog::YES,
         MessageDialogResult::No     => MessageWindowDialog::NO,
-        MessageDialogResult::Cancel => MessageWindowDialog::CANECL,
+        MessageDialogResult::Cancel => MessageWindowDialog::CANCEL,
         MessageDialogResult::Custom(text) => buttons
             .iter()
             .find(|button| button_text(button) == text.as_str())
@@ -368,11 +396,12 @@ fn to_dialog(result: MessageDialogResult, buttons: &[MessageWindowButton]) -> Me
 }
 
 /// 单个按钮对应的返回值。
+/// AIGC
 #[cfg(not(target_os = "windows"))]
 fn dialog_for_button(button: &MessageWindowButton) -> MessageWindowDialog {
     match button {
         MessageWindowButton::ABORT      => MessageWindowDialog::ABORT,
-        MessageWindowButton::CANCEL     => MessageWindowDialog::CANECL,
+        MessageWindowButton::CANCEL     => MessageWindowDialog::CANCEL,
         MessageWindowButton::CLOSE      => MessageWindowDialog::CLOSE,
         MessageWindowButton::CONTINUE   => MessageWindowDialog::CONTINUE,
         MessageWindowButton::HELP       => MessageWindowDialog::HELP,
@@ -387,6 +416,7 @@ fn dialog_for_button(button: &MessageWindowButton) -> MessageWindowDialog {
 }
 
 /// TaskDialog 的图标在 rfd 里只有信息、警告、错误三档，没有对应物的类型降级为信息。
+/// AIGC
 #[cfg(not(target_os = "windows"))]
 fn to_rfd_level(icon: &MessageWindowIcon) -> MessageLevel {
     match icon {
@@ -400,6 +430,7 @@ fn to_rfd_level(icon: &MessageWindowIcon) -> MessageLevel {
 
 /// rfd 的对话框只有标题和一段正文，没有 TaskDialog 的指令区与可折叠的详情区，
 /// 因此把非空的指令、正文、详情按顺序拼进正文。
+/// AIGC
 #[cfg(not(target_os = "windows"))]
 fn join_description(instruction: &str, content: &str, expanded_info: &str) -> String {
     let parts: Vec<&str> = [instruction, content, expanded_info]
