@@ -12,6 +12,9 @@ use windows::Win32::UI::Controls::{
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 
+#[cfg(not(target_os = "windows"))]
+use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+
 
 /// 由于 rfd::MessageDialog 不支持太多窗口按钮类型组合，导致能用的只有这么几个 ------ @see <https://docs.rs/rfd/latest/rfd/struct.MessageDialog.html>
 /// // rfd::MessageButtons
@@ -62,6 +65,16 @@ pub enum MessageWindowIcon {
     INFO,
     #[cfg(windows)]
     HICON(HICON),
+}
+
+#[derive(Debug)]
+pub enum MessageWindowError {
+    /// Windows 上 TaskDialog 自身的失败。非 Windows 平台没有 windows crate，故不参与编译。
+    #[cfg(target_os = "windows")]
+    System(windows::core::Error),    // Win32
+    TooManyButtons(usize),           // 非 Windows 上按钮超过 3 个
+    Abort()                          // 要求退出
+
 }
 
 pub struct MessageWindow {
@@ -138,7 +151,7 @@ impl MessageWindow {
     }
 
     #[cfg(target_os = "windows")]
-    pub fn show(self) -> windows::core::Result<MessageWindowDialog> { 
+    pub fn show(self) -> Result<MessageWindowDialog, MessageWindowError> {
         use windows::Win32::UI::Controls::{TD_ERROR_ICON, TD_SHIELD_ICON, TD_WARNING_ICON};
         use windows::Win32::UI::Controls::{TDCBF_ABORT_BUTTON, TDCBF_CONTINUE_BUTTON, TDCBF_HELP_BUTTON, TDCBF_IGNORE_BUTTON, TDCBF_TRYAGAIN_BUTTON};
         use windows::Win32::UI::WindowsAndMessaging::{MESSAGEBOX_RESULT, IDABORT, IDCANCEL, IDNO, IDCLOSE, IDCONTINUE, IDHELP, IDIGNORE, IDOK, IDRETRY, IDTRYAGAIN, IDYES};
@@ -186,7 +199,6 @@ impl MessageWindow {
             MessageWindowIcon::WARN               => TASKDIALOGCONFIG_0 { pszMainIcon: TD_WARNING_ICON },
             MessageWindowIcon::NULL               => TASKDIALOGCONFIG_0 { pszMainIcon: PCWSTR::null()},
             MessageWindowIcon::HICON(icon) => TASKDIALOGCONFIG_0 { hMainIcon: icon },
-            _                                     => TASKDIALOGCONFIG_0 { pszMainIcon: PCWSTR::null()},
         };
         
         let config = TASKDIALOGCONFIG {
@@ -217,12 +229,15 @@ impl MessageWindow {
         let mut verification_checked = BOOL(0);
         
         unsafe {
-            TaskDialogIndirect(                 
+            match TaskDialogIndirect(
                 &config,                        
                 Some(&mut button_pressed),      
                 Some(&mut radio_pressed),       
                 Some(&mut verification_checked),
-            )?; // 后两个参数保留备用
+            ) { // 后两个参数保留备用
+                Err(error) => {return Err(MessageWindowError::System(error))},
+                Ok(()) => {},
+            }
         }
 
         let button_pressed_box = MESSAGEBOX_RESULT(button_pressed);
@@ -243,12 +258,157 @@ impl MessageWindow {
         });
     }
 
+    /// 非 Windows 平台用 rfd 的对话框显示消息。
+    ///
+    /// 参数含义与 Windows 版一致：title 是窗口标题，instruction 与 content 依次拼成正文，
+    /// icon 映射到 rfd 的等级。rfd 的 `MessageButtons` 只定义了 OK、OK+取消、是+否、
+    /// 是+否+取消四种固定组合，因此按钮组合与之不符或超过 3 个时见 [`to_rfd_buttons`]。
     #[cfg(not(target_os = "windows"))]
-    pub fn show(self: Self) -> MessageWindowDialog {
-        // 暂失，等下写
+    pub fn show(self) -> Result<MessageWindowDialog, MessageWindowError> {
+        let rfd_buttons = to_rfd_buttons(&self.buttons)?;
+
+        let result = MessageDialog::new()
+            .set_title(self.title)
+            .set_description(join_description(
+                &self.instruction,
+                &self.content,
+                &self.expanded_info,
+            ))
+            .set_level(to_rfd_level(&self.icon))
+            .set_buttons(rfd_buttons)
+            .show();
+
+        Ok(to_dialog(result, &self.buttons))
     }
     
 }
+
+/// rfd 只定义了 OK、Yes、No、取消四种固定按钮，其余按钮必须以文本形式传入，
+/// 这里给出每种按钮的固定显示文案。
+///
+/// 「重试」与「再试一次」的文案必须不同：rfd 的自定义按钮只回报按钮文本，
+/// 文本重复就再也分不清用户点的是哪一个。
+#[cfg(not(target_os = "windows"))]
+fn button_text(button: &MessageWindowButton) -> &str {
+    match button {
+        MessageWindowButton::ABORT      => "中止",
+        MessageWindowButton::CANCEL     => "取消",
+        MessageWindowButton::CLOSE      => "关闭",
+        MessageWindowButton::CONTINUE   => "继续",
+        MessageWindowButton::HELP       => "帮助",
+        MessageWindowButton::IGNORE     => "忽略",
+        MessageWindowButton::NO         => "否",
+        MessageWindowButton::OK         => "确定",
+        MessageWindowButton::RETRY      => "重试",
+        MessageWindowButton::TRYAGAIN   => "再试一次",
+        MessageWindowButton::YES        => "是",
+        MessageWindowButton::Custom(_, text) => text.as_str(),
+    }
+}
+
+/// 把按钮列表翻译成 rfd 的按钮组合。
+///
+/// 按钮组合正好是 rfd 的四种固定组合之一时直接用固定组合，让对话框使用系统自己的按钮文案；
+/// 其余组合退回对应的 `...Custom` 变体，按钮文案取自 [`button_text`]。
+/// rfd 最多接受 3 个按钮，超出时报 [`MessageWindowError::TooManyButtons`]。
+///
+/// 自定义组合里最后一个按钮在 GTK 与 macOS 上同时承担 Esc 的角色，这与 TaskDialog
+/// 的「Esc 一律返回取消」不完全一致，是 rfd 没有按钮身份概念的必然结果。
+#[cfg(not(target_os = "windows"))]
+fn to_rfd_buttons(buttons: &[MessageWindowButton]) -> Result<MessageButtons, MessageWindowError> {
+    match buttons {
+        [MessageWindowButton::OK] => Ok(MessageButtons::Ok),
+        [MessageWindowButton::OK, MessageWindowButton::CANCEL] => Ok(MessageButtons::OkCancel),
+        [MessageWindowButton::YES, MessageWindowButton::NO] => Ok(MessageButtons::YesNo),
+        [MessageWindowButton::YES, MessageWindowButton::NO, MessageWindowButton::CANCEL] => {
+            Ok(MessageButtons::YesNoCancel)
+        }
+
+        // rfd 没有零按钮的对话框；空列表按单个「确定」显示，至少让提示能被关掉
+        [] => Ok(MessageButtons::Ok),
+        [button] => Ok(MessageButtons::OkCustom(button_text(button).to_string())),
+        [first, second] => Ok(MessageButtons::OkCancelCustom(
+            button_text(first).to_string(),
+            button_text(second).to_string(),
+        )),
+        [first, second, third] => Ok(MessageButtons::YesNoCancelCustom(
+            button_text(first).to_string(),
+            button_text(second).to_string(),
+            button_text(third).to_string(),
+        )),
+
+        _ => Err(MessageWindowError::TooManyButtons(buttons.len())),
+    }
+}
+
+/// 把 rfd 的返回值翻译回本模块的返回值。
+///
+/// rfd 对固定组合回报 OK、Yes、No、取消，对自定义组合回报按钮文本；但 zenity 后端
+/// （Linux 未启用 gtk3 时的默认实现，且 XDG portal 也转交给它）对单按钮的自定义组合
+/// 只回报 OK。因此 OK 一律按「第一个按钮」解释：固定组合的第一个按钮本来就是 OK，
+/// 自定义组合的第一个按钮也正好落在 rfd 的 OK 位上。
+///
+/// 按文本反查时，文本重复就取声明顺序里的第一个：rfd 不回报按钮身份，无从区分。
+/// 找不到对应按钮（例如对话框被直接关闭）返回 NULL。
+#[cfg(not(target_os = "windows"))]
+fn to_dialog(result: MessageDialogResult, buttons: &[MessageWindowButton]) -> MessageWindowDialog {
+    match result {
+        MessageDialogResult::Ok => buttons
+            .first()
+            .map_or(MessageWindowDialog::OK, dialog_for_button),
+        MessageDialogResult::Yes    => MessageWindowDialog::YES,
+        MessageDialogResult::No     => MessageWindowDialog::NO,
+        MessageDialogResult::Cancel => MessageWindowDialog::CANECL,
+        MessageDialogResult::Custom(text) => buttons
+            .iter()
+            .find(|button| button_text(button) == text.as_str())
+            .map(dialog_for_button)
+            .unwrap_or(MessageWindowDialog::NULL),
+    }
+}
+
+/// 单个按钮对应的返回值。
+#[cfg(not(target_os = "windows"))]
+fn dialog_for_button(button: &MessageWindowButton) -> MessageWindowDialog {
+    match button {
+        MessageWindowButton::ABORT      => MessageWindowDialog::ABORT,
+        MessageWindowButton::CANCEL     => MessageWindowDialog::CANECL,
+        MessageWindowButton::CLOSE      => MessageWindowDialog::CLOSE,
+        MessageWindowButton::CONTINUE   => MessageWindowDialog::CONTINUE,
+        MessageWindowButton::HELP       => MessageWindowDialog::HELP,
+        MessageWindowButton::IGNORE     => MessageWindowDialog::IGNORE,
+        MessageWindowButton::NO         => MessageWindowDialog::NO,
+        MessageWindowButton::OK         => MessageWindowDialog::OK,
+        MessageWindowButton::RETRY      => MessageWindowDialog::RETRY,
+        MessageWindowButton::TRYAGAIN   => MessageWindowDialog::TRYAGAIN,
+        MessageWindowButton::YES        => MessageWindowDialog::YES,
+        MessageWindowButton::Custom(id, _) => MessageWindowDialog::Custom(*id),
+    }
+}
+
+/// TaskDialog 的图标在 rfd 里只有信息、警告、错误三档，没有对应物的类型降级为信息。
+#[cfg(not(target_os = "windows"))]
+fn to_rfd_level(icon: &MessageWindowIcon) -> MessageLevel {
+    match icon {
+        MessageWindowIcon::ERROR  => MessageLevel::Error,
+        MessageWindowIcon::WARN   => MessageLevel::Warning,
+        MessageWindowIcon::NULL | MessageWindowIcon::SHIELD | MessageWindowIcon::INFO => {
+            MessageLevel::Info
+        }
+    }
+}
+
+/// rfd 的对话框只有标题和一段正文，没有 TaskDialog 的指令区与可折叠的详情区，
+/// 因此把非空的指令、正文、详情按顺序拼进正文。
+#[cfg(not(target_os = "windows"))]
+fn join_description(instruction: &str, content: &str, expanded_info: &str) -> String {
+    let parts: Vec<&str> = [instruction, content, expanded_info]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect();
+    parts.join("\n\n")
+}
+
 
 
 /// 调试垃圾场，后续删除
@@ -260,7 +420,6 @@ mod test {
     #[test]
     #[cfg(target_os = "windows")]
     fn sdsdsdsd() {
-        use rfd::MessageDialog;
         use std::path::PathBuf;
         use crate::logger::LOGGER;
         use crate::logger::LEVEL;
