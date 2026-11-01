@@ -168,6 +168,7 @@ impl MessageWindow {
     }
 
     #[cfg(target_os = "windows")]
+    #[track_caller]
     pub fn show(self) -> Result<MessageWindowDialog, MessageWindowError> {
         use windows::Win32::UI::Controls::{TD_ERROR_ICON, TD_SHIELD_ICON, TD_WARNING_ICON};
         use windows::Win32::UI::Controls::{TDCBF_ABORT_BUTTON, TDF_USE_HICON_MAIN, TDCBF_CONTINUE_BUTTON, TDCBF_HELP_BUTTON, TDCBF_IGNORE_BUTTON, TDCBF_TRYAGAIN_BUTTON};
